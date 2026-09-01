@@ -1,0 +1,11 @@
+[package]
+name = "qalam-cli"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+qalam-core = { path = "../crates/qalam-core" }
+
+[[bin]]
+name = "qalam"
+path = "src/main.rs"

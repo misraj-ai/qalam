@@ -1,0 +1,8 @@
+[workspace]
+members = ["crates/qalam-core", "cli"]
+resolver = "2"
+
+[workspace.dependencies]
+lopdf = "0.44"
+unicode-normalization = "0.1"
+unicode-bidi = "0.3"
