@@ -44,6 +44,7 @@
 use std::collections::HashMap;
 
 use crate::content::GlyphWidths;
+use crate::encoding::Encoding;
 use crate::types::{CodeToUnicode, RawFont};
 
 /// A parsed `/ToUnicode` CMap: glyph code → the text it stands for.
@@ -257,6 +258,8 @@ pub struct Font {
     pub resource_name: String,
     /// The parsed `/ToUnicode` map, empty when the font has none.
     pub to_unicode: CMap,
+    /// The simple-font `/Encoding`, used when `/ToUnicode` cannot answer.
+    pub encoding: Encoding,
     /// Whether codes are two bytes wide.
     pub two_byte: bool,
     /// Which reverse-mapping route this font offers (from L0).
@@ -286,11 +289,20 @@ impl Font {
             .map(CMap::parse)
             .unwrap_or_default();
 
+        // A composite font's `/Encoding` names a CMap (`Identity-H`), not a
+        // byte table, so the simple-font encoding path does not apply to it.
+        let encoding = if two_byte {
+            Encoding::default()
+        } else {
+            Encoding::new(raw.base_encoding.as_deref(), raw.differences)
+        };
+
         Self {
             resource_name: raw.info.resource_name,
             two_byte,
             route: raw.info.code_to_unicode,
             to_unicode,
+            encoding,
             first_char: raw.first_char,
             widths: raw.widths,
             missing_width: raw.missing_width,
@@ -301,11 +313,33 @@ impl Font {
 
     /// Resolve one glyph code to the text it stands for.
     ///
+    /// This is the fallback chain from PLAN.md §3, minus `/ActualText` (which
+    /// lives at the content-stream level, not the font level):
+    ///
+    /// 1. `/ToUnicode` — a real reverse map, and always right when present.
+    /// 2. `/Encoding` + `/Differences` — a simple font's byte table.
+    ///
+    /// `None` means genuinely unrecoverable, and stays distinct from an empty
+    /// string. The order matters: a font can have both, and `/ToUnicode` is the
+    /// one the writer produced deliberately for text extraction.
+    ///
     /// The result is still **shaped and in visual order** — presentation forms,
     /// laid down left to right. Making it readable Arabic is L3's job, and doing
     /// any of it here would break the ligature ordering rule (PLAN.md §3).
     pub fn decode(&self, code: u32) -> Option<String> {
-        self.to_unicode.get(code)
+        // `or_else` and not `or`: the second branch is only evaluated when the
+        // first returned `None`, so we never build the fallback needlessly.
+        self.to_unicode
+            .get(code)
+            .or_else(|| self.encoding.decode(code))
+    }
+
+    /// Whether this font can resolve anything at all.
+    ///
+    /// A font that answers `false` here makes every glyph it paints
+    /// unrecoverable — the strongest per-font signal the detector has.
+    pub fn is_resolvable(&self) -> bool {
+        !self.to_unicode.is_empty() || !self.encoding.is_empty()
     }
 
     /// Advance width of a code, as a fraction of the em square.

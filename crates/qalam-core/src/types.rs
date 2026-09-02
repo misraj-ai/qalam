@@ -455,6 +455,13 @@ pub struct RawFont {
     /// `/W`, flattened to inclusive `(first_cid, last_cid, width)` triples.
     /// Composite fonts only.
     pub cid_widths: Vec<(u32, u32, f64)>,
+    /// The `/BaseEncoding` name, or the bare `/Encoding` name when it is not a
+    /// dictionary. The second rung of the resolution chain, used when a font
+    /// has no `/ToUnicode`.
+    pub base_encoding: Option<String>,
+    /// `/Differences`, already flattened from PDF's run-length form into
+    /// `(code, glyph_name)` pairs.
+    pub differences: Vec<(u8, String)>,
 }
 
 impl RawFont {
@@ -469,6 +476,8 @@ impl RawFont {
             // The spec's default when `/DW` is absent.
             default_width: 1000.0,
             cid_widths: Vec::new(),
+            base_encoding: None,
+            differences: Vec::new(),
         }
     }
 }

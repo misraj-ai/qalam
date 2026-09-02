@@ -44,6 +44,7 @@
 pub mod arabic;
 pub mod bidi;
 pub mod content;
+pub mod encoding;
 pub mod error;
 pub mod font;
 pub mod graphics;

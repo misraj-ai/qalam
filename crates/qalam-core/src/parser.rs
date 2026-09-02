@@ -121,8 +121,42 @@ impl Pdf {
             self.read_cid_widths(dict, &mut raw);
         } else {
             self.read_simple_widths(dict, &mut raw);
+            self.read_encoding(dict, &mut raw);
         }
         raw
+    }
+
+    /// Read `/Encoding` in either of its two forms.
+    ///
+    /// It is a bare name (`/WinAnsiEncoding`) or a dictionary carrying a
+    /// `/BaseEncoding` and a `/Differences` array. Composite fonts do not use
+    /// this path at all — their `/Encoding` names a CMap.
+    fn read_encoding(&self, dict: &Dictionary, raw: &mut RawFont) {
+        let Some(encoding) = self.lookup(dict, b"Encoding") else {
+            return;
+        };
+
+        // Form one: a plain name.
+        if let Ok(name) = encoding.as_name() {
+            raw.base_encoding = Some(String::from_utf8_lossy(name).into_owned());
+            return;
+        }
+
+        // Form two: a dictionary.
+        let Ok(enc_dict) = encoding.as_dict() else {
+            return;
+        };
+        raw.base_encoding = self
+            .lookup(enc_dict, b"BaseEncoding")
+            .and_then(|o| o.as_name().ok())
+            .map(|n| String::from_utf8_lossy(n).into_owned());
+
+        if let Some(array) = self
+            .lookup(enc_dict, b"Differences")
+            .and_then(|o| o.as_array().ok())
+        {
+            raw.differences = flatten_differences(array);
+        }
     }
 
     /// Read `/FirstChar` and `/Widths` from a simple (1-byte) font.
@@ -375,6 +409,35 @@ impl Pdf {
             code_to_unicode,
         }
     }
+}
+
+/// Flatten a `/Differences` array into `(code, glyph_name)` pairs.
+///
+/// The array's format is run-length-ish and easy to misread: a **number** sets
+/// the current code, and every **name** after it takes the next code in
+/// sequence. So `[ 65 /alpha /beta 200 /gamma ]` means 65→alpha, 66→beta,
+/// 200→gamma — not three entries at 65, 200 and nowhere.
+fn flatten_differences(array: &[Object]) -> Vec<(u8, String)> {
+    let mut out = Vec::new();
+    let mut code: u32 = 0;
+
+    for item in array {
+        match item {
+            Object::Integer(n) => code = (*n).max(0) as u32,
+            Object::Real(n) => code = (*n).max(0.0) as u32,
+            Object::Name(name) => {
+                // Codes above 255 cannot occur in a simple font; skip rather
+                // than wrapping the value round.
+                if let Ok(byte) = u8::try_from(code) {
+                    out.push((byte, String::from_utf8_lossy(name).into_owned()));
+                }
+                code += 1;
+            }
+            // Anything else is malformed; ignore it and keep the position.
+            _ => {}
+        }
+    }
+    out
 }
 
 /// Read `key` from `dict` as a PDF name, e.g. `/Type0` → `"Type0"`.
