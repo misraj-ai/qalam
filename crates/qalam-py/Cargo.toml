@@ -1,0 +1,25 @@
+[package]
+name = "qalam-py"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+# The Python module is imported as `qalam`, so the compiled library must carry
+# that name. `cdylib` is the dynamic-library form Python can `import`.
+name = "qalam"
+crate-type = ["cdylib"]
+
+[dependencies]
+qalam-core = { path = "../qalam-core" }
+
+# `abi3-py39` builds against Python's *stable* ABI, so one wheel works on 3.9
+# and every later version, instead of one wheel per interpreter version.
+#
+# `extension-module` tells PyO3 not to link libpython — the interpreter that
+# loads us already provides those symbols. It is behind a feature so that
+# `cargo` commands which need a linkable binary can turn it off.
+pyo3 = { workspace = true, features = ["abi3-py39"] }
+
+[features]
+default = ["extension-module"]
+extension-module = ["pyo3/extension-module"]

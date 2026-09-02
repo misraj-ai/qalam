@@ -294,6 +294,9 @@ qalam/
 ├── cli/                      # optional: `qalam extract file.pdf` for quick testing
 │   └── src/main.rs
 │
+├── scripts/
+│   └── compare.py            # correctness + speed vs pypdfium2 / PyMuPDF
+│
 └── tests/
     ├── fixtures/             # real + hand-crafted Arabic PDFs
     │   ├── recoverable/
@@ -329,8 +332,12 @@ Rationale: `qalam-core` knows nothing about Python, so it stays independently us
 - **M4 — Python bindings.** *(done)* PyO3 + maturin; `maturin develop` then
   `qalam.extract_text("file.pdf")` works, plus `Document`/`Page`/`Line` with per-page
   metadata and confidence. Ships as an abi3 wheel (one wheel for Python 3.9+).
-- **M5 — Corpus + benchmarks.** Build a real test corpus, golden-file tests, and a
-  benchmark vs pypdfium2/PyMuPDF (correctness parity + speed). *End of Tier A.*
+- **M5 — Corpus + benchmarks.** *(partly done)* Golden-file tests
+  (`crates/qalam-core/tests/golden.rs`, regenerate with `UPDATE_GOLDEN=1`) and a
+  correctness+speed comparison against pypdfium2/PyMuPDF (`scripts/compare.py`) are in
+  place — see §10.7. **The corpus itself is still one document.** Every threshold in
+  `detect.rs` and `layout.rs` remains a judgement call until that is fixed; more fixtures
+  is the single highest-value work left in Tier A.
 - **M6 — Images (Tier B, do first).** Extract `/XObject` images per page: DCTDecode
   passthrough, Flate+samples → PNG, position via the `Do`-operator CTM. Highest value for
   least risk. Emit `Image` blocks.
@@ -467,6 +474,52 @@ The `/ToUnicode` stream is a PostScript-flavoured CMap. The parser only needs a 
 - Destinations are **UTF-16BE**, possibly multiple code units → decode to a `String`.
 It is NOT full PostScript; a small tokenizer over these keywords is enough. Do not pull in
 a PostScript interpreter.
+
+### 10.7 — Measured against pdfium and PyMuPDF: what the competition gets wrong
+
+Run `.venv/bin/python scripts/compare.py`. On the 44-page fixture:
+
+```
+                                   qalam      pdfium     pymupdf
+  as returned
+  logical word order                 yes          NO          NO
+  lam-alef ligature                  yes          NO          NO
+  tashkeel attached                  yes          NO          NO
+  columns kept whole (of 3)            3           0           0
+  presentation forms left              0           0       31080
+  marks stranded on a space            0         138           1
+  after the caller applies NFKC
+  logical word order                 yes          NO         yes
+  lam-alef ligature                  yes          NO         yes
+  columns kept whole (of 3)            3           0           3
+  presentation forms left              0           0           0
+  marks stranded on a space            0         138           4
+  speed (median of 5)              0.217s      0.313s      0.236s
+```
+
+**The second block is the honest one, and it changes the story.** PyMuPDF's word order,
+ligatures and column handling are all *correct* — it simply returns presentation forms and
+leaves normalisation to the caller. One `unicodedata.normalize("NFKC", …)` closes most of
+the gap. Any comparison that omits this overstates our advantage, so the script reports both.
+
+What survives that fairness test:
+
+- **pdfium reverses word order**, and no downstream fix can recover it: `هذا الدليل إرشادي`
+  comes back as `إلى الرجوع عن يغني … هذا`. Once glyphs are flattened into a string in the
+  wrong sequence the information needed to undo it is gone. This is the one class of failure
+  a caller genuinely cannot repair.
+- **PyMuPDF already reconstructs columns**, which was a surprise — 3/3 cards intact on page 6.
+  Geometric layout analysis is not our differentiator.
+- **Tashkeel is the remaining difference, and it is NFKC's fault, not PyMuPDF's.** PyMuPDF
+  places the marks correctly *after* their base; applying NFKC then inserts the placeholder
+  space (§10.5) and yields `تتضم َّن`. Our `strip_mark_bases` is what closes it. So this is a
+  bug any tool inherits by normalising naively — worth stating plainly rather than scoring as
+  a win.
+- **Neither tool tells you a page needs OCR.** Both return `""` for pages 2, 3, 42 and 43 —
+  indistinguishable from a page that is genuinely blank. That, not raw accuracy, is the real
+  differentiator, and it is the one thing the benchmark table cannot show.
+- Speed is a non-issue: all three are within 1.4x on a 44-page document. Correctness was
+  never going to be traded for it.
 
 ### 10.6 — The binding is thin because the orchestration moved down
 
