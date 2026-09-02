@@ -20,6 +20,7 @@ use unicode_normalization::UnicodeNormalization;
 use crate::bidi::{self, Direction};
 use crate::content::PageGlyphs;
 use crate::font::FontMap;
+use crate::layout::{self, Item};
 use crate::types::{Glyph, Rect, Style};
 
 /// One reconstructed line of text.
@@ -82,10 +83,64 @@ struct Placed {
 /// `fonts`, and what comes back is readable.
 pub fn reconstruct(page: &PageGlyphs, fonts: &FontMap) -> Vec<TextLine> {
     let placed = apply_actual_text(page);
-    group_into_lines(&placed)
+    if placed.is_empty() {
+        return Vec::new();
+    }
+
+    // L6 first. Grouping by baseline across a whole page interleaves columns:
+    // three cards side by side share every baseline, so a line-by-line reading
+    // takes one fragment from each and shuffles three paragraphs together.
+    // Splitting the page into regions first keeps each column's prose intact.
+    let items: Vec<Item> = placed.iter().map(item_for).collect();
+    let rtl = page_direction(&placed, fonts) == Direction::Rtl;
+
+    layout::segment(&items, rtl)
         .into_iter()
-        .filter_map(|line| build_line(&line, fonts))
+        .flat_map(|region| {
+            // `region` holds indices into `placed`, in reading order.
+            let glyphs: Vec<Placed> = region.into_iter().map(|i| placed[i].clone()).collect();
+            group_into_lines(&glyphs)
+                .into_iter()
+                .filter_map(|line| build_line(&line, fonts))
+                .collect::<Vec<_>>()
+        })
         .collect()
+}
+
+/// The box a glyph occupies, for the layout pass.
+///
+/// Heights are approximated from the type size, the same way [`line_bbox`] does
+/// it — a glyph's true ink extent needs per-glyph bounding boxes from the font
+/// program, which is far more work than choosing a column boundary justifies.
+fn item_for(placed: &Placed) -> Item {
+    let g = &placed.glyph;
+    Item {
+        x0: g.x,
+        x1: g.x + g.advance,
+        y0: g.y - g.style.size * 0.25,
+        y1: g.y + g.style.size * 0.75,
+        size: g.style.size,
+    }
+}
+
+/// The dominant direction of a whole page, which decides column ordering.
+///
+/// Decided across the page rather than per line, because a single column of
+/// Latin figures inside an Arabic document must not reverse that page's column
+/// order. Individual lines still get their own direction in [`build_line`].
+fn page_direction(placed: &[Placed], fonts: &FontMap) -> Direction {
+    // Stop at the first strong RTL character rather than decoding the whole
+    // page: one is all the answer needs.
+    for item in placed {
+        let text = match &item.actual {
+            Some(text) => Some(text.clone()),
+            None => fonts.decode(&item.glyph.style.font, item.glyph.code),
+        };
+        if text.is_some_and(|t| t.chars().any(bidi::is_rtl_char)) {
+            return Direction::Rtl;
+        }
+    }
+    Direction::Ltr
 }
 
 /// Attach `/ActualText` overrides to the glyphs they cover.
@@ -189,50 +244,101 @@ fn build_line(placed: &[Placed], fonts: &FontMap) -> Option<TextLine> {
     let mut ordered: Vec<&Placed> = placed.iter().collect();
     ordered.sort_by(|a, b| a.glyph.x.total_cmp(&b.glyph.x));
 
+    // Decode every glyph up front. The base direction decides how combining
+    // marks are placed, and that cannot be known until the text exists.
+    let decoded: Vec<(&Placed, Option<Piece>)> = ordered
+        .iter()
+        .map(|item| {
+            let piece = match &item.actual {
+                // Rung one of the chain: the writer told us outright what this
+                // run says, so nothing else is consulted.
+                Some(text) => Some(Piece::Actual(text.clone())),
+                None => Some(
+                    match fonts.decode(&item.glyph.style.font, item.glyph.code) {
+                        Some(text) => Piece::Decoded(text),
+                        // An unresolvable code becomes U+FFFD, never nothing.
+                        // Silently dropping it would turn "we cannot read this"
+                        // into "there was nothing here" — the exact deception this
+                        // project exists to avoid.
+                        None => Piece::Decoded(char::REPLACEMENT_CHARACTER.to_string()),
+                    },
+                ),
+            };
+            (*item, piece)
+        })
+        .collect();
+
+    let direction = bidi::detect_direction(
+        &decoded
+            .iter()
+            .filter_map(|(_, p)| p.as_ref().map(piece_str))
+            .collect::<String>(),
+    );
+
     // Build the line as pieces rather than one string, because decoded glyphs
     // and `/ActualText` need opposite treatment by the reorder below.
     let mut pieces: Vec<Piece> = Vec::new();
     let mut unresolved = 0;
-    let mut previous_end: Option<f64> = None;
 
-    for item in &ordered {
+    // The rightmost point any glyph has reached so far — a running *maximum*,
+    // not simply the previous glyph's end, so a mark tucked back over its base
+    // letter cannot drag the edge leftwards and fake a word gap.
+    let mut right_edge: Option<f64> = None;
+
+    // Where combining marks for the current base letter go. See below.
+    let mut mark_slot: Option<usize> = None;
+
+    for (item, piece) in decoded {
         let glyph = &item.glyph;
+        let Some(piece) = piece else { continue };
+        let text = piece_str(&piece);
+
+        if text == "\u{FFFD}" {
+            unresolved += 1;
+        }
+
+        let is_mark = is_mark_glyph(glyph, text);
 
         // Some PDFs separate words by moving the pen rather than painting a
         // space glyph. Detect that as a gap wider than a fraction of the type
-        // size, and only when a space is not already there.
-        if let Some(end) = previous_end {
-            let gap = glyph.x - end;
-            let already_spaced = matches!(pieces.last(), Some(Piece::Decoded(t)) if t == " ");
-            if gap > glyph.style.size * WORD_GAP_FRACTION && !already_spaced {
-                pieces.push(Piece::Decoded(" ".to_string()));
+        // size, and only when a space is not already there. A mark is drawn on
+        // top of the letter before it, so it can never open a word.
+        if !is_mark {
+            if let Some(edge) = right_edge {
+                let gap = glyph.x - edge;
+                let already_spaced = matches!(pieces.last(), Some(Piece::Decoded(t)) if t == " ");
+                if gap > glyph.style.size * WORD_GAP_FRACTION && !already_spaced {
+                    pieces.push(Piece::Decoded(" ".to_string()));
+                    mark_slot = None;
+                }
             }
         }
-        previous_end = Some(glyph.x + glyph.advance);
 
-        // Rung one of the chain: the writer told us outright what this run
-        // says, so nothing else is consulted.
-        if let Some(text) = &item.actual {
-            if !text.is_empty() {
-                pieces.push(Piece::Actual(text.clone()));
-            }
+        let end = glyph.x + glyph.advance;
+        right_edge = Some(right_edge.map_or(end, |e| e.max(end)));
+
+        // Drop the blank placeholders an `/ActualText` span leaves behind.
+        if matches!(&piece, Piece::Actual(t) if t.is_empty()) {
             continue;
         }
 
-        match fonts.decode(&glyph.style.font, glyph.code) {
-            Some(text) => pieces.push(Piece::Decoded(text)),
-            None => {
-                // An unresolvable code becomes U+FFFD, never nothing. Silently
-                // dropping it would turn "we cannot read this" into "there was
-                // nothing here" — the exact deception this project exists to
-                // avoid.
-                unresolved += 1;
-                pieces.push(Piece::Decoded(char::REPLACEMENT_CHARACTER.to_string()));
+        match (is_mark, direction, mark_slot) {
+            // An RTL mark is emitted *before* its base, so that the reorder
+            // below — which reverses the whole run — lands it *after* the base,
+            // where logical order requires it. Inserting each further mark at
+            // the same slot keeps their relative order correct through the
+            // reversal too.
+            (true, Direction::Rtl, Some(slot)) => pieces.insert(slot, piece),
+            // An LTR mark already follows its base and stays put; so does a
+            // mark with no base to attach to, at the start of a line.
+            (true, _, _) => pieces.push(piece),
+            (false, _, _) => {
+                pieces.push(piece);
+                // This base owns any marks that follow it.
+                mark_slot = Some(pieces.len() - 1);
             }
         }
     }
-
-    let direction = bidi::detect_direction(&pieces_text(&pieces));
 
     // ---- the order-of-operations rule -----------------------------------
     // Step 1: reorder, while ligatures are still single glyphs.
@@ -246,7 +352,13 @@ fn build_line(placed: &[Placed], fonts: &FontMap) -> Option<TextLine> {
     // characters rather than building an intermediate string.
     let normalised: String = logical.nfkc().collect();
 
-    let text = tidy_whitespace(&normalised);
+    // Step 3: undo one NFKC artefact. The *isolated* presentation forms of the
+    // tashkeel decompose with a SPACE as their base — NFKC(U+FC60) is
+    // `SPACE + FATHA + SHADDA` — because a mark shown alone needs something to
+    // sit on. Here the mark is not alone: it belongs to the letter beside it,
+    // and that space would split a word in half. Observed on page 5 of the
+    // fixture, where `تتضمّن` came out as `تتض َّمن`.
+    let text = tidy_whitespace(&strip_mark_bases(&normalised));
     if text.is_empty() {
         return None;
     }
@@ -269,16 +381,6 @@ enum Piece {
     Decoded(String),
     /// Text taken from `/ActualText`: already in **logical** order.
     Actual(String),
-}
-
-/// The pieces' text concatenated, for direction detection only.
-fn pieces_text(pieces: &[Piece]) -> String {
-    pieces
-        .iter()
-        .map(|p| match p {
-            Piece::Decoded(t) | Piece::Actual(t) => t.as_str(),
-        })
-        .collect()
 }
 
 /// Assemble the pieces into the visual-order string the reorder expects.
@@ -308,6 +410,93 @@ fn assemble_visual(pieces: &[Piece], direction: Direction) -> String {
         }
     }
     visual
+}
+
+/// Remove the placeholder space that NFKC puts before an isolated mark.
+///
+/// A space directly followed by a combining mark is not real text: it is the
+/// base that Unicode's compatibility decomposition supplies so an isolated mark
+/// has something to render on. In extracted PDF text the mark always belongs to
+/// a neighbouring letter, so the space is spurious.
+fn strip_mark_bases(text: &str) -> String {
+    let chars: Vec<char> = text.chars().collect();
+    chars
+        .iter()
+        .enumerate()
+        .filter(|(i, c)| {
+            // Keep everything except a space whose next character is a mark.
+            !(**c == ' ' && chars.get(i + 1).copied().is_some_and(is_combining_mark))
+        })
+        .map(|(_, c)| *c)
+        .collect()
+}
+
+/// The text of a piece, whatever its kind.
+fn piece_str(piece: &Piece) -> &str {
+    match piece {
+        Piece::Decoded(t) | Piece::Actual(t) => t.as_str(),
+    }
+}
+
+/// Is this glyph a combining mark rather than a letter?
+///
+/// # Why this matters: the tashkeel bug
+///
+/// Arabic vowel marks (tashkeel) — shadda, fatha, the tanween — are painted as
+/// separate glyphs positioned *over* the letter they modify. In a real file
+/// they arrive with an advance of zero and an `x` that sits **inside** the
+/// preceding letter's span, because that is where the mark belongs visually.
+///
+/// Tracking "where the last glyph ended" therefore walks backwards at every
+/// mark, and the following letter then looks far away — so the word-gap rule
+/// fires and splits a word in half. Observed on page 5 of the test fixture:
+/// `تتضمّن` came out as `تتض َّمن`.
+///
+/// Two independent guards, either of which alone fixes it:
+/// the running maximum in `build_line`, and this test, which stops a mark from
+/// opening a word at all.
+fn is_mark_glyph(glyph: &Glyph, text: &str) -> bool {
+    if text.is_empty() {
+        // An `/ActualText` placeholder, not a mark.
+        return false;
+    }
+
+    // Ask what the character *becomes*, not what it is. A code may decode to a
+    // presentation form such as U+FC60 whose normalised value is a pair of
+    // marks; testing the raw character would miss it. The leading space is the
+    // decomposition's placeholder base (see `strip_mark_bases`).
+    let normalised: String = text.nfkc().collect();
+    let stripped = normalised.trim_start_matches(' ');
+    if !stripped.is_empty() && stripped.chars().all(is_combining_mark) {
+        return true;
+    }
+
+    // A glyph that does not move the pen cannot separate two words either.
+    const NEGLIGIBLE_ADVANCE: f64 = 0.05;
+    glyph.advance.abs() < glyph.style.size * NEGLIGIBLE_ADVANCE
+}
+
+/// Is this character a combining mark that renders on top of another?
+///
+/// Covers Arabic tashkeel in both their base and presentation-form encodings,
+/// plus the generic combining-diacritical block. This is not a full Unicode
+/// category lookup — that would need a property table this crate does not carry
+/// — but it covers every mark an Arabic document produces.
+fn is_combining_mark(c: char) -> bool {
+    matches!(c as u32,
+        // Combining Diacritical Marks (Latin, but they appear in mixed text).
+        0x0300..=0x036F
+        // Arabic tashkeel: fatha, damma, kasra, shadda, sukun, the tanween.
+        | 0x064B..=0x065F
+        // Superscript alef.
+        | 0x0670
+        // Quranic annotation and Arabic Extended-A marks.
+        | 0x06D6..=0x06ED
+        | 0x08D3..=0x08FF
+        // Presentation forms of the tashkeel (U+FE70–FE7F are shadda pairs and
+        // isolated marks; they normalise to the U+064x forms above).
+        | 0xFE70..=0xFE7F
+    )
 }
 
 /// How wide a gap, as a fraction of the type size, means a word break.
@@ -572,6 +761,130 @@ mod tests {
         let style = dominant_style(&placed(vec![a, b, c]));
         assert!((style.size - 12.0).abs() < 1e-9);
         assert!(style.color.is_black());
+    }
+
+    // ---- combining marks (tashkeel) --------------------------------------
+
+    #[test]
+    fn the_tashkeel_word_split_regression() {
+        // Page 5 of the fixture, the word `تتضمّن`, exactly as painted: visual
+        // (left-to-right) order, with U+FC60 — the *isolated* shadda-with-fatha
+        // ligature — drawn on top of the meem.
+        //
+        // It used to come out as `تتض َّمن`: a space in the middle of the word,
+        // and the marks landing before their base letter instead of after.
+        let glyphs = vec![
+            // noon, meem, then the mark sitting inside the meem's span,
+            // then dad, teh, teh.
+            (366.517, 7.546, "\u{FEE6}"),
+            (374.063, 7.040, "\u{FEE4}"),
+            (377.418, 1.353, "\u{FC60}"),
+            (381.103, 9.526, "\u{FEC0}"),
+            (390.629, 4.345, "\u{FE98}"),
+            (394.974, 3.883, "\u{FE97}"),
+        ];
+
+        let mut pieces = Vec::new();
+        let mut slot: Option<usize> = None;
+        for (x, adv, text) in &glyphs {
+            let mut g = glyph(*x, 610.16, 11.0);
+            g.advance = *adv;
+            let piece = Piece::Decoded((*text).to_string());
+            if is_mark_glyph(&g, text) {
+                match slot {
+                    Some(i) => pieces.insert(i, piece),
+                    None => pieces.push(piece),
+                }
+            } else {
+                pieces.push(piece);
+                slot = Some(pieces.len() - 1);
+            }
+        }
+
+        let visual = assemble_visual(&pieces, Direction::Rtl);
+        let logical = bidi::visual_to_logical(&visual, Direction::Rtl);
+        let text = tidy_whitespace(&strip_mark_bases(&logical.nfkc().collect::<String>()));
+
+        assert_eq!(
+            text,
+            "\u{062A}\u{062A}\u{0636}\u{0645}\u{064E}\u{0651}\u{0646}"
+        );
+        assert!(!text.contains(' '), "a space split the word: {text:?}");
+    }
+
+    #[test]
+    fn an_isolated_mark_form_is_recognised_through_normalisation() {
+        // U+FC60 is a letter by category and has a non-zero advance, so neither
+        // a raw character test nor an advance test alone would spot it. What
+        // gives it away is that it *normalises* to nothing but marks.
+        let mut g = glyph(0.0, 0.0, 11.0);
+        g.advance = 1.353;
+        assert!(is_mark_glyph(&g, "\u{FC60}"));
+
+        // A zero-advance mark in its base form.
+        let mut zero = glyph(0.0, 0.0, 11.0);
+        zero.advance = 0.0;
+        assert!(is_mark_glyph(&zero, "\u{064B}"));
+
+        // An ordinary letter is not a mark.
+        let mut letter = glyph(0.0, 0.0, 11.0);
+        letter.advance = 7.0;
+        assert!(!is_mark_glyph(&letter, "\u{FEE4}"));
+    }
+
+    #[test]
+    fn nfkc_supplies_a_space_base_that_we_remove() {
+        // The behaviour that caused the bug, asserted so the fix is not
+        // mistaken for arbitrary whitespace munging.
+        let expanded: String = "\u{FC60}".nfkc().collect();
+        assert!(
+            expanded.starts_with(' '),
+            "NFKC no longer prefixes a space; strip_mark_bases may be obsolete"
+        );
+
+        assert_eq!(strip_mark_bases(" \u{064E}"), "\u{064E}");
+        // A space before an ordinary letter is real text and must survive.
+        assert_eq!(strip_mark_bases(" \u{0645}"), " \u{0645}");
+        assert_eq!(strip_mark_bases("a b"), "a b");
+    }
+
+    #[test]
+    fn a_mark_never_opens_a_word() {
+        // A mark is painted over the letter before it, at an x *inside* that
+        // letter's span. Treating it as a normal glyph made the running edge
+        // walk backwards and faked a word gap for the next letter.
+        let mut base = glyph(100.0, 0.0, 11.0);
+        base.advance = 7.0;
+        let mut mark = glyph(103.0, 0.0, 11.0);
+        mark.advance = 0.0;
+        let next = glyph(107.0, 0.0, 11.0);
+
+        let page = PageGlyphs {
+            glyphs: vec![base, mark, next],
+            ..Default::default()
+        };
+        // With an empty font map every glyph is U+FFFD, so no space glyph can
+        // come from decoding — any space would be one we invented.
+        let lines = reconstruct(&page, &FontMap::default());
+        assert_eq!(lines.len(), 1);
+        assert!(
+            !lines[0].text.contains(' '),
+            "invented a gap: {:?}",
+            lines[0].text
+        );
+    }
+
+    #[test]
+    fn ltr_marks_stay_after_their_base() {
+        // Latin combining marks already follow their base and must not be moved.
+        let pieces = vec![
+            Piece::Decoded("e".to_string()),
+            Piece::Decoded("\u{0301}".to_string()),
+        ];
+        let visual = assemble_visual(&pieces, Direction::Ltr);
+        let logical = bidi::visual_to_logical(&visual, Direction::Ltr);
+        let text: String = logical.nfkc().collect();
+        assert_eq!(text, "é");
     }
 
     #[test]

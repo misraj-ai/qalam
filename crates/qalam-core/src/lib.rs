@@ -20,6 +20,7 @@
 //! | L3 | [`arabic`]   | line grouping → bidi reorder → NFKC normalise |
 //! | L3 | [`bidi`]     | UAX #9 wrapper: visual order → logical order |
 //! | L4 | [`detect`]   | recoverability scoring: `ok` vs `needs_ocr` |
+//! | L6 | [`layout`]   | recursive XY-cut: columns and reading order (RTL) |
 //!
 //! Alongside the text, L1 records the *styling* each glyph was painted with —
 //! fill colour, font, effective size, render mode — as a [`Style`]. Nothing in
@@ -49,6 +50,7 @@ pub mod encoding;
 pub mod error;
 pub mod font;
 pub mod graphics;
+pub mod layout;
 pub mod parser;
 pub mod types;
 

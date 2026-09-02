@@ -338,6 +338,8 @@ Rationale: `qalam-core` knows nothing about Python, so it stays independently us
   least risk. Emit `Image` blocks.
 - **M7 — Reading order (Tier B).** L1.5 tagged-tree reader + L6 XY-cut fallback with RTL
   column ordering. Emit ordered `Text` blocks; validate against `tagged/` and `multicolumn/`.
+  *(L6 landed early, during M3 — see §10.4. The tagged-tree reader and `Block` emission
+  are what remain.)*
 - **M8 — Tables (Tier C).** Tagged `/Table` structure + ruled-line detection from vector
   graphics. Borderless/alignment inference is a stretch and explicitly best-effort for RTL.
 - **M9 — HTML export (Tier D, stretch).** Render the block model to HTML: `dir="rtl"`,
@@ -467,6 +469,67 @@ The `/ToUnicode` stream is a PostScript-flavoured CMap. The parser only needs a 
 - Destinations are **UTF-16BE**, possibly multiple code units → decode to a `String`.
 It is NOT full PostScript; a small tokenizer over these keywords is enough. Do not pull in
 a PostScript interpreter.
+
+### 10.4 — Columns are not optional, and a global column pass cannot find them
+
+Page 6 of the test file lays three "cards" side by side under a full-width intro
+paragraph. Grouping glyphs by baseline — correct on every single-column page — took one
+fragment from each card per line and interleaved three separate paragraphs into nonsense,
+*even though every glyph decoded perfectly*. Correct characters, unreadable text. This is
+why L6 was pulled forward from M7 into M3: multi-column layout does not degrade output, it
+corrupts it.
+
+Measured on that page:
+
+```
+whole page   widest empty band: 116pt horizontal  → intro above, cards below
+card band    widest empty band:  51pt vertical    → right card | rest
+the pair     widest empty band:  43pt vertical    → middle card | left card
+```
+
+**The load-bearing finding: the page has no page-wide vertical gutter at all.** The
+full-width intro paragraph crosses all three columns, so an x-projection over the whole
+page finds nothing. A single global column-detection pass is not merely less accurate here
+— it detects zero columns. Only the *recursion*, having first cut the intro away on the
+horizontal gap, exposes the gutters underneath. Hence recursive XY-cut splitting at the
+**widest** band each time, rather than at every band at once.
+
+Rules this produced in `layout.rs`:
+- **Split at the widest gap, then recurse.** Choosing between a horizontal and a vertical
+  cut by which band is wider is what lets a full-width heading be removed before the
+  columns beneath it are looked for. No explicit "is this a heading" rule is needed.
+- **Thresholds scale with the region's median type size**, not absolutes. A 20pt gap is a
+  column gutter in 9pt text and ordinary word spacing at 40pt.
+- **Never column-split a region less than ~2 lines tall.** A table-of-contents line is one
+  line with a large hole between title and page number; without this guard the hole reads
+  as a gutter and tears the line in half.
+- **Median, not mean, type size** — one 40pt heading among 500 words of body text must not
+  move the thresholds.
+- Reading order: rows always top-to-bottom (PDF `y` grows *upwards*, so the higher band is
+  read first); columns right-to-left when the page is RTL. That direction is decided per
+  *page*, not per line, so a column of Latin figures cannot reverse the page's column order.
+
+### 10.5 — Tashkeel: two separate bugs, both silent
+
+The word `تتضمّن` on page 5 extracted as `تتض َّمن` — a space inside the word. Two
+independent causes, and the same file contained two more words (`تصورًا`, `مبدئيًّا`) that
+were corrupted by the second cause alone while still *looking* plausible.
+
+1. **NFKC supplies the space itself.** `NFKC(U+FC60)` — the isolated shadda-with-fatha
+   ligature — is `SPACE + FATHA + SHADDA`. Unicode gives an *isolated* mark a space to
+   render on. In extracted text the mark is never isolated; it belongs to the letter beside
+   it. So a space immediately followed by a combining mark must be dropped.
+2. **Marks land before their base after reordering.** UAX #9 rule L3 says combining marks
+   *precede* their base once reordered, and renderers swap them back for display. Going
+   visual→logical we hit the inverse. The mark is painted at an `x` **inside** its base
+   letter's span (mark at 377.4 within the meem's 374.1–381.1), so sorting by x puts it
+   after the meem and the reversal puts it before. Marks must therefore be emitted *before*
+   their base in the visual string, so the reversal lands them after it.
+
+**Detecting a mark cannot be done on the raw character.** U+FC60 is `Lo` (a letter) by
+category and carries a non-zero advance of 1.353, so neither a category test nor a
+zero-advance test finds it. The reliable test is what it *normalises to*: strip a leading
+space, and ask whether everything left is a combining mark.
 
 ### 10.3 — Structure is reconstructed, not read (untagged test file)
 
