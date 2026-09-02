@@ -114,6 +114,245 @@ impl Line {
     }
 }
 
+/// One cell of a reconstructed table.
+#[pyclass(frozen, module = "qalam")]
+pub struct Cell {
+    /// The cell's text, its lines joined with spaces.
+    #[pyo3(get)]
+    text: String,
+    /// Row index, counting from the top.
+    #[pyo3(get)]
+    row: usize,
+    /// Column index **in reading order** — 0 is the rightmost cell on an
+    /// Arabic page, the leftmost on a Latin one.
+    #[pyo3(get)]
+    column: usize,
+    /// `(x0, y0, x1, y1)` in PDF points from the bottom-left of the page.
+    #[pyo3(get)]
+    bbox: (f64, f64, f64, f64),
+}
+
+#[pymethods]
+impl Cell {
+    fn __repr__(&self) -> String {
+        format!("<Cell r{} c{} {:?}>", self.row, self.column, self.text)
+    }
+
+    fn __str__(&self) -> &str {
+        &self.text
+    }
+}
+
+/// A run of text: a paragraph, a heading, one card's contents.
+#[pyclass(frozen, module = "qalam")]
+pub struct TextBlock {
+    /// Always `"text"`. Lets a caller sort a mixed list of blocks without
+    /// reaching for `isinstance`.
+    #[pyo3(get)]
+    kind: &'static str,
+    /// Position in the page's reading order, counting from 0.
+    #[pyo3(get)]
+    reading_index: usize,
+    /// `(x0, y0, x1, y1)` in PDF points.
+    #[pyo3(get)]
+    bbox: (f64, f64, f64, f64),
+    /// The block's text, lines joined with newlines.
+    #[pyo3(get)]
+    text: String,
+    /// Fraction of the block's glyphs that resolved, 0.0 to 1.0.
+    #[pyo3(get)]
+    confidence: f64,
+    lines: Vec<Py<Line>>,
+}
+
+#[pymethods]
+impl TextBlock {
+    /// The block's lines, in reading order.
+    #[getter]
+    fn lines(&self, py: Python<'_>) -> Vec<Py<Line>> {
+        self.lines.iter().map(|l| l.clone_ref(py)).collect()
+    }
+
+    fn __repr__(&self) -> String {
+        let preview: String = self.text.chars().take(30).collect();
+        format!("<TextBlock {} {:?}…>", self.reading_index, preview)
+    }
+
+    fn __str__(&self) -> &str {
+        &self.text
+    }
+}
+
+/// A picture drawn on the page.
+#[pyclass(frozen, module = "qalam")]
+pub struct ImageBlock {
+    /// Always `"image"`.
+    #[pyo3(get)]
+    kind: &'static str,
+    /// Position in the page's reading order.
+    #[pyo3(get)]
+    reading_index: usize,
+    /// `(x0, y0, x1, y1)` in PDF points, or `None` when we never saw the image
+    /// drawn — almost certainly because it lives inside a form XObject we do
+    /// not enter. Not proof it is absent from the page.
+    #[pyo3(get)]
+    bbox: Option<(f64, f64, f64, f64)>,
+    /// True when the image covers most of the page: a background, not a figure.
+    #[pyo3(get)]
+    is_background: bool,
+    /// Pixel width, or `None` if the image could not be decoded.
+    #[pyo3(get)]
+    width: Option<u32>,
+    /// Pixel height.
+    #[pyo3(get)]
+    height: Option<u32>,
+    /// `"jpg"`, `"jp2"` or `"png"`, or `None` if undecoded.
+    #[pyo3(get)]
+    format: Option<String>,
+    /// A conventional file name such as `"Im0.jpg"`.
+    #[pyo3(get)]
+    file_name: Option<String>,
+    /// Why the image could not be decoded, or `None` when it was.
+    ///
+    /// Always one or the other: an undecodable image is reported with its
+    /// reason rather than dropped.
+    #[pyo3(get)]
+    unsupported_reason: Option<String>,
+    /// True when the image declared an `/SMask` we did not composite.
+    ///
+    /// Stronger than it sounds: a logo is routinely stored as a *blank* image
+    /// whose whole shape lives in the mask, so the extraction can be
+    /// byte-correct and visually empty.
+    #[pyo3(get)]
+    dropped_transparency: bool,
+    data: Option<Vec<u8>>,
+}
+
+#[pymethods]
+impl ImageBlock {
+    /// The encoded image file's bytes, ready to write to disk.
+    #[getter]
+    fn data(&self, py: Python<'_>) -> Option<Py<pyo3::types::PyBytes>> {
+        use pyo3::types::PyBytes;
+        self.data
+            .as_ref()
+            .map(|bytes| PyBytes::new(py, bytes).unbind())
+    }
+
+    /// Always empty: a picture contributes no text.
+    ///
+    /// Present so that every block kind answers `text`, and a caller walking
+    /// `page.blocks` never has to special-case one.
+    #[getter]
+    fn text(&self) -> &'static str {
+        ""
+    }
+
+    /// Write the image to a file.
+    ///
+    /// Raises `ValueError` for an image that could not be decoded — the bytes
+    /// simply do not exist, and writing an empty file would hide that.
+    fn save(&self, path: std::path::PathBuf) -> PyResult<()> {
+        let Some(bytes) = &self.data else {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                self.unsupported_reason
+                    .clone()
+                    .unwrap_or_else(|| "image was not decoded".to_string()),
+            ));
+        };
+        std::fs::write(&path, bytes)
+            .map_err(|e| pyo3::exceptions::PyOSError::new_err(e.to_string()))
+    }
+
+    fn __repr__(&self) -> String {
+        match (&self.file_name, &self.unsupported_reason) {
+            (Some(name), _) => format!(
+                "<ImageBlock {} {} {}x{}>",
+                self.reading_index,
+                name,
+                self.width.unwrap_or(0),
+                self.height.unwrap_or(0)
+            ),
+            (None, Some(reason)) => {
+                format!("<ImageBlock {} undecoded: {reason}>", self.reading_index)
+            }
+            _ => format!("<ImageBlock {}>", self.reading_index),
+        }
+    }
+}
+
+/// A table reconstructed from the lines ruled around it.
+#[pyclass(frozen, module = "qalam")]
+pub struct TableBlock {
+    /// Always `"table"`.
+    #[pyo3(get)]
+    kind: &'static str,
+    /// Position in the page's reading order.
+    #[pyo3(get)]
+    reading_index: usize,
+    /// `(x0, y0, x1, y1)` in PDF points.
+    #[pyo3(get)]
+    bbox: (f64, f64, f64, f64),
+    /// How much of the grid was actually drawn, 0.0 to 1.0.
+    ///
+    /// Reconstruction is best-effort; this says how much to trust it.
+    #[pyo3(get)]
+    confidence: f64,
+    /// Number of rows.
+    #[pyo3(get)]
+    row_count: usize,
+    /// Number of columns.
+    #[pyo3(get)]
+    column_count: usize,
+    rows: Vec<Vec<Py<Cell>>>,
+}
+
+#[pymethods]
+impl TableBlock {
+    /// The cells, by row and then by column in reading order.
+    #[getter]
+    fn rows(&self, py: Python<'_>) -> Vec<Vec<Py<Cell>>> {
+        self.rows
+            .iter()
+            .map(|row| row.iter().map(|c| c.clone_ref(py)).collect())
+            .collect()
+    }
+
+    /// The table flattened: cells joined by tabs, rows by newlines.
+    ///
+    /// Every block kind exposes `text`, so a caller can walk `page.blocks` and
+    /// join them without asking what each one is — which is exactly what
+    /// `page.text` does.
+    #[getter]
+    fn text(&self) -> String {
+        self.rows
+            .iter()
+            .map(|row| {
+                row.iter()
+                    .map(|c| c.get().text.as_str())
+                    .collect::<Vec<_>>()
+                    .join("\t")
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// The table as a list of rows of strings — the shape `csv.writer` wants.
+    fn to_rows(&self) -> Vec<Vec<String>> {
+        self.rows
+            .iter()
+            .map(|row| row.iter().map(|c| c.get().text.clone()).collect())
+            .collect()
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "<TableBlock {} {}x{} confidence={:.2}>",
+            self.reading_index, self.row_count, self.column_count, self.confidence
+        )
+    }
+}
+
 /// One page of a document.
 #[pyclass(frozen, module = "qalam")]
 pub struct Page {
@@ -148,7 +387,17 @@ pub struct Page {
     /// Human-readable reasons behind the verdict; empty when the page is clean.
     #[pyo3(get)]
     reasons: Vec<String>,
+    /// True when this page's reading order came from the document's own
+    /// structure tree rather than from geometry.
+    ///
+    /// The lucky case: the writer stated the order and we followed it. `False`
+    /// means we reconstructed it, which is best-effort.
+    #[pyo3(get)]
+    tagged: bool,
     lines: Vec<Py<Line>>,
+    blocks: Vec<Py<PyAny>>,
+    images: Vec<Py<ImageBlock>>,
+    tables: Vec<Py<TableBlock>>,
 }
 
 #[pymethods]
@@ -158,6 +407,28 @@ impl Page {
     fn lines(&self, py: Python<'_>) -> Vec<Py<Line>> {
         // `clone_ref` bumps Python's reference count; it does not copy a Line.
         self.lines.iter().map(|l| l.clone_ref(py)).collect()
+    }
+
+    /// The page's content as typed blocks, in reading order.
+    ///
+    /// A mixed list of `TextBlock`, `ImageBlock` and `TableBlock`. Each carries
+    /// a `kind` of `"text"`, `"image"` or `"table"`, so a caller can branch on
+    /// that rather than on `isinstance`.
+    #[getter]
+    fn blocks(&self, py: Python<'_>) -> Vec<Py<PyAny>> {
+        self.blocks.iter().map(|b| b.clone_ref(py)).collect()
+    }
+
+    /// Just the images on this page.
+    #[getter]
+    fn images(&self, py: Python<'_>) -> Vec<Py<ImageBlock>> {
+        self.images.iter().map(|b| b.clone_ref(py)).collect()
+    }
+
+    /// Just the tables on this page.
+    #[getter]
+    fn tables(&self, py: Python<'_>) -> Vec<Py<TableBlock>> {
+        self.tables.iter().map(|b| b.clone_ref(py)).collect()
     }
 
     fn __repr__(&self) -> String {
@@ -276,24 +547,48 @@ fn to_py_page(py: Python<'_>, page: &qalam_core::Page) -> PyResult<Page> {
     let lines = page
         .lines
         .iter()
-        .map(|line| {
-            Py::new(
-                py,
-                Line {
-                    text: line.text.clone(),
-                    baseline: line.baseline,
-                    direction: match line.direction {
-                        qalam_core::Direction::Rtl => "rtl".to_string(),
-                        qalam_core::Direction::Ltr => "ltr".to_string(),
-                    },
-                    font: line.style.font.clone(),
-                    size: line.style.size,
-                    color: line.style.color.to_css_hex(),
-                    confidence: line.resolution_rate(),
-                },
-            )
-        })
+        .map(|line| Py::new(py, to_py_line(line)))
         .collect::<PyResult<Vec<_>>>()?;
+
+    // The blocks, in reading order. Each variant becomes its own Python type,
+    // so a caller gets real attributes rather than a tagged union to unpack.
+    let mut blocks: Vec<Py<PyAny>> = Vec::with_capacity(page.blocks.len());
+    let mut images = Vec::new();
+    let mut tables = Vec::new();
+
+    for block in &page.blocks {
+        match block {
+            qalam_core::Block::Text(text) => {
+                let lines = text
+                    .lines
+                    .iter()
+                    .map(|line| Py::new(py, to_py_line(line)))
+                    .collect::<PyResult<Vec<_>>>()?;
+                let object = Py::new(
+                    py,
+                    TextBlock {
+                        kind: "text",
+                        reading_index: text.reading_index,
+                        bbox: rect(text.bbox),
+                        text: text.text(),
+                        confidence: text.confidence,
+                        lines,
+                    },
+                )?;
+                blocks.push(object.into_any());
+            }
+            qalam_core::Block::Image(image) => {
+                let object = Py::new(py, to_py_image(image))?;
+                images.push(object.clone_ref(py));
+                blocks.push(object.into_any());
+            }
+            qalam_core::Block::Table(table) => {
+                let object = Py::new(py, to_py_table(py, table)?)?;
+                tables.push(object.clone_ref(py));
+                blocks.push(object.into_any());
+            }
+        }
+    }
 
     Ok(Page {
         number: page.number,
@@ -305,7 +600,104 @@ fn to_py_page(py: Python<'_>, page: &qalam_core::Page) -> PyResult<Page> {
         needs_ocr: page.needs_ocr(),
         confidence: page.confidence(),
         reasons: page.report.reasons.clone(),
+        tagged: page.tagged,
         lines,
+        blocks,
+        images,
+        tables,
+    })
+}
+
+/// A core rectangle as the `(x0, y0, x1, y1)` tuple Python sees.
+///
+/// A tuple rather than a class: it is four numbers with no behaviour, and
+/// Python programmers already know how to unpack one.
+fn rect(r: qalam_core::Rect) -> (f64, f64, f64, f64) {
+    (r.x0, r.y0, r.x1, r.y1)
+}
+
+/// Convert one extracted line.
+fn to_py_line(line: &qalam_core::TextLine) -> Line {
+    Line {
+        text: line.text.clone(),
+        baseline: line.baseline,
+        direction: match line.direction {
+            qalam_core::Direction::Rtl => "rtl".to_string(),
+            qalam_core::Direction::Ltr => "ltr".to_string(),
+        },
+        font: line.style.font.clone(),
+        size: line.style.size,
+        color: line.style.color.to_css_hex(),
+        confidence: line.resolution_rate(),
+    }
+}
+
+/// Convert one image block, decoded or not.
+fn to_py_image(block: &qalam_core::ImageBlock) -> ImageBlock {
+    let common = ImageBlock {
+        kind: "image",
+        reading_index: block.reading_index,
+        bbox: block.bbox.map(rect),
+        is_background: block.is_background,
+        width: None,
+        height: None,
+        format: None,
+        file_name: None,
+        unsupported_reason: None,
+        dropped_transparency: false,
+        data: None,
+    };
+
+    match &block.image {
+        qalam_core::ExtractedImage::Ready(image) => ImageBlock {
+            width: Some(image.width),
+            height: Some(image.height),
+            format: Some(image.format.extension().to_string()),
+            file_name: Some(image.file_name()),
+            dropped_transparency: image.dropped_transparency,
+            data: Some(image.data.clone()),
+            ..common
+        },
+        // An image we declined to decode is reported with its reason, never
+        // silently dropped.
+        qalam_core::ExtractedImage::Unsupported { reason, .. } => ImageBlock {
+            unsupported_reason: Some(reason.clone()),
+            ..common
+        },
+    }
+}
+
+/// Convert one table block.
+fn to_py_table(py: Python<'_>, block: &qalam_core::TableBlock) -> PyResult<TableBlock> {
+    let table = &block.table;
+    let rows = table
+        .rows
+        .iter()
+        .map(|row| {
+            row.iter()
+                .map(|cell| {
+                    Py::new(
+                        py,
+                        Cell {
+                            text: cell.text.clone(),
+                            row: cell.row,
+                            column: cell.column,
+                            bbox: rect(cell.bbox),
+                        },
+                    )
+                })
+                .collect::<PyResult<Vec<_>>>()
+        })
+        .collect::<PyResult<Vec<_>>>()?;
+
+    Ok(TableBlock {
+        kind: "table",
+        reading_index: block.reading_index,
+        bbox: rect(table.bbox),
+        confidence: table.confidence,
+        row_count: table.row_count(),
+        column_count: table.column_count(),
+        rows,
     })
 }
 
@@ -330,6 +722,10 @@ fn qalam(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<Document>()?;
     m.add_class::<Page>()?;
     m.add_class::<Line>()?;
+    m.add_class::<TextBlock>()?;
+    m.add_class::<ImageBlock>()?;
+    m.add_class::<TableBlock>()?;
+    m.add_class::<Cell>()?;
     m.add_function(wrap_pyfunction!(extract_text, m)?)?;
     Ok(())
 }

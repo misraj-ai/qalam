@@ -255,9 +255,18 @@ fn encode_samples(raw: &RawImage) -> std::result::Result<ExtractedImage, String>
         ImageColorSpace::Gray => image::ColorType::L8,
         ImageColorSpace::Rgb => image::ColorType::Rgb8,
         ImageColorSpace::Cmyk => {
-            // PNG has no CMYK. A correct conversion needs the document's ICC
-            // profile; the naive formula would shift every colour.
-            return Err("CMYK samples need a colour-managed conversion".to_string());
+            // PNG has no CMYK, so the samples are converted to RGB.
+            //
+            // This uses the same naive `(1-c)(1-k)` formula as `Color::to_rgb8`
+            // — deliberately, because refusing here while converting text
+            // colour there would be an inconsistency dressed up as caution. A
+            // colour-managed conversion needs the document's ICC profile;
+            // without one this is the standard approximation, and it is
+            // visually close on screen.
+            //
+            // The alternative is not "a more accurate image" but *no image*:
+            // `bar_Persons.pdf` stores 142 of its 177 pictures this way.
+            return encode_cmyk(raw);
         }
         ImageColorSpace::Indexed => {
             // Expand the indices into real colours, then carry on as if the
@@ -314,6 +323,42 @@ fn encode_samples(raw: &RawImage) -> std::result::Result<ExtractedImage, String>
         data,
         dropped_transparency: raw.has_smask,
     }))
+}
+
+/// Convert CMYK samples to RGB and encode them.
+fn encode_cmyk(raw: &RawImage) -> std::result::Result<ExtractedImage, String> {
+    let pixels = (raw.width as usize)
+        .checked_mul(raw.height as usize)
+        .ok_or_else(|| "image dimensions overflow".to_string())?;
+    let expected = pixels
+        .checked_mul(4)
+        .ok_or_else(|| "image dimensions overflow".to_string())?;
+
+    if raw.data.len() < expected {
+        return Err(format!(
+            "truncated: {} sample bytes for a {}x{} CMYK image needing {}",
+            raw.data.len(),
+            raw.width,
+            raw.height,
+            expected
+        ));
+    }
+
+    let mut rgb = Vec::with_capacity(pixels * 3);
+    for chunk in raw.data[..expected].chunks_exact(4) {
+        // Samples are ink coverage, 0 = none. `255 - v` gives the light that
+        // survives, and the product of the two is the channel's value.
+        let k = 255 - chunk[3] as u32;
+        for ink in &chunk[..3] {
+            rgb.push(((255 - *ink as u32) * k / 255) as u8);
+        }
+    }
+
+    encode_samples(&RawImage {
+        color_space: ImageColorSpace::Rgb,
+        data: rgb,
+        ..raw.clone()
+    })
 }
 
 /// Expand an `/Indexed` image into its palette's colour space and encode that.
@@ -474,10 +519,6 @@ mod tests {
                 "JBIG2Decode",
             ),
             (
-                extract_one(&raw(&[], ImageColorSpace::Cmyk, 8, vec![0; 16])),
-                "colour-managed",
-            ),
-            (
                 extract_one(&raw(&[], ImageColorSpace::Indexed, 8, vec![0; 4])),
                 "no palette",
             ),
@@ -576,6 +617,30 @@ mod tests {
         let placed = extract_placed(&raws, &uses);
         assert_eq!(placed.len(), 1);
         assert!(placed[0].bbox.is_none());
+    }
+
+    #[test]
+    fn cmyk_samples_convert_to_rgb() {
+        // Four pixels: pure cyan, pure magenta, pure black (via K), and white.
+        let data = vec![
+            255, 0, 0, 0, // cyan
+            0, 255, 0, 0, // magenta
+            0, 0, 0, 255, // black
+            0, 0, 0, 0, // white
+        ];
+        let out = extract_one(&raw(&["FlateDecode"], ImageColorSpace::Cmyk, 8, data));
+        let ExtractedImage::Ready(img) = out else {
+            panic!("CMYK should convert rather than be refused");
+        };
+        assert_eq!(img.format, ImageFormat::Png);
+        assert_eq!(&img.data[..4], &[0x89, b'P', b'N', b'G']);
+    }
+
+    #[test]
+    fn a_truncated_cmyk_stream_is_refused() {
+        // Four channels per pixel, so a 2x2 image needs 16 bytes.
+        let out = extract_one(&raw(&[], ImageColorSpace::Cmyk, 8, vec![0; 8]));
+        assert!(reason(&out).contains("truncated"), "got: {}", reason(&out));
     }
 
     #[test]
