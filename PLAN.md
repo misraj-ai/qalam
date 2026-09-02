@@ -286,13 +286,10 @@ qalam/
 │   │       └── types.rs      # Glyph, Line, Block(Text/Image/Table), Page, Confidence
 │   │
 │   └── qalam-py/             # L5: PyO3 bindings, depends on qalam-core
-│       ├── Cargo.toml
+│       ├── Cargo.toml        # [lib] name = "qalam", crate-type = ["cdylib"]
 │       ├── pyproject.toml    # maturin build config
+│       ├── README.md         # the package's PyPI front page
 │       └── src/lib.rs
-│
-├── python/
-│   └── qalam/
-│       └── __init__.py       # re-exports + any pure-Python conveniences
 │
 ├── cli/                      # optional: `qalam extract file.pdf` for quick testing
 │   └── src/main.rs
@@ -329,8 +326,9 @@ Rationale: `qalam-core` knows nothing about Python, so it stays independently us
   Recoverable fixtures now produce correct logical Unicode.
 - **M3 — Detector.** Implement L4 confidence scoring; `no_tounicode` fixtures flag
   `needs_ocr` instead of emitting garbage. Add `/ActualText` handling.
-- **M4 — Python bindings.** PyO3 + maturin; `pip install -e .` then
-  `qalam.extract_text("file.pdf")` works. Return per-page metadata + confidence.
+- **M4 — Python bindings.** *(done)* PyO3 + maturin; `maturin develop` then
+  `qalam.extract_text("file.pdf")` works, plus `Document`/`Page`/`Line` with per-page
+  metadata and confidence. Ships as an abi3 wheel (one wheel for Python 3.9+).
 - **M5 — Corpus + benchmarks.** Build a real test corpus, golden-file tests, and a
   benchmark vs pypdfium2/PyMuPDF (correctness parity + speed). *End of Tier A.*
 - **M6 — Images (Tier B, do first).** Extract `/XObject` images per page: DCTDecode
@@ -469,6 +467,31 @@ The `/ToUnicode` stream is a PostScript-flavoured CMap. The parser only needs a 
 - Destinations are **UTF-16BE**, possibly multiple code units → decode to a `String`.
 It is NOT full PostScript; a small tokenizer over these keywords is enough. Do not pull in
 a PostScript interpreter.
+
+### 10.6 — The binding is thin because the orchestration moved down
+
+Before M4 the CLI owned the pipeline sequence: build the font map, interpret, reconstruct,
+assess — in that order, with L2 necessarily *before* L1 because the interpreter needs the
+font map's advance widths. A second front end reimplementing that order is a second front
+end that will drift out of step with it, silently.
+
+So the sequence moved into `qalam_core::Document`, and both the CLI and the Python module
+became presentation-only. `cli/src/extract.rs` fell from ~90 lines to ~40, with byte-identical
+output. Rules this produced:
+
+- **No pure-Python source tree.** The plan originally had a `python/qalam/__init__.py` for
+  re-exports; with a pure-Rust module there is nothing to re-export, and PyO3 carries the
+  docstrings. One fewer place for the two APIs to disagree.
+- **Not every error is a custom exception.** A missing file raises `FileNotFoundError`, an
+  unreadable one `PermissionError`, a bad page number `IndexError`. `QalamError` is reserved
+  for what is genuinely qalam-specific: a malformed PDF. Matching on the wrapped
+  `io::ErrorKind` is what makes the first two distinguishable.
+- **Release the GIL around extraction.** Parsing touches no Python objects, so it runs under
+  `py.detach`. Measured: a competing Python thread ran 3.6M iterations during a 0.22s
+  extraction of the 44-page fixture. This is most of the reason a native extension is worth
+  writing at all.
+- **`Document.text` omits pages needing OCR, in Python too.** The honesty guarantee has to
+  hold at the API boundary a caller actually touches, not just in the CLI's printing.
 
 ### 10.4 — Columns are not optional, and a global column pass cannot find them
 

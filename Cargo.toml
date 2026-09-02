@@ -1,5 +1,10 @@
 [workspace]
-members = ["crates/qalam-core", "cli"]
+members = ["crates/qalam-core", "crates/qalam-py", "cli"]
+# `qalam-py` is a Python extension module: its test harness would need to link
+# against libpython, which a plain `cargo test` cannot do. Leaving it out of the
+# default members keeps `cargo build` and `cargo test` working at the repo root,
+# while maturin still builds it explicitly by path.
+default-members = ["crates/qalam-core", "cli"]
 resolver = "2"
 
 [workspace.dependencies]
@@ -7,3 +12,4 @@ lopdf = "0.44"
 unicode-normalization = "0.1"
 unicode-bidi = "0.3"
 thiserror = "2"
+pyo3 = "0.29"
