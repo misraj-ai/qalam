@@ -216,7 +216,10 @@ fn columns_are_not_interleaved() {
         "يهدف هذا الدليل إلى تطوير دور",
         "يتضمن الدليل الإرشادات وقائمة",
     ] {
-        assert!(text.contains(sentence), "card text was broken up: {sentence}");
+        assert!(
+            text.contains(sentence),
+            "card text was broken up: {sentence}"
+        );
     }
 
     // And the cards must appear right-to-left, in that order.
@@ -237,7 +240,10 @@ fn scanned_pages_are_flagged_rather_than_returned_empty() {
 
     for number in doc.pages_needing_ocr() {
         let page = doc.page(number).expect("flagged page exists");
-        assert!(!page.report.reasons.is_empty(), "page {number} gave no reason");
+        assert!(
+            !page.report.reasons.is_empty(),
+            "page {number} gave no reason"
+        );
         assert_eq!(page.confidence(), 0.0);
     }
 }
@@ -249,11 +255,9 @@ fn every_readable_page_resolves_every_glyph() {
     let Some(doc) = fixture() else { return };
     for page in doc.pages().iter().filter(|p| !p.needs_ocr()) {
         assert_eq!(
-            page.report.signals.unresolved,
-            0,
+            page.report.signals.unresolved, 0,
             "page {} left {} glyph(s) unresolved",
-            page.number,
-            page.report.signals.unresolved
+            page.number, page.report.signals.unresolved
         );
     }
 }

@@ -18,7 +18,9 @@
 use lopdf::{Dictionary, Document, Object, ObjectId};
 
 use crate::error::{Error, Result};
-use crate::types::{CodeToUnicode, FontInfo, PageInfo, RawFont, Rect, Rotation};
+use crate::types::{
+    CodeToUnicode, FontInfo, ImageColorSpace, PageInfo, Palette, RawFont, RawImage, Rect, Rotation,
+};
 
 /// An opened PDF document.
 ///
@@ -101,6 +103,204 @@ impl Pdf {
             .into_iter()
             .map(|(name, dict)| self.raw_font(&name, dict))
             .collect())
+    }
+
+    /// Pull every image XObject on a page out of the object graph.
+    ///
+    /// Forms are skipped: a `/Subtype /Form` XObject is a reusable *content
+    /// stream*, not a picture, and belongs to a different problem.
+    pub fn page_raw_images(&self, page_number: u32) -> Result<Vec<RawImage>> {
+        let id = self.page_id(page_number)?;
+
+        // `/XObject` lives in `/Resources`, which is inheritable — a document
+        // may declare it once on the page tree root.
+        let Some(xobjects) = self
+            .inherited(id, b"Resources")
+            .and_then(|o| o.as_dict().ok())
+            .and_then(|res| self.lookup(res, b"XObject"))
+            .and_then(|o| o.as_dict().ok())
+        else {
+            return Ok(Vec::new());
+        };
+
+        let mut images = Vec::new();
+        for (name, value) in xobjects.iter() {
+            let Ok(stream) = self.resolve(value).and_then(|o| Ok(o.as_stream()?)) else {
+                continue;
+            };
+            if name_of(&stream.dict, b"Subtype").as_deref() != Some("Image") {
+                continue;
+            }
+            if let Some(image) = self.raw_image(name, stream) {
+                images.push(image);
+            }
+        }
+        Ok(images)
+    }
+
+    /// Read one image stream into plain data.
+    ///
+    /// Returns `None` for a stream we cannot even establish the dimensions of;
+    /// there is nothing useful a later layer could do with it.
+    fn raw_image(&self, resource_name: &[u8], stream: &lopdf::Stream) -> Option<RawImage> {
+        let dict = &stream.dict;
+        let width = self.lookup(dict, b"Width")?.as_i64().ok()?;
+        let height = self.lookup(dict, b"Height")?.as_i64().ok()?;
+        if width <= 0 || height <= 0 {
+            return None;
+        }
+
+        let filters = self.filters_of(dict);
+
+        // The image codec, if any, is the last filter in the chain. Everything
+        // before it (compression, ASCII armour) has to come off first; the
+        // codec's own bytes stay as they are.
+        let data = if filters.last().is_some_and(|f| is_image_codec(f)) {
+            stream.content.clone()
+        } else {
+            // `decompressed_content` undoes /FlateDecode and friends. A stream
+            // that will not decode is passed through raw rather than dropped —
+            // `images.rs` can still report what it is.
+            stream
+                .decompressed_content()
+                .unwrap_or_else(|_| stream.content.clone())
+        };
+
+        Some(RawImage {
+            resource_name: String::from_utf8_lossy(resource_name).into_owned(),
+            width: width as u32,
+            height: height as u32,
+            bits_per_component: self
+                .lookup(dict, b"BitsPerComponent")
+                .and_then(|o| o.as_i64().ok())
+                .unwrap_or(8)
+                .clamp(1, 16) as u8,
+            color_space: self.image_color_space(dict),
+            palette: self.image_palette(dict),
+            filters,
+            data,
+            has_smask: dict.get(b"SMask").is_ok() || dict.get(b"Mask").is_ok(),
+        })
+    }
+
+    /// Resolve an `/Indexed` colour space's lookup table.
+    ///
+    /// The array is `[/Indexed base hival lookup]`, where `lookup` is either a
+    /// literal string or a stream — both forms occur, so both are handled.
+    fn image_palette(&self, dict: &Dictionary) -> Option<Palette> {
+        let array = self.lookup(dict, b"ColorSpace")?.as_array().ok()?;
+        let family = array.first()?.as_name().ok()?;
+        if !matches!(String::from_utf8_lossy(family).as_ref(), "Indexed" | "I") {
+            return None;
+        }
+
+        // The palette's own colour space, which says how wide an entry is. It
+        // may be a bare name or a nested array such as `[/ICCBased ...]`.
+        let base_obj = self.resolve(array.get(1)?).ok()?;
+        let base = match base_obj.as_name() {
+            Ok(name) => classify_color_space(&String::from_utf8_lossy(name)),
+            Err(_) => self.color_space_of_object(base_obj),
+        };
+        base.components()?;
+
+        let lookup = self.resolve(array.get(3)?).ok()?;
+        let entries = match lookup {
+            Object::String(bytes, _) => bytes.clone(),
+            // A stream's table may be compressed like any other.
+            Object::Stream(stream) => stream
+                .decompressed_content()
+                .unwrap_or_else(|_| stream.content.clone()),
+            _ => return None,
+        };
+
+        Some(Palette { base, entries })
+    }
+
+    /// Classify a colour-space *object* that is an array, e.g. `[/ICCBased s]`.
+    fn color_space_of_object(&self, obj: &Object) -> ImageColorSpace {
+        let Ok(array) = obj.as_array() else {
+            return ImageColorSpace::Other;
+        };
+        let Some(family) = array.first().and_then(|o| o.as_name().ok()) else {
+            return ImageColorSpace::Other;
+        };
+        match String::from_utf8_lossy(family).as_ref() {
+            "ICCBased" => array
+                .get(1)
+                .and_then(|o| self.resolve(o).ok())
+                .and_then(|o| o.as_stream().ok())
+                .and_then(|s| self.lookup(&s.dict, b"N"))
+                .and_then(|o| o.as_i64().ok())
+                .map(|n| match n {
+                    1 => ImageColorSpace::Gray,
+                    3 => ImageColorSpace::Rgb,
+                    4 => ImageColorSpace::Cmyk,
+                    _ => ImageColorSpace::Other,
+                })
+                .unwrap_or(ImageColorSpace::Other),
+            other => classify_color_space(other),
+        }
+    }
+
+    /// The filter chain, whether written as one name or an array of them.
+    fn filters_of(&self, dict: &Dictionary) -> Vec<String> {
+        let Some(filter) = self.lookup(dict, b"Filter") else {
+            return Vec::new();
+        };
+
+        if let Ok(name) = filter.as_name() {
+            return vec![String::from_utf8_lossy(name).into_owned()];
+        }
+        filter
+            .as_array()
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(|o| self.resolve(o).ok()?.as_name().ok())
+                    .map(|n| String::from_utf8_lossy(n).into_owned())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Classify `/ColorSpace`, which may be a name or an array.
+    fn image_color_space(&self, dict: &Dictionary) -> ImageColorSpace {
+        let Some(cs) = self.lookup(dict, b"ColorSpace") else {
+            return ImageColorSpace::Other;
+        };
+
+        if let Ok(name) = cs.as_name() {
+            return classify_color_space(&String::from_utf8_lossy(name));
+        }
+
+        // The array forms: `[/ICCBased stream]`, `[/Indexed base hival lookup]`,
+        // `[/CalRGB dict]`, and so on.
+        let Ok(array) = cs.as_array() else {
+            return ImageColorSpace::Other;
+        };
+        let Some(family) = array.first().and_then(|o| o.as_name().ok()) else {
+            return ImageColorSpace::Other;
+        };
+
+        match String::from_utf8_lossy(family).as_ref() {
+            "Indexed" | "I" => ImageColorSpace::Indexed,
+            // An ICC profile we do not interpret; its `/N` says how many
+            // components it has, which is all we need to read the samples.
+            "ICCBased" => array
+                .get(1)
+                .and_then(|o| self.resolve(o).ok())
+                .and_then(|o| o.as_stream().ok())
+                .and_then(|s| self.lookup(&s.dict, b"N"))
+                .and_then(|o| o.as_i64().ok())
+                .map(|n| match n {
+                    1 => ImageColorSpace::Gray,
+                    3 => ImageColorSpace::Rgb,
+                    4 => ImageColorSpace::Cmyk,
+                    _ => ImageColorSpace::Other,
+                })
+                .unwrap_or(ImageColorSpace::Other),
+            other => classify_color_space(other),
+        }
     }
 
     /// Extract one font dictionary into plain data.
@@ -408,6 +608,28 @@ impl Pdf {
             encoding,
             code_to_unicode,
         }
+    }
+}
+
+/// Is this filter an image codec rather than a general-purpose one?
+///
+/// The distinction decides whether the stream's bytes are raw samples or an
+/// encoded picture we should hand on untouched.
+fn is_image_codec(filter: &str) -> bool {
+    matches!(
+        filter,
+        "DCTDecode" | "DCT" | "JPXDecode" | "CCITTFaxDecode" | "CCF" | "JBIG2Decode"
+    )
+}
+
+/// Map a colour-space name onto what we model.
+fn classify_color_space(name: &str) -> ImageColorSpace {
+    match name {
+        "DeviceGray" | "CalGray" | "G" => ImageColorSpace::Gray,
+        "DeviceRGB" | "CalRGB" | "RGB" => ImageColorSpace::Rgb,
+        "DeviceCMYK" | "CMYK" => ImageColorSpace::Cmyk,
+        "Indexed" | "I" => ImageColorSpace::Indexed,
+        _ => ImageColorSpace::Other,
     }
 }
 

@@ -21,6 +21,7 @@
 //! | L3 | [`bidi`]     | UAX #9 wrapper: visual order → logical order |
 //! | L4 | [`detect`]   | recoverability scoring: `ok` vs `needs_ocr` |
 //! | L6 | [`layout`]   | recursive XY-cut: columns and reading order (RTL) |
+//! | L7 | [`images`]   | `/XObject` image extraction: passthrough or PNG |
 //!
 //! Alongside the text, L1 records the *styling* each glyph was painted with —
 //! fill colour, font, effective size, render mode — as a [`Style`]. Nothing in
@@ -51,6 +52,7 @@ pub mod encoding;
 pub mod error;
 pub mod font;
 pub mod graphics;
+pub mod images;
 pub mod layout;
 pub mod parser;
 pub mod types;
@@ -66,6 +68,7 @@ pub use document::{extract_text, Document, Page};
 pub use error::{Error, Result};
 pub use font::{CMap, Font, FontMap};
 pub use graphics::Matrix;
+pub use images::{ExtractedImage, Image, ImageFormat};
 pub use parser::Pdf;
 pub use types::{
     ClipTextMode, CodeToUnicode, Color, FontInfo, Glyph, PageInfo, RawFont, Rect, Rotation, Style,

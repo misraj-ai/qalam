@@ -13,3 +13,7 @@ unicode-normalization = "0.1"
 unicode-bidi = "0.3"
 thiserror = "2"
 pyo3 = "0.29"
+# PNG encoding only: DCTDecode images pass through as JPEG untouched, so no
+# decoder is needed and the default feature set (every format under the sun)
+# would be a large build for nothing.
+image = { version = "0.25", default-features = false, features = ["png"] }

@@ -482,6 +482,107 @@ impl RawFont {
     }
 }
 
+/// How an image's samples are to be interpreted.
+///
+/// Only the device spaces are modelled precisely. Anything else is recorded as
+/// [`ImageColorSpace::Other`] rather than guessed at — the same rule [`Color`]
+/// follows, and for the same reason: a wrong colour space turns a picture into
+/// noise, and noise that looks deliberate is worse than an honest refusal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ImageColorSpace {
+    /// One component per sample.
+    Gray,
+    /// Three components: red, green, blue.
+    Rgb,
+    /// Four components. Needs conversion before any common image format can
+    /// hold it.
+    Cmyk,
+    /// `/Indexed`: samples are indices into a palette. Needs the palette
+    /// expanded before the pixels mean anything.
+    Indexed,
+    /// A space we did not resolve — `/Separation`, `/DeviceN`, a pattern.
+    Other,
+}
+
+impl ImageColorSpace {
+    /// How many samples make up one pixel.
+    ///
+    /// `Indexed` and `Other` return `None`: the answer is not knowable from the
+    /// space's name alone, so no caller can be handed a plausible wrong number.
+    pub fn components(self) -> Option<usize> {
+        match self {
+            ImageColorSpace::Gray | ImageColorSpace::Indexed => Some(1),
+            ImageColorSpace::Rgb => Some(3),
+            ImageColorSpace::Cmyk => Some(4),
+            ImageColorSpace::Other => None,
+        }
+    }
+}
+
+/// The lookup table of an `/Indexed` colour space.
+///
+/// Samples in an indexed image are not colours; they are *subscripts* into this
+/// table. Nothing about the pixels means anything until it is applied.
+#[derive(Debug, Clone)]
+pub struct Palette {
+    /// What the entries themselves are — usually [`ImageColorSpace::Rgb`].
+    pub base: ImageColorSpace,
+    /// The entries, laid end to end: `base.components()` bytes each.
+    pub entries: Vec<u8>,
+}
+
+impl Palette {
+    /// Look up one index, returning its components.
+    ///
+    /// `None` for an index past the end of the table, which a malformed file
+    /// can easily contain.
+    pub fn get(&self, index: usize) -> Option<&[u8]> {
+        let width = self.base.components()?;
+        let start = index.checked_mul(width)?;
+        self.entries.get(start..start + width)
+    }
+}
+
+/// An image XObject pulled out of the object graph, before decoding.
+///
+/// The hand-off from L0 to L7, mirroring [`RawFont`]: `parser.rs` walks the
+/// object graph and resolves references; `images.rs` decides what the bytes
+/// mean. Splitting them at plain data means the decoding logic is testable
+/// without a PDF.
+#[derive(Debug, Clone)]
+pub struct RawImage {
+    /// The `/Resources /XObject` name the content stream draws with, e.g. `Im0`
+    /// in `/Im0 Do`.
+    pub resource_name: String,
+    /// Pixel width and height, from `/Width` and `/Height`.
+    pub width: u32,
+    /// Pixel height.
+    pub height: u32,
+    /// `/BitsPerComponent`: 1, 2, 4, 8 or 16.
+    pub bits_per_component: u8,
+    /// How to read the samples.
+    pub color_space: ImageColorSpace,
+    /// The filter chain as named in the stream, outermost first.
+    pub filters: Vec<String>,
+    /// The image bytes.
+    ///
+    /// Non-image filters (`/FlateDecode`, `/LZWDecode`) have already been
+    /// undone, so for those this is raw samples. For an image *codec*
+    /// (`/DCTDecode`, `/JPXDecode`, the fax filters) the codec's own bytes are
+    /// left intact — a JPEG inside a PDF is already a JPEG file, and
+    /// re-encoding it would lose quality for nothing.
+    pub data: Vec<u8>,
+    /// For `/Indexed` images, the palette: `components`-byte entries, one per
+    /// index, already resolved from the `/Indexed` array's lookup table.
+    pub palette: Option<Palette>,
+    /// Whether the image carries a `/SMask` (a soft-mask alpha channel).
+    ///
+    /// Recorded but **not merged**: compositing it is listed as an open
+    /// question in PLAN.md §8. A caller that ignores this will see a picture
+    /// with its transparency filled in.
+    pub has_smask: bool,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

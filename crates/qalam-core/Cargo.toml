@@ -8,3 +8,4 @@ lopdf = { workspace = true }
 unicode-normalization = { workspace = true }
 unicode-bidi = { workspace = true }
 thiserror = { workspace = true }
+image = { workspace = true }

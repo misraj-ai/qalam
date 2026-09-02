@@ -338,9 +338,10 @@ Rationale: `qalam-core` knows nothing about Python, so it stays independently us
   place — see §10.7. **The corpus itself is still one document.** Every threshold in
   `detect.rs` and `layout.rs` remains a judgement call until that is fixed; more fixtures
   is the single highest-value work left in Tier A.
-- **M6 — Images (Tier B, do first).** Extract `/XObject` images per page: DCTDecode
-  passthrough, Flate+samples → PNG, position via the `Do`-operator CTM. Highest value for
-  least risk. Emit `Image` blocks.
+- **M6 — Images (Tier B, do first).** *(partly done)* Extract `/XObject` images per page:
+  DCTDecode passthrough, Flate+samples → PNG, `/Indexed` palettes expanded — see §10.8.
+  **Still to do:** position via the `Do`-operator CTM, images nested inside form XObjects,
+  `/SMask` compositing, and emitting them as `Image` blocks.
 - **M7 — Reading order (Tier B).** L1.5 tagged-tree reader + L6 XY-cut fallback with RTL
   column ordering. Emit ordered `Text` blocks; validate against `tagged/` and `multicolumn/`.
   *(L6 landed early, during M3 — see §10.4. The tagged-tree reader and `Block` emission
@@ -474,6 +475,37 @@ The `/ToUnicode` stream is a PostScript-flavoured CMap. The parser only needs a 
 - Destinations are **UTF-16BE**, possibly multiple code units → decode to a `String`.
 It is NOT full PostScript; a small tokenizer over these keywords is enough. Do not pull in
 a PostScript interpreter.
+
+### 10.8 — Images: passthrough is the feature, and a blank logo is not a bug
+
+All six image XObjects in the fixture now extract, and Pillow opens every one at the right
+dimensions. Two rules did most of the work:
+
+- **A `/DCTDecode` image is already a JPEG file.** Its bytes go straight to disk. Decoding
+  and re-encoding would cost time and lose quality for nothing. `/JPXDecode` likewise.
+- **Everything else is raw samples**, meaningless to a viewer, and gets packed into a PNG —
+  lossless, so nothing degrades on the way.
+
+`/Indexed` was worth supporting rather than refusing: two of the six images use it, so
+without palette expansion the feature would have been "works on a third of this document".
+Our expanded PNG is **pixel-identical** to PyMuPDF's extraction of the same object, which is
+the check that made the next finding trustworthy.
+
+**The finding that matters: a correct extraction can still be useless.** That 519x145
+indexed image comes out entirely white — every pixel within one step of 255. It is not a
+bug; PyMuPDF produces exactly the same pixels. The logo's whole shape lives in its
+`/SMask`, and the base image is a blank rectangle. So `dropped_transparency` is not a note
+about edge quality, it means *this picture may be meaningless on its own*. Compositing the
+mask moved from "nice to have" to a real gap.
+
+Two other honest gaps this exposed:
+- **Images inside form XObjects are invisible to us.** The fixture contains DeviceGray
+  images (974x272, 739x126) that never appear in the extraction, because they live in a
+  form's own `/Resources` and we do not recurse into forms. The same recursion would fix
+  the one form that contains text (§10.2 note).
+- **Sub-byte sample depths are refused, not guessed.** 1-, 2- and 4-bit samples are packed
+  several pixels to a byte against a row stride; unpacking them is real work, and none of it
+  is guesswork, so it is deferred rather than faked.
 
 ### 10.7 — Measured against pdfium and PyMuPDF: what the competition gets wrong
 
