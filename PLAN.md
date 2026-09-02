@@ -156,7 +156,11 @@ Layered so each stage is independently testable. Data flows top to bottom.
   pages are a strong hint for the L4 detector that we are reading someone else's OCR
   rather than born-digital text.
 - **Resolution is a fallback chain** (L2), in priority order: `/ActualText` →
-  `/ToUnicode` → simple-font `/Encoding` (+ `/Differences`) → embedded font's own cmap.
+  `/ToUnicode` → simple-font `/Encoding` (+ `/Differences`) → embedded font's own charset.
+  With one exception: when `/ToUnicode` and `/Differences` disagree about a **numeric
+  separator**, the latter wins, because the renderer checks it and nothing checks
+  `/ToUnicode` (§10.15). The override is confined to separators precisely so that it cannot
+  become a general licence to second-guess the map.
 - **The detector (L4) is the differentiating feature.** Signals: fraction of glyphs
   with no Unicode mapping, fraction mapping to `U+0000`/`.notdef`, presence of a
   `ToUnicode` stream at all, ratio of presentation-form vs base codepoints, and
@@ -355,8 +359,10 @@ Rationale: `qalam-core` knows nothing about Python, so it stays independently us
   the interpreter now reports painted axis-aligned rules, `tables.rs` clusters them into a
   grid, and cells are filled with the text inside them, columns numbered right-to-left —
   see §10.11. 18 tables found in `bar_Persons.pdf`, none invented in the other fixture.
-  **Still to do:** the tagged `/Table`/`/TR`/`/TD` path, rotated header cells, and
-  borderless/alignment inference — the last remains a stretch and explicitly best-effort.
+  Rotated column headers read correctly (§10.14). **Still to do:** the tagged
+  `/Table`/`/TR`/`/TD` path — `bar_Persons.pdf` tags 21 tables and 1,709 cells, so the
+  information is sitting there — and borderless/alignment inference, which remains a
+  stretch and explicitly best-effort.
 - **M9 — HTML export (Tier D, stretch).** Render the block model to HTML: `dir="rtl"`,
   blocks in reading order, `Span` styling as inline CSS, extracted images inlined. Purely
   additive — it consumes the model, and needs no change to any layer below it.
@@ -400,6 +406,19 @@ Rationale: `qalam-core` knows nothing about Python, so it stays independently us
   lookup plus a tint transform to resolve exactly. Plan: handle the three device spaces
   precisely, approximate `/ICCBased` by its `/N` component count (1 -> Gray, 3 -> RGB,
   4 -> CMYK), and record anything else as `Color::Unknown` rather than guessing wrong.
+- **Type1 and TrueType font programs are not read.** `cff.rs` handles `/FontFile3` only.
+  `/FontFile` (Type 1) hides its encoding in an eexec-encrypted section and `/FontFile2`
+  (TrueType) names glyphs in a `post` table; `bar_Persons.pdf` embeds seven Type 1 fonts, so
+  this is not hypothetical. Both are additive work behind the same interface.
+- **Digits are reported as `/ToUnicode` claims, not as the font names them.** The same fonts
+  that mis-map separators also map Arabic-Indic digit glyphs to Latin characters, so a page
+  rendering `٣٫٧٠٩` extracts as `3٫709`. The value is right and the ordering is right;
+  only the script is the map's rather than the font's. Extending the arbitration to digits
+  would make it fully faithful at the cost of changing a great deal of output — a decision
+  worth taking against a real corpus rather than one document.
+- **Only quarter turns are recognised.** `TextOrientation` snaps to the nearest 90°, so text
+  set on an arbitrary angle — a diagonal watermark, a fan of labels round a pie chart — is
+  treated as horizontal and will group badly.
 - **Kashida (tatweel) justification.** `bar_Persons.pdf` stretches words to the margin by
   inserting U+0640 between letters, so `المعظم` is stored as `المعظــم`. We extract it
   faithfully, which is right — it is in the file — but it means extracted text will not
@@ -490,6 +509,117 @@ The `/ToUnicode` stream is a PostScript-flavoured CMap. The parser only needs a 
 It is NOT full PostScript; a small tokenizer over these keywords is enough. Do not pull in
 a PostScript interpreter.
 
+### 10.15 — Which of a PDF's own claims to believe
+
+Three of the day's bugs came down to one question: when a file contradicts itself, which
+part of it is telling the truth? The answer turns out to be structural rather than a matter
+of taste.
+
+**Trust what the renderer checks.** `/ToUnicode` exists solely to help text extraction —
+*nothing draws it*. A producer can write it wrong and every page still looks perfect, so the
+error survives proofreading, printing and publication. `/Encoding /Differences` is the
+opposite: the renderer walks code → glyph name → outline through it, so an error there is
+visible on the page and gets fixed before anyone ships.
+
+That asymmetry is decisive, and `bar_Persons.pdf` demonstrates it three times over:
+
+```
+                       /ToUnicode says   /Differences says   the page shows
+  code 161 (T1_0)      .                 uni066B  ٫          ٫
+  code 131 (T1_0)      7                 uni0667  ٧          ٧
+  code 159 (T1_0)      6                 uni0666  ٦          ٦
+```
+
+The font contains **no Latin digits at all** — its CFF charset holds only `uni0660`–`uni0669`
+and the Arabic separators. `/ToUnicode` was describing glyphs that do not exist in it.
+
+So `font.rs` now arbitrates. **Narrowly**, because preferring glyph names wholesale would be
+reckless — plenty of subset fonts name glyphs `g42` or `cid123`, and there a good
+`/ToUnicode` is the only real information available. A correction is made only when both
+sources give exactly one character, both are numeric separators, and they differ. It can
+therefore **only ever turn one separator into another**: never a letter, never a digit,
+never a ligature. On a document whose sources agree — every correct PDF — nothing is
+corrected at all, which the first fixture's byte-identical golden file proves empirically.
+
+What it repairs is worth the care: `3,709` was extracting as `3.709`, a value wrong by a
+factor of a thousand and wrong in a way no reader would catch. It now reads `3٫709`, which
+is what the font says and, just as importantly, **cannot be silently misparsed** by whatever
+consumes it downstream.
+
+`cff.rs` reads the same names from the embedded font program as a further fallback, and is
+the fourth rung of §3's chain. It was built first, before the discovery that `/Differences`
+already had the answer — a reminder to exhaust the PDF's own dictionaries before parsing
+binary font programs.
+
+**What remains unfixable from inside the file.** Once corrected, some pages group one number
+with `٫` and another with `,`. The document contradicts *itself*, and no amount of parsing
+settles that, so L4 flags the page `degraded` with a reason. That is the honest end of the
+line.
+
+### 10.14 — Text does not always run left to right
+
+A table's narrow column headers are routinely set on their side to fit. Page 8 of
+`bar_Persons.pdf` does exactly that, and every layer of ours assumed text advances along x:
+each glyph landed on its own baseline, so `أقل من ١٥` came back as `أ( ق ل م ن ٥١ )`.
+
+The direction is taken from the **text rendering matrix** — specifically where it sends the
+unit x vector — rather than inferred from where glyphs happen to fall. A `Glyph` carries a
+`TextOrientation`, and exposes `along()` and `across()`: its position along the reading
+direction and across it. Line grouping, word-gap detection, mark attachment, bounding boxes
+and the layout items all work in those terms, so one code path serves any quarter turn. A
+change of orientation also ends a line, however close the glyphs are.
+
+### 10.13 — Numbers are left-to-right, and a glyph may be a whole number
+
+Two bugs in one place, and the first was ours.
+
+**A glyph can decode to several digits.** `bar_Persons.pdf` has one whose `/ToUnicode` value
+is the three characters `201` — a single glyph for a year's leading digits. The
+multi-character pre-reversal added for Arabic ligatures (§10.10) reversed it to `102`, so
+`(2016 - 2017)` came back as `(1026 - 1027)`. The rule was right for ligatures and wrong in
+general; it now asks whether a piece contains a strong right-to-left **letter**, and digits
+of both scripts are explicitly excluded. Nothing about this is visible in the output — it is
+simply the wrong number, which is the worst way to be wrong.
+
+**A number split across two digit scripts is not merely ugly.** Fonts here map most digit
+glyphs to one script and a few to the other, so `2017` arrives as `20١7`. Latin digits are
+bidi class EN and Arabic-Indic ones AN, so a mixed number is three runs rather than one and
+the reorder moves them independently — the digits end up in the wrong *order*, not just the
+wrong script. `unify_digit_runs` unifies each run to its majority script. That is a repair
+rather than a guess: **a number cannot be written in two numeral systems at once**, so a run
+that appears to be is certainly a mapping fault.
+
+### 10.12 — A synthetic fixture proves a reader runs, not that it is right
+
+`bar_Persons.pdf` **is tagged** — `/StructTreeRoot`, `/MarkInfo /Marked true`, and all 36
+content pages took the tagged reading-order path built in §10.9. The output was far worse
+than geometry would have produced:
+
+```
+before:  3 / م هــم ذوي / 2017 / م و / 2016 / ) أن حــوالي ربــع...   six fragments
+after:   يوضــح الجــدول رقــم (3) أن حــوالي ربــع المســجلين...      one sentence
+```
+
+The cause: **3,638 `/Span` elements**. ISO 32000 §14.8.4 divides structure types into
+*block-level* elements that stack down the page and *inline-level* ones that flow within a
+line. `/Span` is the common inline type, and producers wrap one around every number and
+every change of styling. Treating each as a block gave every inline figure its own
+paragraph.
+
+Two rules followed:
+
+- **Only block-level tags open a region**; inline tags (`Span`, `Link`, `Quote`,
+  `Reference`, …) join the block they sit in. An *unrecognised* tag is treated as
+  block-level, because a custom name is far more likely to be a paragraph style than an
+  inline span, and gluing unrelated paragraphs together is worse than splitting them.
+- **`/RoleMap` must be read.** This file's tags are `NormalParagraphStyle`, `Story`,
+  `Paragraph_Style_1`, `ara_table_text` — InDesign's own names, meaningless until the map
+  translates them to standard types.
+
+The lesson generalises past tagging: a fixture we write ourselves can only test the
+behaviour we already thought of. It proved the reader parsed a tree and honoured its order —
+both true, and both beside the point.
+
 ### 10.11 — Tables: geometry finds the grid, but only the text can confirm it
 
 `bar_Persons.pdf` yields 18 ruled tables. Page 5's comes out essentially perfect — seven
@@ -549,10 +679,15 @@ would be exactly the invention this project refuses.
 
 ### 10.9 — Tagged PDFs, tested against bytes we wrote ourselves
 
-Neither corpus document is tagged: `/StructTreeRoot` appears **zero** times in both. Rather
-than ship a reader that had never seen real input, the test suite builds tagged PDFs from
-scratch — real indirect objects, a real xref table, parsed by the same `lopdf` the library
-uses. Weaker evidence than a document from Word or InDesign, far stronger than asserting
+> **Superseded in part — see §10.12.** When this was written the corpus held one untagged
+> document, so the reader was built against PDFs the test suite writes itself. The second
+> fixture turned out to be tagged, and promptly showed that a synthetic fixture proves a
+> reader *runs*, not that it is *right*.
+
+`test_for_arabic_barser.pdf` is untagged: `/StructTreeRoot` appears **zero** times in it.
+Rather than ship a reader that had never seen real input, the test suite builds tagged PDFs
+from scratch — real indirect objects, a real xref table, parsed by the same `lopdf` the
+library uses. Weaker evidence than a document from InDesign, far stronger than asserting
 against hand-made structs.
 
 The fixture is built so **structure order and geometry disagree**: `Alpha` painted low,

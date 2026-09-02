@@ -199,30 +199,35 @@ fn measure(glyphs: &PageGlyphs, fonts: &FontMap, lines: &[TextLine]) -> Signals 
 /// characters mean the same thing and cannot both be right. A page mixing
 /// `1,234` with `5.678` is internally inconsistent, whatever the intent.
 fn has_mixed_separators(text: &str) -> bool {
+    /// Characters used to group or separate digits, in either script.
+    ///
+    /// Wider than `,` and `.` on purpose: once a font's `/Differences` is
+    /// believed over its `/ToUnicode`, a page can end up grouping one number
+    /// with `٫` and another with `,`. That is the same fault wearing different
+    /// clothes, and just as wrong.
+    const SEPARATORS: [char; 5] = ['.', ',', '\u{060C}', '\u{066B}', '\u{066C}'];
+
     let chars: Vec<char> = text.chars().collect();
-    let mut comma = false;
-    let mut period = false;
+    let mut seen: Vec<char> = Vec::new();
 
     for (i, c) in chars.iter().enumerate() {
-        if *c != ',' && *c != '.' {
+        if !SEPARATORS.contains(c) {
             continue;
         }
-        // A digit before, exactly three after, and no fourth.
+        // A digit before, exactly three after, and no fourth: the shape of
+        // digit *grouping*, where every one of these characters means the same
+        // thing and so they cannot disagree innocently.
         let before = i > 0 && chars[i - 1].is_ascii_digit();
         let after = chars
             .get(i + 1..i + 4)
             .is_some_and(|w| w.len() == 3 && w.iter().all(char::is_ascii_digit));
         let no_fourth = !chars.get(i + 4).is_some_and(char::is_ascii_digit);
 
-        if before && after && no_fourth {
-            if *c == ',' {
-                comma = true;
-            } else {
-                period = true;
-            }
+        if before && after && no_fourth && !seen.contains(c) {
+            seen.push(*c);
         }
     }
-    comma && period
+    seen.len() > 1
 }
 
 /// Turn measurements into a verdict.
@@ -304,15 +309,15 @@ fn judge(s: &Signals) -> (Recoverability, Vec<String>) {
     }
 
     if s.mixed_digit_separators {
-        // Not our error, and not repairable from the text: some fonts map the
-        // glyph the page *draws* as a thousands comma to U+002E instead, so
-        // `3,709` is extracted as `3.709`. Both characters then appear in the
-        // same table, grouping digits identically, and at least one is wrong.
+        // The page groups digits two different ways, so at least one of them
+        // is not what the document meant. `font.rs` already corrects the case
+        // where the font itself contradicts its `/ToUnicode`; what is left is a
+        // document that disagrees with *itself*, which no amount of parsing can
+        // settle.
         //
-        // Guessing which would change the value of a number by a factor of a
-        // thousand — the one kind of error a reader will not catch. So the page
-        // is marked degraded and the caller is told, which is the honest
-        // response to a document that contradicts itself.
+        // Guessing would change a number by a factor of a thousand — the one
+        // kind of error a reader will not catch. So the page is marked degraded
+        // and the caller is told.
         fail(
             Recoverability::Degraded,
             "digits are grouped with both `,` and `.` — some numbers may have \
@@ -539,6 +544,9 @@ mod tests {
         // identically, so at least one is wrong — and guessing which would move
         // a decimal point by three places.
         assert!(has_mixed_separators("3.709 and 3,900"));
+        // And after the font's `/Differences` is believed, the same page mixes
+        // an Arabic separator with a comma — the same fault, different clothes.
+        assert!(has_mixed_separators("3\u{066B}709 and 3,900"));
 
         let s = Signals {
             mixed_digit_separators: true,
@@ -553,6 +561,7 @@ mod tests {
     fn one_consistent_separator_is_not_suspicious() {
         // Every ordinary document. Only the *mixture* is evidence of a fault.
         assert!(!has_mixed_separators("1,234 and 5,678"));
+        assert!(!has_mixed_separators("3\u{066B}709 and 5\u{066B}943"));
         assert!(!has_mixed_separators("1.234 and 5.678"));
         // A genuine decimal is not a grouping: the digit count rules it out.
         assert!(!has_mixed_separators("3,709 and 0.5"));

@@ -47,6 +47,7 @@
 pub mod arabic;
 pub mod bidi;
 pub mod blocks;
+pub mod cff;
 pub mod content;
 pub mod detect;
 pub mod document;

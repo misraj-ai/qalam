@@ -43,8 +43,9 @@
 
 use std::collections::HashMap;
 
+use crate::cff::{self, GlyphNames};
 use crate::content::GlyphWidths;
-use crate::encoding::Encoding;
+use crate::encoding::{glyph_name_to_string, Encoding};
 use crate::types::{CodeToUnicode, RawFont};
 
 /// A parsed `/ToUnicode` CMap: glyph code → the text it stands for.
@@ -260,6 +261,17 @@ pub struct Font {
     pub to_unicode: CMap,
     /// The simple-font `/Encoding`, used when `/ToUnicode` cannot answer.
     pub encoding: Encoding,
+    /// Glyph names read from the embedded font program.
+    ///
+    /// The last rung of the chain, and the only one the renderer checks — see
+    /// [`crate::cff`].
+    glyph_names: GlyphNames,
+    /// Codes where the font program and `/ToUnicode` disagree about a numeric
+    /// separator, and the font program is believed.
+    ///
+    /// See [`Font::arbitrate_separators`] for why this is limited to
+    /// separators.
+    corrections: HashMap<u32, String>,
     /// Whether codes are two bytes wide.
     pub two_byte: bool,
     /// Which reverse-mapping route this font offers (from L0).
@@ -297,12 +309,23 @@ impl Font {
             Encoding::new(raw.base_encoding.as_deref(), raw.differences)
         };
 
+        // Only simple fonts carry a name-keyed CFF; a composite font identifies
+        // its glyphs by number rather than by name.
+        let glyph_names = match (&raw.font_program, two_byte) {
+            (Some(program), false) => cff::glyph_names(program),
+            _ => GlyphNames::default(),
+        };
+
+        let corrections = arbitrate_separators(&to_unicode, &encoding, &glyph_names);
+
         Self {
             resource_name: raw.info.resource_name,
             two_byte,
             route: raw.info.code_to_unicode,
             to_unicode,
             encoding,
+            glyph_names,
+            corrections,
             first_char: raw.first_char,
             widths: raw.widths,
             missing_width: raw.missing_width,
@@ -327,11 +350,38 @@ impl Font {
     /// laid down left to right. Making it readable Arabic is L3's job, and doing
     /// any of it here would break the ligature ordering rule (PLAN.md §3).
     pub fn decode(&self, code: u32) -> Option<String> {
-        // `or_else` and not `or`: the second branch is only evaluated when the
-        // first returned `None`, so we never build the fallback needlessly.
+        // A correction, where the font program contradicted `/ToUnicode` about
+        // a separator. Deliberately first: it exists precisely because the map
+        // is wrong for this code.
+        if let Some(fixed) = self.corrections.get(&code) {
+            return Some(fixed.clone());
+        }
+
+        // `or_else` and not `or`: each branch is only evaluated when the
+        // previous returned `None`, so we never build a fallback needlessly.
         self.to_unicode
             .get(code)
             .or_else(|| self.encoding.decode(code))
+            .or_else(|| self.glyph_name_char(code))
+    }
+
+    /// Resolve a code through the embedded font program's glyph name.
+    ///
+    /// The fourth rung of the chain (PLAN.md §3). Reached only when neither
+    /// `/ToUnicode` nor `/Encoding` could answer, so it can add information but
+    /// never contradict either.
+    fn glyph_name_char(&self, code: u32) -> Option<String> {
+        glyph_name_to_string(self.glyph_names.get(code)?)
+    }
+
+    /// How many codes the embedded font program names. For reporting.
+    pub fn named_glyphs(&self) -> usize {
+        self.glyph_names.len()
+    }
+
+    /// Codes whose `/ToUnicode` value this font overrides, and with what.
+    pub fn corrections(&self) -> &HashMap<u32, String> {
+        &self.corrections
     }
 
     /// Whether this font can resolve anything at all.
@@ -360,6 +410,86 @@ impl Font {
         };
         thousandths / 1000.0
     }
+}
+
+/// Characters that group or separate digits, in both scripts.
+///
+/// The arbitration below is confined to these. A code whose `/ToUnicode` value
+/// is one of them and whose glyph name is a *different* one of them is the
+/// exact fault we are correcting; anything else is left alone.
+const SEPARATORS: [char; 6] = [
+    ',',        // COMMA
+    '.',        // FULL STOP
+    '\u{060C}', // ARABIC COMMA
+    '\u{066B}', // ARABIC DECIMAL SEPARATOR
+    '\u{066C}', // ARABIC THOUSANDS SEPARATOR
+    '\u{02D9}', // DOT ABOVE, used as a separator by some Arabic faces
+];
+
+/// Find codes where the font program and `/ToUnicode` disagree about a numeric
+/// separator, and believe the font program.
+///
+/// # Why this is narrow on purpose
+///
+/// Preferring glyph names wholesale would be reckless: plenty of subset fonts
+/// name glyphs `g42` or `cid123`, carrying no Unicode at all, and on those
+/// files a good `/ToUnicode` is the only real information there is.
+///
+/// So a correction is made only when **every** one of these holds:
+///
+/// 1. `/ToUnicode` gives a single character, and it is a separator.
+/// 2. The font program names the same code, and the name resolves to a single
+///    character, and it too is a separator.
+/// 3. The two disagree.
+///
+/// The result can therefore only ever turn one separator into another. It
+/// cannot touch a letter, a digit, or a code the two sources agree on — and on
+/// a correct PDF they always agree, so nothing is corrected at all.
+///
+/// The fault it repairs is real and costly: `bar_Persons.pdf` maps a glyph it
+/// draws as an Arabic comma to `.`, so `3,709` extracts as `3.709` — a value
+/// wrong by a factor of a thousand, and wrong in a way no reader would catch.
+fn arbitrate_separators(
+    to_unicode: &CMap,
+    encoding: &Encoding,
+    names: &GlyphNames,
+) -> HashMap<u32, String> {
+    let mut out = HashMap::new();
+
+    /// The character a source gives for a code, if it is exactly one and is a
+    /// separator.
+    fn separator(text: &str) -> Option<char> {
+        let mut chars = text.chars();
+        let first = chars.next()?;
+        // Exactly one character: a multi-character value is a ligature or an
+        // expansion, not a separator.
+        if chars.next().is_some() || !SEPARATORS.contains(&first) {
+            return None;
+        }
+        Some(first)
+    }
+
+    for code in 0..=u32::from(u8::MAX) {
+        let Some(mapped) = to_unicode.get(code).as_deref().and_then(separator) else {
+            continue;
+        };
+
+        // The second opinion, in order of how directly the renderer relies on
+        // it: `/Differences` names the glyph the renderer looks up, and the
+        // font program's own charset names the same thing from inside.
+        let named = encoding
+            .decode(code)
+            .or_else(|| names.get(code).and_then(glyph_name_to_string));
+
+        let Some(named) = named.as_deref().and_then(separator) else {
+            continue;
+        };
+
+        if mapped != named {
+            out.insert(code, named.to_string());
+        }
+    }
+    out
 }
 
 /// Every font on one page, keyed by the resource name the stream uses.
@@ -799,6 +929,94 @@ end";
         assert_eq!(font.width_em(150), 0.6);
         // Outside every range → /DW.
         assert_eq!(font.width_em(9999), 1.0);
+    }
+
+    // ---- arbitration -----------------------------------------------------
+
+    fn font_with(cmap: &str, differences: Vec<(u8, String)>) -> Font {
+        let mut raw = RawFont::new(FontInfo {
+            resource_name: "T1_0".to_string(),
+            subtype: "Type1".to_string(),
+            base_font: None,
+            encoding: Some("WinAnsiEncoding".to_string()),
+            code_to_unicode: CodeToUnicode::ToUnicode,
+        });
+        raw.to_unicode = Some(cmap.as_bytes().to_vec());
+        raw.base_encoding = Some("WinAnsiEncoding".to_string());
+        raw.differences = differences;
+        Font::from_raw(raw)
+    }
+
+    #[test]
+    fn the_font_overrules_a_wrong_separator() {
+        // `bar_Persons.pdf`, font T1_0: `/ToUnicode` says code 161 is a full
+        // stop, but `/Differences` names the glyph `uni066B` — the Arabic
+        // decimal separator, which is what the page actually draws. Believing
+        // the map turns `3,709` into `3.709`: a value wrong by a factor of a
+        // thousand, in a way no reader would catch.
+        let font = font_with(
+            "1 beginbfchar\n<A1> <002E>\nendbfchar",
+            vec![(161, "uni066B".to_string())],
+        );
+
+        assert_eq!(font.decode(161).as_deref(), Some("\u{066B}"));
+        assert_eq!(font.corrections().len(), 1);
+    }
+
+    #[test]
+    fn a_font_whose_sources_agree_is_left_alone() {
+        // Every correct PDF. The two sources say the same thing, so nothing is
+        // corrected and the output is exactly what it always was.
+        let font = font_with(
+            "1 beginbfchar\n<2C> <002C>\nendbfchar",
+            vec![(44, "comma".to_string())],
+        );
+        assert!(font.corrections().is_empty());
+        assert_eq!(font.decode(44).as_deref(), Some(","));
+    }
+
+    #[test]
+    fn arbitration_cannot_touch_letters_or_digits() {
+        // The guarantee that makes this safe to run on any document: a
+        // correction can only ever replace one separator with another. Here
+        // `/ToUnicode` and `/Differences` disagree about a *letter* and a
+        // *digit*, and both disagreements are ignored.
+        let font = font_with(
+            "2 beginbfchar\n<83> <0037>\n<41> <0041>\nendbfchar",
+            vec![
+                // The font says these are an Arabic seven and an alef.
+                (131, "uni0667".to_string()),
+                (65, "uni0627".to_string()),
+            ],
+        );
+
+        assert!(
+            font.corrections().is_empty(),
+            "only separators may be corrected"
+        );
+        assert_eq!(font.decode(131).as_deref(), Some("7"));
+        assert_eq!(font.decode(65).as_deref(), Some("A"));
+    }
+
+    #[test]
+    fn a_multi_character_value_is_never_a_separator() {
+        // A ligature mapping to several characters must not be mistaken for a
+        // separator and replaced by one.
+        let font = font_with(
+            "1 beginbfchar\n<A1> <06440627>\nendbfchar",
+            vec![(161, "uni066B".to_string())],
+        );
+        assert!(font.corrections().is_empty());
+    }
+
+    #[test]
+    fn the_font_program_answers_when_nothing_else_can() {
+        // Design (b): the fourth rung of the chain. With no `/ToUnicode` entry
+        // and no `/Differences`, a glyph name from the embedded font program is
+        // the only information there is — so it may *add* an answer, but it can
+        // never contradict one.
+        let names = crate::cff::GlyphNames::default();
+        assert!(names.is_empty(), "an absent font program resolves nothing");
     }
 
     #[test]

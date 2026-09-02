@@ -496,8 +496,28 @@ impl Pdf {
         } else {
             self.read_simple_widths(dict, &mut raw);
             self.read_encoding(dict, &mut raw);
+            raw.font_program = self.read_font_program(dict);
         }
         raw
+    }
+
+    /// Pull the embedded CFF font program out of the font descriptor.
+    ///
+    /// Only `/FontFile3` (Type1C / CFF) is read. `/FontFile` is Type 1, whose
+    /// encoding sits inside an eexec-encrypted section, and `/FontFile2` is
+    /// TrueType, whose `post` table names glyphs but by a different route —
+    /// both are worth adding later, and neither is guessed at now.
+    fn read_font_program(&self, dict: &Dictionary) -> Option<Vec<u8>> {
+        let descriptor = self
+            .lookup(dict, b"FontDescriptor")
+            .and_then(|o| o.as_dict().ok())?;
+
+        let stream = self
+            .lookup(descriptor, b"FontFile3")
+            .and_then(|o| o.as_stream().ok())?;
+
+        // Font programs are almost always Flate-compressed.
+        stream.decompressed_content().ok()
     }
 
     /// Read `/Encoding` in either of its two forms.

@@ -544,6 +544,11 @@ pub struct RawFont {
     /// `/Differences`, already flattened from PDF's run-length form into
     /// `(code, glyph_name)` pairs.
     pub differences: Vec<(u8, String)>,
+    /// The embedded CFF font program (`/FontFile3`), if there is one.
+    ///
+    /// The only source of glyph identity that the *renderer* checks, and so the
+    /// only one a producer cannot get wrong unnoticed. See [`crate::cff`].
+    pub font_program: Option<Vec<u8>>,
 }
 
 impl RawFont {
@@ -560,6 +565,7 @@ impl RawFont {
             cid_widths: Vec::new(),
             base_encoding: None,
             differences: Vec::new(),
+            font_program: None,
         }
     }
 }
