@@ -6,11 +6,14 @@
 //! qalam raw     <file.pdf> [page]   # dump a page's raw content stream (default 1)
 //! qalam glyphs  <file.pdf> [page]   # L1 output: positioned, styled glyph codes
 //! qalam text    <file.pdf> [page]   # L2 output: codes resolved through /ToUnicode
+//! qalam extract <file.pdf> [page]   # L3 output: correct logical Arabic
 //! ```
 
 use std::process::ExitCode;
 
 use qalam_core::{AssumedWidths, CodeToUnicode, FontMap, Pdf};
+
+mod extract;
 
 /// # Rust lesson: `main` can return
 ///
@@ -27,6 +30,17 @@ fn main() -> ExitCode {
         [cmd, path] if cmd == "raw" => raw(path, 1),
         [cmd, path] if cmd == "glyphs" => glyphs(path, 1),
         [cmd, path] if cmd == "text" => text(path, 1),
+        [cmd, path] if cmd == "extract" => extract::extract(path, None),
+        [cmd, path, page] if cmd == "extract" => match page.parse() {
+            Ok(n) => extract::extract(path, Some(n)),
+            // `all` extracts the whole document, which is what a user of the
+            // finished library would actually ask for.
+            Err(_) if page == "all" => extract::extract(path, None),
+            Err(_) => {
+                eprintln!("error: `{page}` is not a page number");
+                return ExitCode::FAILURE;
+            }
+        },
         // Both page-taking commands parse their argument the same way, so they
         // share one arm and dispatch on the command name inside it.
         [cmd, path, page] if cmd == "raw" || cmd == "glyphs" || cmd == "text" => {
@@ -64,7 +78,8 @@ fn usage() {
          \x20 qalam inspect <file.pdf>          pages, geometry and font resources\n\
          \x20 qalam raw <file.pdf> [page]       raw content stream of a page (default 1)\n\
          \x20 qalam glyphs <file.pdf> [page]    positioned, styled glyph codes (L1)\n\
-         \x20 qalam text <file.pdf> [page]      codes resolved through /ToUnicode (L2)"
+         \x20 qalam text <file.pdf> [page]      codes resolved through /ToUnicode (L2)\n\
+         \x20 qalam extract <file.pdf> [page]   correct logical Arabic (L3; page or `all`)"
     );
 }
 

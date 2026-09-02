@@ -17,7 +17,8 @@
 //! | L1 | [`content`]  | content stream → positioned, styled glyph codes |
 //! | L1 | [`graphics`] | graphics-state stack (`q`/`Q`, `cm`) and colour operators |
 //! | L2 | [`font`]     | glyph code → Unicode, via `/ToUnicode` & friends |
-//! | L3 | `arabic`   | line grouping → bidi reorder → NFKC normalise |
+//! | L3 | [`arabic`]   | line grouping → bidi reorder → NFKC normalise |
+//! | L3 | [`bidi`]     | UAX #9 wrapper: visual order → logical order |
 //! | L4 | `detect`   | recoverability scoring: `ok` vs `needs_ocr` |
 //!
 //! Alongside the text, L1 records the *styling* each glyph was painted with —
@@ -40,6 +41,8 @@
 // from a compiler that nags about unexplained APIs.
 #![warn(missing_docs)]
 
+pub mod arabic;
+pub mod bidi;
 pub mod content;
 pub mod error;
 pub mod font;
@@ -50,6 +53,8 @@ pub mod types;
 // Re-export the handful of names most callers need, so they can write
 // `use qalam_core::Pdf;` instead of `use qalam_core::parser::Pdf;`.
 // The module paths stay public too, for anyone who wants the long form.
+pub use arabic::{lines_to_text, reconstruct, TextLine};
+pub use bidi::Direction;
 pub use content::{interpret, AssumedWidths, GlyphWidths, PageGlyphs};
 pub use error::{Error, Result};
 pub use font::{CMap, Font, FontMap};
