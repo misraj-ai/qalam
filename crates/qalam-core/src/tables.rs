@@ -261,18 +261,35 @@ fn merge<'a>(lines: impl Iterator<Item = &'a RuledLine>, along_x: bool) -> Vec<B
 /// even when they do, the gap between them is broken by the requirement below
 /// that a group's members be mutually overlapping.
 fn group_rows(horizontals: &[Boundary]) -> Vec<Vec<Boundary>> {
+    /// A gap this many times the page's typical row spacing starts a new table.
+    ///
+    /// Rows are regularly spaced; a jump several times further than the page's
+    /// usual spacing is a different object, not a very tall row.
+    const OUTLIER_FACTOR: f64 = 3.0;
+
+    // The typical spacing is measured across the **whole page**, not
+    // accumulated as each group grows. Judging incrementally cannot work: the
+    // first two boundaries of a group have no spacing to compare against, so
+    // any jump at all is accepted — and one isolated rule near the foot of the
+    // page then joins the table above it and stretches the group's height
+    // until no real column is tall enough to qualify. That is precisely how a
+    // form XObject's decorative line destroyed a table (PLAN.md §10.16).
+    let limit = median_gap(horizontals).map(|m| m * OUTLIER_FACTOR);
+
     let mut groups: Vec<Vec<Boundary>> = Vec::new();
 
     for boundary in horizontals {
         // Sorted by coordinate, so only the most recent group can match.
-        match groups.last_mut() {
-            Some(group)
-                if group
-                    .last()
-                    .is_some_and(|prev| prev.overlaps(boundary.from, boundary.to)) =>
-            {
-                group.push(boundary.clone());
-            }
+        let extend = groups
+            .last()
+            .and_then(|g| g.last())
+            .is_some_and(|previous| {
+                previous.overlaps(boundary.from, boundary.to)
+                    && limit.is_none_or(|limit| (boundary.at - previous.at) <= limit)
+            });
+
+        match (extend, groups.last_mut()) {
+            (true, Some(group)) => group.push(boundary.clone()),
             _ => groups.push(vec![boundary.clone()]),
         }
     }
@@ -281,6 +298,23 @@ fn group_rows(horizontals: &[Boundary]) -> Vec<Vec<Boundary>> {
         .into_iter()
         .filter(|g| g.len() >= MIN_BOUNDARIES)
         .collect()
+}
+
+/// The median spacing between consecutive boundaries on the page.
+///
+/// Median rather than mean because the outliers are exactly what this is meant
+/// to identify, and a mean would be dragged towards them.
+fn median_gap(boundaries: &[Boundary]) -> Option<f64> {
+    if boundaries.len() < 2 {
+        return None;
+    }
+    let mut gaps: Vec<f64> = boundaries.windows(2).map(|w| w[1].at - w[0].at).collect();
+    gaps.sort_by(f64::total_cmp);
+
+    let median = gaps[gaps.len() / 2];
+    // A page whose rules are nearly coincident would give a median near zero,
+    // and every real gap would then look like an outlier.
+    (median > 1.0).then_some(median)
 }
 
 /// Turn a group of row dividers plus the page's column dividers into a grid.
@@ -548,6 +582,38 @@ mod tests {
         assert_eq!(table.rows[0][0].text, "A");
         assert_eq!(table.rows[0][1].text, "B");
         assert_eq!(table.rows[1][0].text, "");
+    }
+
+    #[test]
+    fn a_distant_rule_does_not_swallow_the_table() {
+        // Page 6 of `bar_Persons.pdf`. A form XObject draws a short decorative
+        // rule near the foot of the page that happens to overlap the table
+        // above it horizontally. Grouped with the table's rows it stretched the
+        // group from 147pt tall to 463pt, and the column filter — which asks
+        // that a divider run at least half the table's height — then rejected
+        // every real column. The table vanished, silently, into loose lines.
+        let mut lines = ruled(4, 3);
+        // Well below everything, overlapping in x, and nothing in between.
+        lines.push(h(-400.0, 10.0, 200.0));
+
+        let grids = detect(&lines);
+        assert_eq!(grids.len(), 1, "the stray rule broke detection");
+        assert_eq!(grids[0].row_count(), 4);
+        assert_eq!(grids[0].column_count(), 3);
+    }
+
+    #[test]
+    fn rows_of_two_separate_tables_are_not_merged() {
+        // Two grids far apart on one page, overlapping in x. The gap between
+        // them dwarfs either one's row height, which is what tells them apart.
+        let mut lines = ruled(3, 2);
+        lines.extend(ruled(3, 2).iter().map(|l| RuledLine {
+            y0: l.y0 + 400.0,
+            y1: l.y1 + 400.0,
+            ..*l
+        }));
+
+        assert_eq!(detect(&lines).len(), 2);
     }
 
     #[test]

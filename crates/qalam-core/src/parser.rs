@@ -19,8 +19,8 @@ use lopdf::{Dictionary, Document, Object, ObjectId};
 
 use crate::error::{Error, Result};
 use crate::types::{
-    CodeToUnicode, FontInfo, ImageColorSpace, PageInfo, Palette, RawFont, RawImage, RawStructure,
-    Rect, Rotation, StructElement,
+    CodeToUnicode, FontInfo, ImageColorSpace, PageInfo, Palette, RawFont, RawForm, RawImage,
+    RawStructure, Rect, Rotation, StructElement,
 };
 
 /// An opened PDF document.
@@ -100,10 +100,138 @@ impl Pdf {
             return Ok(Vec::new());
         };
 
-        Ok(fonts
+        let mut out: Vec<RawFont> = fonts
             .into_iter()
             .map(|(name, dict)| self.raw_font(&name, dict))
-            .collect())
+            .collect();
+
+        // Fonts a form uses, under names qualified the same way the
+        // interpreter will qualify them. A form's `/C2_0` and the page's are
+        // different fonts wearing the same name.
+        for form in self.collect_forms(page_number)? {
+            let Some(font_dict) = self
+                .lookup(form.resources, b"Font")
+                .and_then(|o| o.as_dict().ok())
+            else {
+                continue;
+            };
+
+            for (name, value) in font_dict.iter() {
+                let Ok(dict) = self.resolve(value).and_then(|o| Ok(o.as_dict()?)) else {
+                    continue;
+                };
+                let qualified = format!("{}/{}", form.name, String::from_utf8_lossy(name));
+                out.push(self.raw_font(qualified.as_bytes(), dict));
+            }
+        }
+        Ok(out)
+    }
+
+    /// Every form XObject a page draws, including forms drawn by forms.
+    ///
+    /// Returned flat, each with a name qualified by its nesting, so the
+    /// interpreter can look one up by the name it sees at a `Do`.
+    pub fn page_forms(&self, page_number: u32) -> Result<Vec<RawForm>> {
+        let mut out = Vec::new();
+        for form in self.collect_forms(page_number)? {
+            let stream = form.stream;
+            let content = stream
+                .decompressed_content()
+                .unwrap_or_else(|_| stream.content.clone());
+
+            // `/Matrix` defaults to the identity, which most forms use.
+            let matrix = self
+                .lookup(&stream.dict, b"Matrix")
+                .and_then(|o| o.as_array().ok())
+                .and_then(|a| {
+                    let v: Vec<f64> = a.iter().filter_map(|o| self.number(o)).collect();
+                    <[f64; 6]>::try_from(v).ok()
+                })
+                .unwrap_or([1.0, 0.0, 0.0, 1.0, 0.0, 0.0]);
+
+            out.push(RawForm {
+                resource_name: form.name,
+                content,
+                matrix,
+            });
+        }
+        Ok(out)
+    }
+
+    /// Walk the page's form XObjects depth-first, qualifying nested names.
+    fn collect_forms(&self, page_number: u32) -> Result<Vec<Form<'_>>> {
+        let id = self.page_id(page_number)?;
+        let Some(resources) = self
+            .inherited(id, b"Resources")
+            .and_then(|o| o.as_dict().ok())
+        else {
+            return Ok(Vec::new());
+        };
+
+        let mut out = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        self.walk_forms(resources, "", 0, &mut seen, &mut out);
+        Ok(out)
+    }
+
+    /// The recursive half of [`Self::collect_forms`].
+    ///
+    /// `seen` guards against a form that draws itself, directly or through
+    /// another — legal to write and fatal to follow blindly.
+    fn walk_forms<'a>(
+        &'a self,
+        resources: &'a Dictionary,
+        prefix: &str,
+        depth: usize,
+        seen: &mut std::collections::HashSet<ObjectId>,
+        out: &mut Vec<Form<'a>>,
+    ) {
+        const MAX_DEPTH: usize = 8;
+        if depth >= MAX_DEPTH {
+            return;
+        }
+
+        let Some(xobjects) = self
+            .lookup(resources, b"XObject")
+            .and_then(|o| o.as_dict().ok())
+        else {
+            return;
+        };
+
+        for (name, value) in xobjects.iter() {
+            // A form may be reached by two different names; only its *identity*
+            // makes a cycle, so that is what is tracked.
+            if let Ok(id) = value.as_reference() {
+                if !seen.insert(id) {
+                    continue;
+                }
+            }
+            let Ok(stream) = self.resolve(value).and_then(|o| Ok(o.as_stream()?)) else {
+                continue;
+            };
+            if name_of(&stream.dict, b"Subtype").as_deref() != Some("Form") {
+                continue;
+            }
+
+            let qualified = format!("{prefix}{}", String::from_utf8_lossy(name));
+
+            // A form may omit `/Resources`, in which case it uses the ones in
+            // force where it was drawn. That inheritance matters: the form
+            // holding page 1's title has none of its own, so its `/C2_0` is the
+            // *page's* `/C2_0` — and without following that, its text decodes
+            // to nothing.
+            let inner = self
+                .lookup(&stream.dict, b"Resources")
+                .and_then(|o| o.as_dict().ok())
+                .unwrap_or(resources);
+
+            out.push(Form {
+                name: qualified.clone(),
+                stream,
+                resources: inner,
+            });
+            self.walk_forms(inner, &format!("{qualified}/"), depth + 1, seen, out);
+        }
     }
 
     /// Read the document's structure tree, if it has one.
@@ -803,6 +931,17 @@ impl Pdf {
             code_to_unicode,
         }
     }
+}
+
+/// A form XObject found on a page, with the resources it resolves names in.
+struct Form<'a> {
+    /// The name qualified by nesting, e.g. `Fm3` or `Fm1/Fm0`.
+    name: String,
+    /// The form's content stream object.
+    stream: &'a lopdf::Stream,
+    /// The resource dictionary its names resolve in — its own if it has one,
+    /// otherwise the dictionary in force where it was drawn.
+    resources: &'a Dictionary,
 }
 
 /// Is this filter an image codec rather than a general-purpose one?

@@ -631,6 +631,30 @@ impl Palette {
     }
 }
 
+/// A form XObject: a reusable content stream drawn by a `Do` operator.
+///
+/// A form is a page within a page. It has its own content stream, its own
+/// `/Resources` — including its own fonts, under its own names — and a
+/// `/Matrix` placing it. Text and images inside one are invisible to an
+/// interpreter that does not descend into it, and there is no hint in the
+/// outer stream that anything was missed.
+///
+/// Page 1 of the Arabic corpus hides its title this way.
+#[derive(Debug, Clone)]
+pub struct RawForm {
+    /// The name the drawing stream uses, qualified by the forms it is nested
+    /// inside — `Fm3`, or `Fm1/Fm0` for a form drawn by another form.
+    ///
+    /// Qualified because names are scoped per-resource-dictionary: a page and
+    /// a form may both call a font `C2_0` and mean different fonts. Without
+    /// the prefix, text inside a form would be decoded with the wrong map.
+    pub resource_name: String,
+    /// The form's decoded content stream.
+    pub content: Vec<u8>,
+    /// The form's `/Matrix`, applied to the transform in force at the `Do`.
+    pub matrix: [f64; 6],
+}
+
 /// An image XObject pulled out of the object graph, before decoding.
 ///
 /// The hand-off from L0 to L7, mirroring [`RawFont`]: `parser.rs` walks the

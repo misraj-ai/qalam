@@ -169,15 +169,23 @@ fn glyphs(path: &str, page: u32) -> qalam_core::Result<()> {
     let pdf = Pdf::open(path)?;
 
     // L1 needs the page's font list to know whether codes are 1 or 2 bytes.
-    let info = pdf
-        .pages()
-        .into_iter()
+    // Confirm the page exists before doing any work on it.
+    pdf.pages()
+        .iter()
         .find(|p| p.number == page)
         .ok_or(qalam_core::Error::PageNotFound(page))?;
 
     let content = pdf.page_content(page)?;
+    let forms = pdf.page_forms(page)?;
+    // Font summaries must include the forms' own fonts, or a form's 2-byte
+    // font is read as a 1-byte one and every CID splits in half.
+    let summaries: Vec<qalam_core::FontInfo> = pdf
+        .page_raw_fonts(page)?
+        .into_iter()
+        .map(|f| f.info)
+        .collect();
     // `AssumedWidths` is the placeholder until `font.rs` supplies real metrics.
-    let out = qalam_core::interpret(&content, &info.fonts, &AssumedWidths);
+    let out = qalam_core::interpret_with_forms(&content, &summaries, &forms, &AssumedWidths);
 
     println!("page {page}: {} glyph(s)", out.glyphs.len());
     if !out.xobjects.is_empty() {
@@ -253,9 +261,9 @@ fn print_run(run: &[qalam_core::Glyph]) {
 /// in that order.
 fn text(path: &str, page: u32) -> qalam_core::Result<()> {
     let pdf = Pdf::open(path)?;
-    let info = pdf
-        .pages()
-        .into_iter()
+    // Confirm the page exists before doing any work on it.
+    pdf.pages()
+        .iter()
         .find(|p| p.number == page)
         .ok_or(qalam_core::Error::PageNotFound(page))?;
 
@@ -273,7 +281,13 @@ fn text(path: &str, page: u32) -> qalam_core::Result<()> {
     }
 
     let content = pdf.page_content(page)?;
-    let out = qalam_core::interpret(&content, &info.fonts, &fonts);
+    let forms = pdf.page_forms(page)?;
+    let summaries: Vec<qalam_core::FontInfo> = pdf
+        .page_raw_fonts(page)?
+        .into_iter()
+        .map(|f| f.info)
+        .collect();
+    let out = qalam_core::interpret_with_forms(&content, &summaries, &forms, &fonts);
 
     // Group glyphs into lines by their baseline. Crude on purpose: proper
     // geometric grouping is L3's job, and doing it here would prejudge it.

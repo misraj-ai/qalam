@@ -406,3 +406,28 @@ fn multi_character_ligatures_keep_their_order() {
         );
     }
 }
+
+#[test]
+fn text_inside_form_xobjects_is_found() {
+    // A form XObject is a page within a page: its own content stream, its own
+    // resources, its own fonts under its own names. Page 1 of the Arabic
+    // corpus hides its title in one, and an interpreter that does not descend
+    // into it loses the text with no hint that anything was missed.
+    let Some(doc) = fixture() else { return };
+    let text = doc.page(1).expect("page 1").text();
+
+    for expected in ["صياغة مقترح تشريعي", "لنظام أو لائحة"] {
+        assert!(
+            text.contains(expected),
+            "form XObject text is missing: {expected}"
+        );
+    }
+
+    // And it must decode, not arrive as replacement characters. A form's fonts
+    // are named `Fm1/C2_0`; a summary the interpreter cannot find is read as a
+    // single-byte font, which splits every 2-byte CID in half.
+    assert!(
+        !text.contains(char::REPLACEMENT_CHARACTER),
+        "form text did not decode: {text}"
+    );
+}

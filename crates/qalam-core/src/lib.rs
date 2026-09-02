@@ -69,7 +69,8 @@ pub use arabic::{lines_to_text, reconstruct, reconstruct_regions, Region, TextLi
 pub use bidi::Direction;
 pub use blocks::{assemble, Block, ImageBlock, TableBlock, TextBlock};
 pub use content::{
-    interpret, ActualText, AssumedWidths, GlyphWidths, McidSpan, PageGlyphs, RuledLine, XObjectUse,
+    interpret, interpret_with_forms, ActualText, AssumedWidths, GlyphWidths, McidSpan, PageGlyphs,
+    RuledLine, XObjectUse,
 };
 pub use detect::{assess, PageReport, Recoverability, Signals};
 pub use document::{extract_text, Document, Page};

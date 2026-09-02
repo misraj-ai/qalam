@@ -33,7 +33,7 @@ use lopdf::content::{Content, Operation};
 use lopdf::Object;
 
 use crate::graphics::{ColorSpaceKind, GraphicsStack, Matrix};
-use crate::types::{FontInfo, Glyph, Style, TextOrientation, TextRenderMode};
+use crate::types::{FontInfo, Glyph, RawForm, Style, TextOrientation, TextRenderMode};
 
 /// Supplies the advance width of a glyph, in fractions of an em.
 ///
@@ -262,6 +262,13 @@ struct Interpreter<'a> {
     text: TextState,
     /// Fonts declared on this page, for deciding 1-byte vs 2-byte codes.
     fonts: &'a [FontInfo],
+    /// The form XObjects this page can draw, by qualified name.
+    forms: &'a [RawForm],
+    /// The forms we are currently inside, innermost last.
+    ///
+    /// Joined with `/` it is the prefix that qualifies a resource name, so a
+    /// form's `C2_0` becomes `Fm3/C2_0` and cannot be confused with the page's.
+    form_stack: Vec<String>,
     /// Where real advance widths come from.
     widths: &'a dyn GlyphWidths,
     /// What we have found so far.
@@ -315,6 +322,25 @@ struct MarkedSection {
 /// compiles a separate copy of the function per type — faster, but this is
 /// called once per page, so the flexibility is worth more than the nanoseconds.
 pub fn interpret(content: &[u8], fonts: &[FontInfo], widths: &dyn GlyphWidths) -> PageGlyphs {
+    interpret_with_forms(content, fonts, &[], widths)
+}
+
+/// Interpret a page, descending into the form XObjects it draws.
+///
+/// A form is a page within a page: its own content stream, its own resources,
+/// its own fonts under its own names. Text inside one is invisible to an
+/// interpreter that does not enter it, and nothing in the outer stream hints
+/// that anything was missed — page 1 of the Arabic corpus hides its title
+/// exactly this way.
+///
+/// `forms` comes from [`crate::Pdf::page_forms`], with names already qualified
+/// by nesting.
+pub fn interpret_with_forms(
+    content: &[u8],
+    fonts: &[FontInfo],
+    forms: &[RawForm],
+    widths: &dyn GlyphWidths,
+) -> PageGlyphs {
     // lopdf tokenises the stream for us. A stream we cannot even tokenise yields
     // no glyphs rather than an error: other pages may still be fine.
     let Ok(parsed) = Content::decode(content) else {
@@ -326,6 +352,8 @@ pub fn interpret(content: &[u8], fonts: &[FontInfo], widths: &dyn GlyphWidths) -
         text: TextState::default(),
         fonts,
         widths,
+        forms,
+        form_stack: Vec::new(),
         out: PageGlyphs::default(),
         path: Vec::new(),
         path_start: None,
@@ -408,7 +436,9 @@ impl Interpreter<'_> {
             // ---- text state ----------------------------------------------
             "Tf" => {
                 if let Some(name) = op.operands.first().and_then(object_name) {
-                    self.text.font = name;
+                    // Qualified, so a form's `C2_0` is not mistaken for the
+                    // page's when the glyphs are decoded later.
+                    self.text.font = self.qualify(&name);
                 }
                 if let Some(size) = nums.first() {
                     self.text.font_size = *size;
@@ -622,15 +652,18 @@ impl Interpreter<'_> {
 
             // ---- everything else -----------------------------------------
             "Do" => {
-                // Record the name and the transform; deciding what the object
-                // *is* belongs to a layer that can see `/Resources`.
-                if let Some(name) = op.operands.first().and_then(object_name) {
-                    self.out.xobjects.push(XObjectUse {
-                        name,
-                        ctm: self.graphics.current().ctm,
-                        glyph_index: self.out.glyphs.len(),
-                    });
-                }
+                let Some(name) = op.operands.first().and_then(object_name) else {
+                    return;
+                };
+                // Record every invocation. Images are matched against these
+                // later; forms are entered below.
+                let qualified = self.qualify(&name);
+                self.out.xobjects.push(XObjectUse {
+                    name: qualified.clone(),
+                    ctm: self.graphics.current().ctm,
+                    glyph_index: self.out.glyphs.len(),
+                });
+                self.enter_form(&qualified);
             }
             _ => {
                 // Paths, clipping, shading, marked content, inline images: all
@@ -716,6 +749,66 @@ impl Interpreter<'_> {
         self.path.clear();
         self.path_cursor = None;
         self.path_start = None;
+    }
+
+    /// Qualify a resource name with the forms we are inside.
+    ///
+    /// At page level this returns the name unchanged, so the common case costs
+    /// one allocation and nothing else.
+    fn qualify(&self, name: &str) -> String {
+        if self.form_stack.is_empty() {
+            return name.to_string();
+        }
+        format!("{}/{name}", self.form_stack.join("/"))
+    }
+
+    /// Draw a form XObject, if this name is one.
+    ///
+    /// The form's content is interpreted in place, so its glyphs land in the
+    /// same output in the order they were painted — a form drawn between two
+    /// paragraphs reads between them.
+    fn enter_form(&mut self, qualified: &str) {
+        // Forms nest, but not deeply in practice. The bound also stops a form
+        // that draws itself from recursing forever, in concert with the
+        // parser's own cycle guard.
+        const MAX_NESTING: usize = 8;
+        if self.form_stack.len() >= MAX_NESTING {
+            return;
+        }
+
+        let Some(form) = self.forms.iter().find(|f| f.resource_name == qualified) else {
+            // Not a form: an image, or a name we have no definition for.
+            return;
+        };
+
+        // A form is drawn inside a save/restore of its own, and its `/Matrix`
+        // composes with the transform in force at the `Do`. Both are the
+        // caller's responsibility per the spec, not the form's.
+        let m = form.matrix;
+        let outer = self.graphics.current().ctm;
+        self.graphics.save();
+        self.graphics.current_mut().ctm =
+            Matrix::new(m[0], m[1], m[2], m[3], m[4], m[5]).then(outer);
+
+        // The text object state does not survive into a form either.
+        let saved_text = std::mem::take(&mut self.text);
+        self.form_stack.push(
+            qualified
+                .rsplit('/')
+                .next()
+                .unwrap_or(qualified)
+                .to_string(),
+        );
+
+        if let Ok(parsed) = Content::decode(&form.content) {
+            for op in &parsed.operations {
+                self.run(op);
+            }
+        }
+
+        self.form_stack.pop();
+        self.text = saved_text;
+        self.graphics.restore();
     }
 
     /// Set a fill or stroke colour from a `g`/`rg`/`k` family operator.

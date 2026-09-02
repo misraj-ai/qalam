@@ -141,11 +141,23 @@ impl Document {
 
             // L2 before L1: the font map supplies both the code→text mapping
             // and the advance widths the interpreter needs to place glyphs.
-            let fonts = FontMap::from_raw(pdf.page_raw_fonts(number)?);
+            //
+            // The font *summaries* come from the same source, not from
+            // `info.fonts`, because that lists only the page's own fonts. A
+            // form's fonts are named `Fm1/C2_0`, and a summary the interpreter
+            // cannot find is read as a single-byte font — which splits every
+            // 2-byte CID in half and turns the text into noise.
+            let raw_fonts = pdf.page_raw_fonts(number)?;
+            let summaries: Vec<crate::types::FontInfo> =
+                raw_fonts.iter().map(|f| f.info.clone()).collect();
+            let fonts = FontMap::from_raw(raw_fonts);
             let content = pdf.page_content(number)?;
 
-            // L1: the content stream.
-            let glyphs = crate::content::interpret(&content, &info.fonts, &fonts);
+            // L1: the content stream, descending into any form XObjects it
+            // draws — a form is a page within a page, and text inside one is
+            // invisible to an interpreter that does not enter it.
+            let forms = pdf.page_forms(number)?;
+            let glyphs = crate::content::interpret_with_forms(&content, &summaries, &forms, &fonts);
 
             // L1.5: does the document state its own reading order for this
             // page? Nearly always `None`, and then L6's geometry decides.
