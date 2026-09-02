@@ -19,7 +19,7 @@
 //! | L2 | [`font`]     | glyph code → Unicode, via `/ToUnicode` & friends |
 //! | L3 | [`arabic`]   | line grouping → bidi reorder → NFKC normalise |
 //! | L3 | [`bidi`]     | UAX #9 wrapper: visual order → logical order |
-//! | L4 | `detect`   | recoverability scoring: `ok` vs `needs_ocr` |
+//! | L4 | [`detect`]   | recoverability scoring: `ok` vs `needs_ocr` |
 //!
 //! Alongside the text, L1 records the *styling* each glyph was painted with —
 //! fill colour, font, effective size, render mode — as a [`Style`]. Nothing in
@@ -44,6 +44,7 @@
 pub mod arabic;
 pub mod bidi;
 pub mod content;
+pub mod detect;
 pub mod encoding;
 pub mod error;
 pub mod font;
@@ -56,7 +57,8 @@ pub mod types;
 // The module paths stay public too, for anyone who wants the long form.
 pub use arabic::{lines_to_text, reconstruct, TextLine};
 pub use bidi::Direction;
-pub use content::{interpret, AssumedWidths, GlyphWidths, PageGlyphs};
+pub use content::{interpret, ActualText, AssumedWidths, GlyphWidths, PageGlyphs};
+pub use detect::{assess, PageReport, Recoverability, Signals};
 pub use error::{Error, Result};
 pub use font::{CMap, Font, FontMap};
 pub use graphics::Matrix;

@@ -18,6 +18,7 @@
 use unicode_normalization::UnicodeNormalization;
 
 use crate::bidi::{self, Direction};
+use crate::content::PageGlyphs;
 use crate::font::FontMap;
 use crate::types::{Glyph, Rect, Style};
 
@@ -64,15 +65,56 @@ impl TextLine {
     }
 }
 
+/// A glyph paired with the `/ActualText` that overrides it, if any.
+///
+/// `Some("")` is meaningful and distinct from `None`: it marks a glyph that a
+/// span covers but whose text was already emitted by the span's first glyph.
+/// Without that distinction an override's text would repeat once per glyph.
+#[derive(Debug, Clone)]
+struct Placed {
+    glyph: Glyph,
+    actual: Option<String>,
+}
+
 /// Turn one page's glyphs into lines of correct, logical-order text.
 ///
-/// This is the whole of Tier A in one call: L1 gave us `glyphs`, L2 gave us
+/// This is the whole of Tier A in one call: L1 gave us the glyphs, L2 gave us
 /// `fonts`, and what comes back is readable.
-pub fn reconstruct(glyphs: &[Glyph], fonts: &FontMap) -> Vec<TextLine> {
-    group_into_lines(glyphs)
+pub fn reconstruct(page: &PageGlyphs, fonts: &FontMap) -> Vec<TextLine> {
+    let placed = apply_actual_text(page);
+    group_into_lines(&placed)
         .into_iter()
         .filter_map(|line| build_line(&line, fonts))
         .collect()
+}
+
+/// Attach `/ActualText` overrides to the glyphs they cover.
+///
+/// The whole span's text goes on its first glyph and the rest are blanked, so
+/// the text appears exactly once, positioned where the span began.
+fn apply_actual_text(page: &PageGlyphs) -> Vec<Placed> {
+    let mut placed: Vec<Placed> = page
+        .glyphs
+        .iter()
+        .map(|glyph| Placed {
+            glyph: glyph.clone(),
+            actual: None,
+        })
+        .collect();
+
+    for span in &page.actual_text {
+        // Clamp against a malformed range rather than panicking on the slice.
+        let end = span.end.min(placed.len());
+        let Some(start) = (span.start < end).then_some(span.start) else {
+            continue;
+        };
+
+        placed[start].actual = Some(span.text.clone());
+        for slot in &mut placed[start + 1..end] {
+            slot.actual = Some(String::new());
+        }
+    }
+    placed
 }
 
 /// Join a page's lines into a single string, top to bottom.
@@ -95,15 +137,16 @@ pub fn lines_to_text(lines: &[TextLine]) -> String {
 /// every heading first, or interleave two columns. The only reliable statement
 /// about a line is that its glyphs sit at the same height. PLAN.md §3 makes
 /// this a design rule: *positions are ground truth for order*.
-fn group_into_lines(glyphs: &[Glyph]) -> Vec<Vec<Glyph>> {
+fn group_into_lines(glyphs: &[Placed]) -> Vec<Vec<Placed>> {
     if glyphs.is_empty() {
         return Vec::new();
     }
 
     // Sort top-to-bottom. PDF's y grows upwards, so descending y is reading
     // order down the page.
-    let mut sorted: Vec<Glyph> = glyphs.to_vec();
+    let mut sorted: Vec<Placed> = glyphs.to_vec();
     sorted.sort_by(|a, b| {
+        let (a, b) = (&a.glyph, &b.glyph);
         // `f64` is only `PartialOrd` — NaN has no place in an ordering — so
         // `sort_by` needs a total order. `total_cmp` provides one, and a NaN
         // coordinate from a malformed file sorts to one end instead of
@@ -111,21 +154,21 @@ fn group_into_lines(glyphs: &[Glyph]) -> Vec<Vec<Glyph>> {
         b.y.total_cmp(&a.y).then(a.x.total_cmp(&b.x))
     });
 
-    let mut lines: Vec<Vec<Glyph>> = Vec::new();
-    let mut current: Vec<Glyph> = Vec::new();
-    let mut current_y = sorted[0].y;
+    let mut lines: Vec<Vec<Placed>> = Vec::new();
+    let mut current: Vec<Placed> = Vec::new();
+    let mut current_y = sorted[0].glyph.y;
 
-    for glyph in sorted {
+    for placed in sorted {
         // Tolerance scales with the type size: 2pt of drift is a different
         // line in 6pt footnotes but the same line in a 40pt heading. Subscripts
         // and diacritics sit slightly off the baseline and must not split it.
-        let tolerance = (glyph.style.size * 0.3).max(0.5);
+        let tolerance = (placed.glyph.style.size * 0.3).max(0.5);
 
-        if (glyph.y - current_y).abs() > tolerance && !current.is_empty() {
+        if (placed.glyph.y - current_y).abs() > tolerance && !current.is_empty() {
             lines.push(std::mem::take(&mut current));
-            current_y = glyph.y;
+            current_y = placed.glyph.y;
         }
-        current.push(glyph);
+        current.push(placed);
     }
 
     if !current.is_empty() {
@@ -138,48 +181,62 @@ fn group_into_lines(glyphs: &[Glyph]) -> Vec<Vec<Glyph>> {
 ///
 /// Returns `None` for a line that produced no text at all, so blank lines do
 /// not clutter the output.
-fn build_line(glyphs: &[Glyph], fonts: &FontMap) -> Option<TextLine> {
-    let first = glyphs.first()?;
+fn build_line(placed: &[Placed], fonts: &FontMap) -> Option<TextLine> {
+    let first = placed.first()?;
 
     // Left to right, which is the order the glyphs were painted in — the
     // *visual* order we are about to undo.
-    let mut ordered: Vec<&Glyph> = glyphs.iter().collect();
-    ordered.sort_by(|a, b| a.x.total_cmp(&b.x));
+    let mut ordered: Vec<&Placed> = placed.iter().collect();
+    ordered.sort_by(|a, b| a.glyph.x.total_cmp(&b.glyph.x));
 
-    let mut visual = String::new();
+    // Build the line as pieces rather than one string, because decoded glyphs
+    // and `/ActualText` need opposite treatment by the reorder below.
+    let mut pieces: Vec<Piece> = Vec::new();
     let mut unresolved = 0;
     let mut previous_end: Option<f64> = None;
 
-    for glyph in &ordered {
+    for item in &ordered {
+        let glyph = &item.glyph;
+
         // Some PDFs separate words by moving the pen rather than painting a
         // space glyph. Detect that as a gap wider than a fraction of the type
         // size, and only when a space is not already there.
         if let Some(end) = previous_end {
             let gap = glyph.x - end;
-            let is_wide = gap > glyph.style.size * WORD_GAP_FRACTION;
-            if is_wide && !visual.ends_with(' ') {
-                visual.push(' ');
+            let already_spaced = matches!(pieces.last(), Some(Piece::Decoded(t)) if t == " ");
+            if gap > glyph.style.size * WORD_GAP_FRACTION && !already_spaced {
+                pieces.push(Piece::Decoded(" ".to_string()));
             }
+        }
+        previous_end = Some(glyph.x + glyph.advance);
+
+        // Rung one of the chain: the writer told us outright what this run
+        // says, so nothing else is consulted.
+        if let Some(text) = &item.actual {
+            if !text.is_empty() {
+                pieces.push(Piece::Actual(text.clone()));
+            }
+            continue;
         }
 
         match fonts.decode(&glyph.style.font, glyph.code) {
-            Some(text) => visual.push_str(&text),
+            Some(text) => pieces.push(Piece::Decoded(text)),
             None => {
                 // An unresolvable code becomes U+FFFD, never nothing. Silently
                 // dropping it would turn "we cannot read this" into "there was
                 // nothing here" — the exact deception this project exists to
                 // avoid.
                 unresolved += 1;
-                visual.push(char::REPLACEMENT_CHARACTER);
+                pieces.push(Piece::Decoded(char::REPLACEMENT_CHARACTER.to_string()));
             }
         }
-        previous_end = Some(glyph.x + glyph.advance);
     }
+
+    let direction = bidi::detect_direction(&pieces_text(&pieces));
 
     // ---- the order-of-operations rule -----------------------------------
     // Step 1: reorder, while ligatures are still single glyphs.
-    let direction = bidi::detect_direction(&visual);
-    let logical = bidi::visual_to_logical(&visual, direction);
+    let logical = bidi::visual_to_logical(&assemble_visual(&pieces, direction), direction);
 
     // Step 2: only now normalise. NFKC folds U+FExx presentation forms to base
     // letters and expands `ﻻ` into `ل` + `ا` — in the order the reorder left
@@ -196,13 +253,61 @@ fn build_line(glyphs: &[Glyph], fonts: &FontMap) -> Option<TextLine> {
 
     Some(TextLine {
         text,
-        baseline: first.y,
+        baseline: first.glyph.y,
         bbox: line_bbox(&ordered),
         direction,
-        style: dominant_style(glyphs),
+        style: dominant_style(placed),
         unresolved,
-        glyph_count: glyphs.len(),
+        glyph_count: placed.len(),
     })
+}
+
+/// A fragment of a line, tagged by where its text came from.
+#[derive(Debug, Clone)]
+enum Piece {
+    /// Text decoded from glyph codes: still in **visual** order.
+    Decoded(String),
+    /// Text taken from `/ActualText`: already in **logical** order.
+    Actual(String),
+}
+
+/// The pieces' text concatenated, for direction detection only.
+fn pieces_text(pieces: &[Piece]) -> String {
+    pieces
+        .iter()
+        .map(|p| match p {
+            Piece::Decoded(t) | Piece::Actual(t) => t.as_str(),
+        })
+        .collect()
+}
+
+/// Assemble the pieces into the visual-order string the reorder expects.
+///
+/// # The `/ActualText` problem
+///
+/// Decoded glyphs arrive in visual order and the reorder below turns them into
+/// logical order. `/ActualText` is *already* logical — the writer wrote it for
+/// a human. Passing it through unchanged would leave the reorder to reverse it,
+/// producing a backwards word inside an otherwise correct line.
+///
+/// So an RTL override is reversed on the way in, and the line's reorder undoes
+/// that. This is exact for a span of a single direction, which is what
+/// `/ActualText` is used for in practice — a ligature, a hyphenated word, a
+/// logo's name. It carries the same caveat as the whole visual→logical
+/// inversion (see `bidi.rs`): a span mixing directions internally may not round
+/// trip perfectly. PLAN.md §8 tracks that.
+fn assemble_visual(pieces: &[Piece], direction: Direction) -> String {
+    let mut visual = String::new();
+    for piece in pieces {
+        match piece {
+            Piece::Decoded(text) => visual.push_str(text),
+            Piece::Actual(text) if direction == Direction::Rtl => {
+                visual.extend(text.chars().rev());
+            }
+            Piece::Actual(text) => visual.push_str(text),
+        }
+    }
+    visual
 }
 
 /// How wide a gap, as a fraction of the type size, means a word break.
@@ -224,13 +329,14 @@ fn tidy_whitespace(text: &str) -> String {
 /// Heights are approximated from the type size, because a glyph's real ink
 /// extent needs the font program's per-glyph bounding boxes — more work than
 /// any current consumer justifies.
-fn line_bbox(glyphs: &[&Glyph]) -> Rect {
+fn line_bbox(glyphs: &[&Placed]) -> Rect {
     let mut x0 = f64::INFINITY;
     let mut x1 = f64::NEG_INFINITY;
     let mut y0 = f64::INFINITY;
     let mut y1 = f64::NEG_INFINITY;
 
-    for g in glyphs {
+    for placed in glyphs {
+        let g = &placed.glyph;
         x0 = x0.min(g.x);
         x1 = x1.max(g.x + g.advance);
         // Descenders drop below the baseline, ascenders rise above it. These
@@ -252,19 +358,19 @@ fn line_bbox(glyphs: &[&Glyph]) -> Rect {
 ///
 /// A plain count rather than anything cleverer: lines are near-uniform, and the
 /// majority style is what a reader would call "the style of this line".
-fn dominant_style(glyphs: &[Glyph]) -> Style {
+fn dominant_style(glyphs: &[Placed]) -> Style {
     let mut best: Option<(&Style, usize)> = None;
 
     for candidate in glyphs {
         let count = glyphs
             .iter()
-            .filter(|g| g.style.merges_with(&candidate.style))
+            .filter(|g| g.glyph.style.merges_with(&candidate.glyph.style))
             .count();
 
         // `is_none_or` keeps the first style seen when counts tie, which makes
         // the result deterministic rather than dependent on iteration order.
         if best.is_none_or(|(_, best_count)| count > best_count) {
-            best = Some((&candidate.style, count));
+            best = Some((&candidate.glyph.style, count));
         }
     }
 
@@ -300,6 +406,17 @@ mod tests {
                 render_mode: TextRenderMode::Fill,
             },
         }
+    }
+
+    /// Wrap glyphs as [`Placed`] with no `/ActualText` override.
+    fn placed(glyphs: Vec<Glyph>) -> Vec<Placed> {
+        glyphs
+            .into_iter()
+            .map(|glyph| Placed {
+                glyph,
+                actual: None,
+            })
+            .collect()
     }
 
     /// Run steps 2 and 3 — reorder then normalise — on a visual-order string.
@@ -402,10 +519,10 @@ mod tests {
             glyph(20.0, 100.0, 12.0),
             glyph(10.0, 200.0, 12.0),
         ];
-        let lines = group_into_lines(&glyphs);
+        let lines = group_into_lines(&placed(glyphs));
         assert_eq!(lines.len(), 2);
         // Top of the page first: y=200 before y=100.
-        assert_eq!(lines[0][0].y, 200.0);
+        assert_eq!(lines[0][0].glyph.y, 200.0);
         assert_eq!(lines[1].len(), 2);
     }
 
@@ -413,12 +530,12 @@ mod tests {
     fn small_baseline_drift_does_not_split_a_line() {
         // Diacritics and subscripts sit slightly off the baseline.
         let glyphs = vec![glyph(10.0, 100.0, 12.0), glyph(20.0, 101.5, 12.0)];
-        assert_eq!(group_into_lines(&glyphs).len(), 1);
+        assert_eq!(group_into_lines(&placed(glyphs)).len(), 1);
 
         // The same 1.5pt drift in 4pt type *is* a different line, because the
         // tolerance scales with the type size.
         let small = vec![glyph(10.0, 100.0, 4.0), glyph(20.0, 101.5, 4.0)];
-        assert_eq!(group_into_lines(&small).len(), 2);
+        assert_eq!(group_into_lines(&placed(small)).len(), 2);
     }
 
     #[test]
@@ -426,7 +543,7 @@ mod tests {
         // `sort_by` requires a total order; `f64` alone does not provide one.
         let mut glyphs = vec![glyph(10.0, 100.0, 12.0), glyph(20.0, 100.0, 12.0)];
         glyphs[1].y = f64::NAN;
-        let lines = group_into_lines(&glyphs);
+        let lines = group_into_lines(&placed(glyphs));
         assert_eq!(lines.iter().map(|l| l.len()).sum::<usize>(), 2);
     }
 
@@ -437,7 +554,7 @@ mod tests {
             baseline: 0.0,
             bbox: Rect::new(0.0, 0.0, 1.0, 1.0),
             direction: Direction::Ltr,
-            style: dominant_style(&[glyph(0.0, 0.0, 12.0)]),
+            style: dominant_style(&placed(vec![glyph(0.0, 0.0, 12.0)])),
             unresolved: 3,
             glyph_count: 12,
         };
@@ -452,7 +569,7 @@ mod tests {
         let c = glyph(20.0, 0.0, 12.0);
 
         // One red 24pt glyph, two black 12pt ones.
-        let style = dominant_style(&[a, b, c]);
+        let style = dominant_style(&placed(vec![a, b, c]));
         assert!((style.size - 12.0).abs() < 1e-9);
         assert!(style.color.is_black());
     }
@@ -461,5 +578,100 @@ mod tests {
     fn whitespace_is_tidied() {
         assert_eq!(tidy_whitespace("  a   b  "), "a b");
         assert_eq!(tidy_whitespace("   "), "");
+    }
+
+    // ---- /ActualText -----------------------------------------------------
+
+    #[test]
+    fn actual_text_lands_on_the_first_glyph_and_blanks_the_rest() {
+        let page = PageGlyphs {
+            glyphs: vec![
+                glyph(0.0, 0.0, 12.0),
+                glyph(10.0, 0.0, 12.0),
+                glyph(20.0, 0.0, 12.0),
+            ],
+            actual_text: vec![crate::content::ActualText {
+                start: 0,
+                end: 2,
+                text: "ffi".to_string(),
+            }],
+            ..Default::default()
+        };
+
+        let placed = apply_actual_text(&page);
+        assert_eq!(placed[0].actual.as_deref(), Some("ffi"));
+        // Covered but already accounted for: `Some("")`, not `None`, so the
+        // text is emitted once rather than once per glyph.
+        assert_eq!(placed[1].actual.as_deref(), Some(""));
+        // Outside the span.
+        assert_eq!(placed[2].actual, None);
+    }
+
+    #[test]
+    fn a_malformed_actual_text_range_is_clamped_not_panicked() {
+        let page = PageGlyphs {
+            glyphs: vec![glyph(0.0, 0.0, 12.0)],
+            actual_text: vec![
+                // Past the end of the glyph list.
+                crate::content::ActualText {
+                    start: 0,
+                    end: 99,
+                    text: "x".to_string(),
+                },
+                // Backwards, and entirely out of bounds.
+                crate::content::ActualText {
+                    start: 50,
+                    end: 10,
+                    text: "y".to_string(),
+                },
+            ],
+            ..Default::default()
+        };
+
+        let placed = apply_actual_text(&page);
+        assert_eq!(placed.len(), 1);
+        assert_eq!(placed[0].actual.as_deref(), Some("x"));
+    }
+
+    #[test]
+    fn an_rtl_override_is_not_reversed_by_the_line_reorder() {
+        // `/ActualText` is already logical; decoded glyphs are visual. Without
+        // compensation the reorder would reverse the override, producing a
+        // backwards word inside an otherwise correct line.
+        let arabic = "\u{0645}\u{0631}\u{062D}\u{0628}\u{0627}"; // مرحبا
+        let pieces = vec![Piece::Actual(arabic.to_string())];
+
+        let visual = assemble_visual(&pieces, Direction::Rtl);
+        let logical = bidi::visual_to_logical(&visual, Direction::Rtl);
+        assert_eq!(logical, arabic, "the override came back reversed");
+    }
+
+    #[test]
+    fn an_ltr_override_passes_through_unchanged() {
+        let pieces = vec![Piece::Actual("ffi".to_string())];
+        assert_eq!(assemble_visual(&pieces, Direction::Ltr), "ffi");
+    }
+
+    #[test]
+    fn actual_text_beats_the_glyph_codes_it_covers() {
+        // The point of the top rung of the chain: whatever the glyphs decode
+        // to, the writer's declared text wins.
+        let page = PageGlyphs {
+            glyphs: vec![glyph(0.0, 100.0, 12.0), glyph(10.0, 100.0, 12.0)],
+            actual_text: vec![crate::content::ActualText {
+                start: 0,
+                end: 2,
+                text: "fi".to_string(),
+            }],
+            ..Default::default()
+        };
+
+        // An empty font map: every code is otherwise unresolvable, so any text
+        // at all can only have come from the override.
+        let lines = reconstruct(&page, &FontMap::default());
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0].text, "fi");
+        // The glyphs never went through font decoding, so nothing is unresolved.
+        assert_eq!(lines[0].unresolved, 0);
     }
 }

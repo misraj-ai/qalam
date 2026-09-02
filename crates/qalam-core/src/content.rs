@@ -66,6 +66,24 @@ impl GlyphWidths for AssumedWidths {
     }
 }
 
+/// A run of glyphs whose true text the PDF states outright.
+///
+/// A marked-content section may carry `/ActualText`, giving the text a run of
+/// glyphs *really* represents — regardless of what the glyphs decode to. It is
+/// used for ligatures, for hyphenated words split across lines, and for glyphs
+/// that are not text at all (a logo drawn from a custom font). It is the
+/// **top** rung of the resolution chain in PLAN.md §3: when present, it wins.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ActualText {
+    /// Index of the first glyph covered, into [`PageGlyphs::glyphs`].
+    pub start: usize,
+    /// One past the last glyph covered — a half-open range, as Rust ranges are.
+    pub end: usize,
+    /// The text the writer says this run represents, already decoded from
+    /// PDF's text-string format.
+    pub text: String,
+}
+
 /// Everything the interpreter recovered from one page.
 #[derive(Debug, Default)]
 pub struct PageGlyphs {
@@ -82,6 +100,8 @@ pub struct PageGlyphs {
     /// Operators we recognised as text-affecting but chose not to implement.
     /// Useful while building; expected to stay empty on ordinary files.
     pub unsupported: Vec<String>,
+    /// `/ActualText` overrides, as glyph ranges. Usually empty.
+    pub actual_text: Vec<ActualText>,
 }
 
 /// The text-object state, reset at every `BT`.
@@ -146,6 +166,20 @@ struct Interpreter<'a> {
     widths: &'a dyn GlyphWidths,
     /// What we have found so far.
     out: PageGlyphs,
+    /// The open marked-content sections, innermost last.
+    ///
+    /// Each entry remembers the glyph index where the section began and its
+    /// `/ActualText`, if any. A stack because `BDC`/`BMC` sections nest, and a
+    /// nested one must not close its parent.
+    marked_content: Vec<MarkedSection>,
+}
+
+/// One open marked-content section.
+struct MarkedSection {
+    /// Glyph count at the moment the section opened.
+    start: usize,
+    /// The section's `/ActualText`, if it declared one.
+    actual_text: Option<String>,
 }
 
 /// Interpret one page's content stream.
@@ -173,6 +207,7 @@ pub fn interpret(content: &[u8], fonts: &[FontInfo], widths: &dyn GlyphWidths) -
         fonts,
         widths,
         out: PageGlyphs::default(),
+        marked_content: Vec::new(),
     };
 
     for op in &parsed.operations {
@@ -333,6 +368,53 @@ impl Interpreter<'_> {
                         // hence the negation. Units are thousandths of an em.
                         let tx = -kern / 1000.0 * self.text.font_size * self.text.horizontal_scale;
                         self.text.tm = Matrix::translation(tx, 0.0).then(self.text.tm);
+                    }
+                }
+            }
+
+            // ---- marked content ------------------------------------------
+            // `BDC` opens a section with a property list, which is where
+            // `/ActualText` lives. `BMC` opens one without properties. Both are
+            // closed by `EMC`.
+            "BDC" | "BMC" => {
+                let actual_text = if op.operator == "BDC" {
+                    // Operands are `/Tag /PropertyName` or `/Tag << ... >>`.
+                    // Only the inline-dictionary form is readable here: the
+                    // named form points into `/Resources /Properties`, which
+                    // this module deliberately does not have.
+                    op.operands
+                        .get(1)
+                        .and_then(|o| o.as_dict().ok())
+                        .and_then(|d| d.get(b"ActualText").ok())
+                        .and_then(object_string)
+                        .map(pdf_text_string)
+                } else {
+                    None
+                };
+
+                // Bound the nesting so a pathological stream cannot grow this
+                // without limit, matching the graphics stack's guard.
+                const MAX_NESTING: usize = 64;
+                if self.marked_content.len() < MAX_NESTING {
+                    self.marked_content.push(MarkedSection {
+                        start: self.out.glyphs.len(),
+                        actual_text,
+                    });
+                }
+            }
+            "EMC" => {
+                if let Some(section) = self.marked_content.pop() {
+                    let end = self.out.glyphs.len();
+                    // Record only sections that both declared an override and
+                    // actually painted something.
+                    if let Some(text) = section.actual_text {
+                        if end > section.start {
+                            self.out.actual_text.push(ActualText {
+                                start: section.start,
+                                end,
+                                text,
+                            });
+                        }
                     }
                 }
             }
@@ -507,6 +589,25 @@ fn object_name(obj: &Object) -> Option<String> {
     obj.as_name()
         .ok()
         .map(|n| String::from_utf8_lossy(n).into_owned())
+}
+
+/// Decode a PDF *text string* into Rust text.
+///
+/// PDF stores these in one of two ways, distinguished by a byte-order mark:
+/// UTF-16BE when the string starts with `FE FF`, and PDFDocEncoding otherwise.
+/// PDFDocEncoding agrees with Latin-1 across the range that carries text, which
+/// is what the fallback below assumes.
+fn pdf_text_string(bytes: &[u8]) -> String {
+    if bytes.starts_with(&[0xFE, 0xFF]) {
+        let units = bytes[2..]
+            .chunks_exact(2)
+            .map(|pair| u16::from_be_bytes([pair[0], pair[1]]));
+        return char::decode_utf16(units)
+            .map(|r| r.unwrap_or(char::REPLACEMENT_CHARACTER))
+            .collect();
+    }
+    // Latin-1: each byte is its own codepoint.
+    bytes.iter().map(|&b| b as char).collect()
 }
 
 /// Borrow a PDF string operand's raw bytes.
@@ -724,6 +825,79 @@ mod tests {
         // still at (100,100), still black.
         assert_eq!((out.glyphs[0].x, out.glyphs[0].y), (100.0, 100.0));
         assert!(out.glyphs[0].style.color.is_black());
+    }
+
+    // ---- /ActualText -----------------------------------------------------
+
+    #[test]
+    fn bdc_with_actual_text_records_the_glyph_range() {
+        let out = run(
+            "BT /F1 12 Tf /Span <</ActualText (fi)>> BDC (\\001\\002) Tj EMC ET",
+            &[simple_font("F1")],
+        );
+        assert_eq!(out.glyphs.len(), 2);
+        assert_eq!(out.actual_text.len(), 1);
+        assert_eq!(out.actual_text[0].text, "fi");
+        assert_eq!((out.actual_text[0].start, out.actual_text[0].end), (0, 2));
+    }
+
+    #[test]
+    fn utf16_actual_text_is_decoded_via_its_byte_order_mark() {
+        // A PDF text string beginning FE FF is UTF-16BE. Here: U+0645 U+0631.
+        let out = run(
+            "BT /F1 12 Tf /Span <</ActualText <FEFF06450631>>> BDC (x) Tj EMC ET",
+            &[simple_font("F1")],
+        );
+        assert_eq!(out.actual_text.len(), 1);
+        assert_eq!(out.actual_text[0].text, "\u{0645}\u{0631}");
+    }
+
+    #[test]
+    fn marked_content_without_actual_text_records_nothing() {
+        // `/OC` optional-content layers wrap the text in our fixture and carry
+        // no override — the common case, which must not produce a phantom span.
+        let out = run(
+            "/OC /MC0 BDC BT /F1 12 Tf (x) Tj ET EMC",
+            &[simple_font("F1")],
+        );
+        assert_eq!(out.glyphs.len(), 1);
+        assert!(out.actual_text.is_empty());
+    }
+
+    #[test]
+    fn an_empty_marked_section_records_no_override() {
+        // The section declared text but painted nothing, so there is no glyph
+        // range to attach it to.
+        let out = run("/Span <</ActualText (x)>> BDC EMC", &[simple_font("F1")]);
+        assert!(out.actual_text.is_empty());
+    }
+
+    #[test]
+    fn nested_sections_close_in_the_right_order() {
+        // The inner `EMC` must close the inner section, not the outer one.
+        let out = run(
+            "BT /F1 12 Tf \
+             /Span <</ActualText (outer)>> BDC (a) Tj \
+             /Span <</ActualText (inner)>> BDC (b) Tj EMC \
+             (c) Tj EMC ET",
+            &[simple_font("F1")],
+        );
+        assert_eq!(out.glyphs.len(), 3);
+        assert_eq!(out.actual_text.len(), 2);
+
+        // The inner section closes first, covering only glyph 1.
+        assert_eq!(out.actual_text[0].text, "inner");
+        assert_eq!((out.actual_text[0].start, out.actual_text[0].end), (1, 2));
+        // The outer covers all three.
+        assert_eq!(out.actual_text[1].text, "outer");
+        assert_eq!((out.actual_text[1].start, out.actual_text[1].end), (0, 3));
+    }
+
+    #[test]
+    fn an_unmatched_emc_is_survivable() {
+        let out = run("EMC BT /F1 12 Tf (x) Tj ET", &[simple_font("F1")]);
+        assert_eq!(out.glyphs.len(), 1);
+        assert!(out.actual_text.is_empty());
     }
 
     #[test]
