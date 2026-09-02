@@ -82,8 +82,45 @@ struct Placed {
 /// This is the whole of Tier A in one call: L1 gave us the glyphs, L2 gave us
 /// `fonts`, and what comes back is readable.
 pub fn reconstruct(page: &PageGlyphs, fonts: &FontMap) -> Vec<TextLine> {
+    reconstruct_regions(page, fonts, &[])
+        .into_iter()
+        .flat_map(|region| region.lines)
+        .collect()
+}
+
+/// One region of a page: a run of text, and any extra boxes that fell inside it.
+///
+/// A region is what the XY-cut decided is a self-contained piece of the page —
+/// one card, one column, one heading band. Keeping them apart is what stops
+/// three side-by-side cards from being read as one interleaved paragraph.
+#[derive(Debug, Clone)]
+pub struct Region {
+    /// The text in this region, in reading order.
+    pub lines: Vec<TextLine>,
+    /// Indices into the `extra_boxes` passed to [`reconstruct_regions`], for
+    /// whatever landed in this region. Used to place images among the text.
+    pub extras: Vec<usize>,
+    /// The area the region covers.
+    pub bbox: Rect,
+}
+
+/// Split a page into regions of text, in reading order.
+///
+/// `extra_boxes` are non-text rectangles — image placements — that should take
+/// part in the reading-order pass. They are plain [`Rect`]s on purpose: reading
+/// order is a property of *where things are*, so this layer needs nothing about
+/// what they contain, and stays free of any dependency on L7.
+///
+/// Including them matters. Ordering images by vertical position alone would put
+/// a figure that sits beside a column of text in the wrong place; feeding its
+/// box through the same cut puts it in the column it actually belongs to.
+pub fn reconstruct_regions(
+    page: &PageGlyphs,
+    fonts: &FontMap,
+    extra_boxes: &[Rect],
+) -> Vec<Region> {
     let placed = apply_actual_text(page);
-    if placed.is_empty() {
+    if placed.is_empty() && extra_boxes.is_empty() {
         return Vec::new();
     }
 
@@ -91,20 +128,82 @@ pub fn reconstruct(page: &PageGlyphs, fonts: &FontMap) -> Vec<TextLine> {
     // three cards side by side share every baseline, so a line-by-line reading
     // takes one fragment from each and shuffles three paragraphs together.
     // Splitting the page into regions first keeps each column's prose intact.
-    let items: Vec<Item> = placed.iter().map(item_for).collect();
+    //
+    // Glyphs come first in the item list and the extras after, so an index
+    // below `placed.len()` is a glyph and anything at or above it is an extra.
+    let mut items: Vec<Item> = placed.iter().map(item_for).collect();
+    items.extend(extra_boxes.iter().map(|b| Item {
+        x0: b.x0,
+        x1: b.x1,
+        y0: b.y0,
+        y1: b.y1,
+        // An image has no type size. Using the page's median text size keeps
+        // the gutter thresholds meaningful rather than letting a size of zero
+        // collapse them.
+        size: median_text_size(&placed),
+    }));
+
     let rtl = page_direction(&placed, fonts) == Direction::Rtl;
+    let split = placed.len();
 
     layout::segment(&items, rtl)
         .into_iter()
-        .flat_map(|region| {
-            // `region` holds indices into `placed`, in reading order.
-            let glyphs: Vec<Placed> = region.into_iter().map(|i| placed[i].clone()).collect();
-            group_into_lines(&glyphs)
+        .filter_map(|region| {
+            // `partition` separates the glyph indices from the extras.
+            let (glyph_ids, extra_ids): (Vec<usize>, Vec<usize>) =
+                region.into_iter().partition(|&i| i < split);
+
+            let glyphs: Vec<Placed> = glyph_ids.iter().map(|&i| placed[i].clone()).collect();
+            let lines: Vec<TextLine> = group_into_lines(&glyphs)
                 .into_iter()
                 .filter_map(|line| build_line(&line, fonts))
-                .collect::<Vec<_>>()
+                .collect();
+
+            let extras: Vec<usize> = extra_ids.iter().map(|&i| i - split).collect();
+            if lines.is_empty() && extras.is_empty() {
+                return None;
+            }
+
+            Some(Region {
+                bbox: region_bbox(&lines, &extras, extra_boxes),
+                lines,
+                extras,
+            })
         })
         .collect()
+}
+
+/// The median type size on a page, or a plausible default when there is no text.
+fn median_text_size(placed: &[Placed]) -> f64 {
+    let mut sizes: Vec<f64> = placed.iter().map(|p| p.glyph.style.size).collect();
+    if sizes.is_empty() {
+        // A page of images only; any positive size keeps the thresholds sane.
+        return 10.0;
+    }
+    sizes.sort_by(f64::total_cmp);
+    sizes[sizes.len() / 2]
+}
+
+/// The area covered by a region's lines and extras together.
+fn region_bbox(lines: &[TextLine], extras: &[usize], extra_boxes: &[Rect]) -> Rect {
+    let boxes = lines
+        .iter()
+        .map(|l| l.bbox)
+        .chain(extras.iter().filter_map(|&i| extra_boxes.get(i).copied()));
+
+    boxes
+        .fold(None::<Rect>, |acc, b| {
+            Some(match acc {
+                None => b,
+                Some(a) => Rect::new(
+                    a.x0.min(b.x0),
+                    a.y0.min(b.y0),
+                    a.x1.max(b.x1),
+                    a.y1.max(b.y1),
+                ),
+            })
+        })
+        .unwrap_or(Rect::new(0.0, 0.0, 0.0, 0.0))
 }
 
 /// The box a glyph occupies, for the layout pass.

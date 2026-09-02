@@ -8,6 +8,7 @@
 //! qalam text    <file.pdf> [page]   # L2 output: codes resolved through /ToUnicode
 //! qalam extract <file.pdf> [page]   # L3 output: correct logical Arabic
 //! qalam images  <file.pdf> [dir]    # L7 output: write embedded images to disk
+//! qalam blocks  <file.pdf> [page]   # the structured model: typed blocks in order
 //! ```
 
 use std::process::ExitCode;
@@ -32,6 +33,14 @@ fn main() -> ExitCode {
         [cmd, path] if cmd == "glyphs" => glyphs(path, 1),
         [cmd, path] if cmd == "text" => text(path, 1),
         [cmd, path] if cmd == "extract" => extract::extract(path, None),
+        [cmd, path] if cmd == "blocks" => extract::blocks(path, None),
+        [cmd, path, page] if cmd == "blocks" => match page.parse() {
+            Ok(n) => extract::blocks(path, Some(n)),
+            Err(_) => {
+                eprintln!("error: `{page}` is not a page number");
+                return ExitCode::FAILURE;
+            }
+        },
         [cmd, path] if cmd == "images" => images(path, None),
         [cmd, path, dir] if cmd == "images" => images(path, Some(dir)),
         [cmd, path, page] if cmd == "extract" => match page.parse() {
@@ -83,7 +92,8 @@ fn usage() {
          \x20 qalam glyphs <file.pdf> [page]    positioned, styled glyph codes (L1)\n\
          \x20 qalam text <file.pdf> [page]      codes resolved through /ToUnicode (L2)\n\
          \x20 qalam extract <file.pdf> [page]   correct logical Arabic (L3; page or `all`)\n\
-         \x20 qalam images <file.pdf> [dir]     write embedded images to a directory (L7)"
+         \x20 qalam images <file.pdf> [dir]     write embedded images to a directory (L7)\n\
+         \x20 qalam blocks <file.pdf> [page]    typed blocks in reading order"
     );
 }
 

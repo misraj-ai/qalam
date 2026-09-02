@@ -20,6 +20,7 @@
 //! ```
 
 use crate::arabic::{self, TextLine};
+use crate::blocks::{self, Block};
 use crate::detect::{self, PageReport, Recoverability};
 use crate::font::FontMap;
 use crate::images::{self, PlacedImage};
@@ -55,6 +56,13 @@ pub struct Page {
     pub lines: Vec<TextLine>,
     /// What the detector concluded about this page (L4).
     pub report: PageReport,
+    /// The page's content as typed blocks, in reading order.
+    ///
+    /// The richer model PLAN.md §3 describes: text and images interleaved by
+    /// geometry, each knowing where it is and how much we trust it. `lines` and
+    /// `images` are views over the same content, kept because most callers want
+    /// one or the other and not the interleaving.
+    pub blocks: Vec<Block>,
     /// The images drawn on this page, each with where it landed (L7).
     ///
     /// Independent of the text: an image needs no font, no reading order and no
@@ -71,6 +79,20 @@ impl Page {
     /// [`Document::text`] that declines to hand back the untrustworthy ones.
     pub fn text(&self) -> String {
         arabic::lines_to_text(&self.lines)
+    }
+
+    /// The page's text blocks, skipping images.
+    ///
+    /// # Rust lesson: returning an iterator
+    ///
+    /// `impl Iterator<Item = &TextBlock>` hands back a lazy sequence borrowed
+    /// from `self` — no vector is built, and a caller who only wants the first
+    /// block pays for only that one.
+    pub fn text_blocks(&self) -> impl Iterator<Item = &crate::blocks::TextBlock> {
+        self.blocks.iter().filter_map(|b| match b {
+            Block::Text(t) => Some(t),
+            Block::Image(_) => None,
+        })
     }
 
     /// Whether this page has no usable text layer.
@@ -112,6 +134,9 @@ impl Document {
             let raw_images = pdf.page_raw_images(number)?;
             let images = images::extract_placed(&raw_images, &glyphs.xobjects);
 
+            // The unified model: text regions and images ordered together.
+            let blocks = blocks::assemble(&glyphs, &fonts, &images, info.media_box);
+
             pages.push(Page {
                 number,
                 width: info.media_box.width(),
@@ -119,6 +144,7 @@ impl Document {
                 rotation: info.rotation,
                 lines,
                 report,
+                blocks,
                 images,
             });
         }

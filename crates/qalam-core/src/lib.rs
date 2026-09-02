@@ -45,6 +45,7 @@
 
 pub mod arabic;
 pub mod bidi;
+pub mod blocks;
 pub mod content;
 pub mod detect;
 pub mod document;
@@ -60,8 +61,9 @@ pub mod types;
 // Re-export the handful of names most callers need, so they can write
 // `use qalam_core::Pdf;` instead of `use qalam_core::parser::Pdf;`.
 // The module paths stay public too, for anyone who wants the long form.
-pub use arabic::{lines_to_text, reconstruct, TextLine};
+pub use arabic::{lines_to_text, reconstruct, reconstruct_regions, Region, TextLine};
 pub use bidi::Direction;
+pub use blocks::{assemble, Block, ImageBlock, TextBlock};
 pub use content::{interpret, ActualText, AssumedWidths, GlyphWidths, PageGlyphs, XObjectUse};
 pub use detect::{assess, PageReport, Recoverability, Signals};
 pub use document::{extract_text, Document, Page};
