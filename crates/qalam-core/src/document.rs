@@ -19,7 +19,7 @@
 //! # Ok::<(), qalam_core::Error>(())
 //! ```
 
-use crate::arabic::{self, TextLine};
+use crate::arabic::TextLine;
 use crate::blocks::{self, Block};
 use crate::detect::{self, PageReport, Recoverability};
 use crate::font::FontMap;
@@ -80,13 +80,23 @@ pub struct Page {
 }
 
 impl Page {
-    /// This page's text, lines joined with newlines.
+    /// This page's text, in reading order.
+    ///
+    /// Walks [`Page::blocks`] rather than [`Page::lines`], so a table's cells
+    /// arrive as tab-separated rows instead of as loose lines. Blocks are the
+    /// richer model and plain text is the reduction of it, never the other way
+    /// round (PLAN.md §3).
     ///
     /// Returned regardless of the verdict — a caller who has checked
     /// [`Page::report`] may well want to look at degraded text. It is
     /// [`Document::text`] that declines to hand back the untrustworthy ones.
     pub fn text(&self) -> String {
-        arabic::lines_to_text(&self.lines)
+        self.blocks
+            .iter()
+            .map(Block::text)
+            .filter(|t| !t.is_empty())
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 
     /// The page's text blocks, skipping images.
@@ -99,7 +109,7 @@ impl Page {
     pub fn text_blocks(&self) -> impl Iterator<Item = &crate::blocks::TextBlock> {
         self.blocks.iter().filter_map(|b| match b {
             Block::Text(t) => Some(t),
-            Block::Image(_) => None,
+            Block::Image(_) | Block::Table(_) => None,
         })
     }
 
@@ -151,21 +161,13 @@ impl Document {
             let raw_images = pdf.page_raw_images(number)?;
             let images = images::extract_placed(&raw_images, &glyphs.xobjects);
 
-            // L3 + L6: the unified model, text and images ordered together.
-            let blocks = blocks::assemble(&glyphs, &fonts, &images, info.media_box, order.as_ref());
-
-            // `lines` is a *view* over the blocks, not a second extraction.
-            // Reconstructing the page twice would cost twice as much and, worse,
-            // let the two disagree — the flat text saying one thing and the
-            // structured model another.
-            let lines: Vec<TextLine> = blocks
-                .iter()
-                .filter_map(|block| match block {
-                    Block::Text(text) => Some(text.lines.iter().cloned()),
-                    Block::Image(_) => None,
-                })
-                .flatten()
-                .collect();
+            // L3 + L6 + tables: the unified model, everything ordered together.
+            //
+            // One pass produces both views, so they cannot disagree: `blocks`
+            // is the structured model, `lines` the flat one. Reconstructing the
+            // page twice would cost twice as much and let the two drift apart.
+            let (blocks, lines) =
+                blocks::assemble(&glyphs, &fonts, &images, info.media_box, order.as_ref());
 
             // L4 last: it judges what every layer below it produced.
             let report = detect::assess(number, &glyphs, &fonts, &lines);

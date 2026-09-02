@@ -402,6 +402,57 @@ impl Style {
     }
 }
 
+/// Which way the text advances across the page.
+///
+/// Nearly all text is [`Rightward`](TextOrientation::Rightward), but a table's
+/// narrow column headers are routinely set on their side to fit, and a page
+/// that assumes otherwise reads them one character per line.
+///
+/// The direction is taken from the text rendering matrix — specifically from
+/// where it sends the unit x vector — so it is what the PDF says, not something
+/// inferred from where glyphs happen to land.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TextOrientation {
+    /// Ordinary horizontal text. Successive glyphs move right.
+    #[default]
+    Rightward,
+    /// Rotated a quarter turn anticlockwise: glyphs move **up** the page.
+    Upward,
+    /// Upside down: glyphs move left.
+    Leftward,
+    /// Rotated a quarter turn clockwise: glyphs move **down** the page.
+    Downward,
+}
+
+impl TextOrientation {
+    /// Classify from the direction the text matrix sends the unit x vector.
+    ///
+    /// `atan2` gives the angle in radians; the quarter-turn it is nearest to is
+    /// what matters, because anything in between is decorative rather than a
+    /// line of text to be read.
+    pub fn from_advance(dx: f64, dy: f64) -> Self {
+        // A degenerate matrix — zero-scale text — is not rotated in any
+        // meaningful sense.
+        if dx == 0.0 && dy == 0.0 {
+            return TextOrientation::Rightward;
+        }
+
+        let degrees = dy.atan2(dx).to_degrees();
+        // Snap to the nearest quarter turn, in 0..4.
+        match ((degrees / 90.0).round() as i64).rem_euclid(4) {
+            1 => TextOrientation::Upward,
+            2 => TextOrientation::Leftward,
+            3 => TextOrientation::Downward,
+            _ => TextOrientation::Rightward,
+        }
+    }
+
+    /// `true` when the text runs up or down the page rather than across it.
+    pub fn is_vertical(self) -> bool {
+        matches!(self, TextOrientation::Upward | TextOrientation::Downward)
+    }
+}
+
 /// One glyph as the content stream painted it: a font code at a position.
 ///
 /// This is L1's output and the pipeline's atom. Note what it is **not**: there
@@ -426,6 +477,37 @@ pub struct Glyph {
     pub advance: f64,
     /// Colour, font, effective size and render mode at the moment of painting.
     pub style: Style,
+    /// Which way the text was advancing when this glyph was painted.
+    pub orientation: TextOrientation,
+}
+
+impl Glyph {
+    /// The glyph's position **along** the direction the text reads.
+    ///
+    /// For ordinary text this is `x`. For text rotated a quarter turn it is
+    /// `y`, negated when the text runs downward so that "further along the
+    /// line" is always a larger number — which lets one sort serve every
+    /// orientation.
+    pub fn along(&self) -> f64 {
+        match self.orientation {
+            TextOrientation::Rightward => self.x,
+            TextOrientation::Leftward => -self.x,
+            TextOrientation::Upward => self.y,
+            TextOrientation::Downward => -self.y,
+        }
+    }
+
+    /// The glyph's position **across** the text, which identifies its line.
+    ///
+    /// Glyphs sharing this value are on the same line, whichever way that line
+    /// happens to run.
+    pub fn across(&self) -> f64 {
+        if self.orientation.is_vertical() {
+            self.x
+        } else {
+            self.y
+        }
+    }
 }
 
 /// A font's data pulled out of the PDF object graph, in plain Rust form.

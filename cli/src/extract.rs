@@ -111,6 +111,22 @@ fn print_blocks(page: &qalam_core::Page) {
                     println!("       {}", line.text);
                 }
             }
+            Block::Table(table) => {
+                let t = &table.table;
+                println!(
+                    "[{:>2}] table {position}  confidence {:.2}  {} x {}",
+                    block.reading_index(),
+                    t.confidence,
+                    t.row_count(),
+                    t.column_count()
+                );
+                for row in &t.rows {
+                    // Cells are already in reading order, so joining them left
+                    // to right prints an RTL table right-to-left, as read.
+                    let cells: Vec<&str> = row.iter().map(|c| c.text.as_str()).collect();
+                    println!("       | {} |", cells.join(" | "));
+                }
+            }
             Block::Image(image) => {
                 let kind = if image.is_background {
                     "image (background)"

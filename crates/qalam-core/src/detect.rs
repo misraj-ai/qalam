@@ -77,6 +77,11 @@ pub struct Signals {
     pub replacement_chars: usize,
     /// Characters of text produced.
     pub text_len: usize,
+    /// `true` when the page groups digits with both `,` and `.`.
+    ///
+    /// See [`judge`]: at least one of the two is wrong, and which is not
+    /// knowable from the text alone.
+    pub mixed_digit_separators: bool,
 }
 
 impl Signals {
@@ -182,7 +187,42 @@ fn measure(glyphs: &PageGlyphs, fonts: &FontMap, lines: &[TextLine]) -> Signals 
             .filter(|c| *c == char::REPLACEMENT_CHARACTER)
             .count(),
         text_len: text.chars().count(),
+        mixed_digit_separators: has_mixed_separators(&text),
     }
+}
+
+/// Does this page group digits with a comma in one number and a full stop in
+/// another?
+///
+/// Looks only for the *grouping* shape — a separator with exactly three digits
+/// after it and at least one before — because that is the pattern where the two
+/// characters mean the same thing and cannot both be right. A page mixing
+/// `1,234` with `5.678` is internally inconsistent, whatever the intent.
+fn has_mixed_separators(text: &str) -> bool {
+    let chars: Vec<char> = text.chars().collect();
+    let mut comma = false;
+    let mut period = false;
+
+    for (i, c) in chars.iter().enumerate() {
+        if *c != ',' && *c != '.' {
+            continue;
+        }
+        // A digit before, exactly three after, and no fourth.
+        let before = i > 0 && chars[i - 1].is_ascii_digit();
+        let after = chars
+            .get(i + 1..i + 4)
+            .is_some_and(|w| w.len() == 3 && w.iter().all(char::is_ascii_digit));
+        let no_fourth = !chars.get(i + 4).is_some_and(char::is_ascii_digit);
+
+        if before && after && no_fourth {
+            if *c == ',' {
+                comma = true;
+            } else {
+                period = true;
+            }
+        }
+    }
+    comma && period
 }
 
 /// Turn measurements into a verdict.
@@ -259,6 +299,25 @@ fn judge(s: &Signals) -> (Recoverability, Vec<String>) {
         fail(
             Recoverability::Degraded,
             "text is painted invisibly — this looks like an OCR layer over a scan".to_string(),
+            &mut verdict,
+        );
+    }
+
+    if s.mixed_digit_separators {
+        // Not our error, and not repairable from the text: some fonts map the
+        // glyph the page *draws* as a thousands comma to U+002E instead, so
+        // `3,709` is extracted as `3.709`. Both characters then appear in the
+        // same table, grouping digits identically, and at least one is wrong.
+        //
+        // Guessing which would change the value of a number by a factor of a
+        // thousand — the one kind of error a reader will not catch. So the page
+        // is marked degraded and the caller is told, which is the honest
+        // response to a document that contradicts itself.
+        fail(
+            Recoverability::Degraded,
+            "digits are grouped with both `,` and `.` — some numbers may have \
+             the wrong separator, and so the wrong value"
+                .to_string(),
             &mut verdict,
         );
     }
@@ -341,6 +400,7 @@ mod tests {
             residual_presentation_forms: 0,
             replacement_chars: 0,
             text_len: 480,
+            mixed_digit_separators: false,
         }
     }
 
@@ -472,6 +532,35 @@ mod tests {
     }
 
     #[test]
+    fn a_page_grouping_digits_two_ways_is_flagged() {
+        // Page 6 of `bar_Persons.pdf`: the 2016 columns come back as `3.709`
+        // and the 2017 columns as `3,900`, because the font maps the comma
+        // glyph it *draws* to U+002E. Both are in one table, grouping digits
+        // identically, so at least one is wrong — and guessing which would move
+        // a decimal point by three places.
+        assert!(has_mixed_separators("3.709 and 3,900"));
+
+        let s = Signals {
+            mixed_digit_separators: true,
+            ..healthy()
+        };
+        let (verdict, reasons) = judge(&s);
+        assert_eq!(verdict, Recoverability::Degraded);
+        assert!(reasons.iter().any(|r| r.contains("wrong value")));
+    }
+
+    #[test]
+    fn one_consistent_separator_is_not_suspicious() {
+        // Every ordinary document. Only the *mixture* is evidence of a fault.
+        assert!(!has_mixed_separators("1,234 and 5,678"));
+        assert!(!has_mixed_separators("1.234 and 5.678"));
+        // A genuine decimal is not a grouping: the digit count rules it out.
+        assert!(!has_mixed_separators("3,709 and 0.5"));
+        assert!(!has_mixed_separators("3,709 and 0.12345"));
+        assert!(!has_mixed_separators("no numbers at all"));
+    }
+
+    #[test]
     fn verdicts_order_from_best_to_worst() {
         // Load-bearing: `judge` lowers the verdict by comparing. Inverting this
         // ordering would silently invert the detector.
@@ -491,6 +580,7 @@ mod tests {
             residual_presentation_forms: 50,
             replacement_chars: 50,
             text_len: 10,
+            mixed_digit_separators: true,
         };
         let score = confidence(&s, Recoverability::Degraded);
         assert!((0.0..=1.0).contains(&score), "score was {score}");

@@ -133,6 +133,12 @@ impl Pdf {
             return out;
         };
 
+        // `/RoleMap` translates a producer's own tag names into the standard
+        // ones. InDesign emits `/NormalParagraphStyle` and `/Story`; without
+        // the map those are meaningless strings, and the reader cannot tell a
+        // paragraph from anything else.
+        let roles = self.role_map(root);
+
         // Page object ids, so `/Pg` references can be turned into page numbers.
         let page_numbers: std::collections::HashMap<ObjectId, u32> = self
             .doc
@@ -142,8 +148,34 @@ impl Pdf {
             .collect();
 
         let mut seen = std::collections::HashSet::new();
-        self.walk_structure(root, 0, None, &page_numbers, &mut seen, &mut out.elements);
+        self.walk_structure(
+            root,
+            0,
+            None,
+            &page_numbers,
+            &roles,
+            &mut seen,
+            &mut out.elements,
+        );
         out
+    }
+
+    /// Read `/RoleMap`: the producer's tag names mapped to standard ones.
+    fn role_map(&self, root: &Dictionary) -> std::collections::HashMap<String, String> {
+        let mut map = std::collections::HashMap::new();
+        let Some(dict) = self.lookup(root, b"RoleMap").and_then(|o| o.as_dict().ok()) else {
+            return map;
+        };
+
+        for (name, value) in dict.iter() {
+            if let Ok(target) = self.resolve_or(value).as_name() {
+                map.insert(
+                    String::from_utf8_lossy(name).into_owned(),
+                    String::from_utf8_lossy(target).into_owned(),
+                );
+            }
+        }
+        map
     }
 
     /// Depth-first walk of the structure tree, emitting elements in order.
@@ -161,6 +193,7 @@ impl Pdf {
         depth: usize,
         inherited_page: Option<u32>,
         page_numbers: &std::collections::HashMap<ObjectId, u32>,
+        roles: &std::collections::HashMap<String, String>,
         seen: &mut std::collections::HashSet<ObjectId>,
         out: &mut Vec<StructElement>,
     ) {
@@ -182,7 +215,10 @@ impl Pdf {
             .get(b"S")
             .ok()
             .and_then(|o| o.as_name().ok())
-            .map(|n| String::from_utf8_lossy(n).into_owned());
+            .map(|n| String::from_utf8_lossy(n).into_owned())
+            // A producer's own name resolves to the standard one it stands for;
+            // an unmapped name is kept as-is and simply will not be recognised.
+            .map(|name| roles.get(&name).cloned().unwrap_or(name));
 
         // `/K` holds the kids: child elements, integers (marked-content ids),
         // or a marked-content reference dictionary. All three forms occur.
@@ -239,7 +275,7 @@ impl Pdf {
         }
 
         for child in children {
-            self.walk_structure(child, depth + 1, page, page_numbers, seen, out);
+            self.walk_structure(child, depth + 1, page, page_numbers, roles, seen, out);
         }
     }
 

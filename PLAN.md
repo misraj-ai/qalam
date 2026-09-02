@@ -335,19 +335,28 @@ Rationale: `qalam-core` knows nothing about Python, so it stays independently us
 - **M5 — Corpus + benchmarks.** *(partly done)* Golden-file tests
   (`crates/qalam-core/tests/golden.rs`, regenerate with `UPDATE_GOLDEN=1`) and a
   correctness+speed comparison against pypdfium2/PyMuPDF (`scripts/compare.py`) are in
-  place — see §10.7. **The corpus itself is still one document.** Every threshold in
-  `detect.rs` and `layout.rs` remains a judgement call until that is fixed; more fixtures
-  is the single highest-value work left in Tier A.
-- **M6 — Images (Tier B, do first).** *(partly done)* Extract `/XObject` images per page:
-  DCTDecode passthrough, Flate+samples → PNG, `/Indexed` palettes expanded — see §10.8.
-  **Still to do:** position via the `Do`-operator CTM, images nested inside form XObjects,
-  `/SMask` compositing, and emitting them as `Image` blocks.
-- **M7 — Reading order (Tier B).** L1.5 tagged-tree reader + L6 XY-cut fallback with RTL
-  column ordering. Emit ordered `Text` blocks; validate against `tagged/` and `multicolumn/`.
-  *(L6 landed early, during M3 — see §10.4. The tagged-tree reader and `Block` emission
-  are what remain.)*
-- **M8 — Tables (Tier C).** Tagged `/Table` structure + ruled-line detection from vector
-  graphics. Borderless/alignment inference is a stretch and explicitly best-effort for RTL.
+  place — see §10.7. The corpus is now **two** documents, and the second immediately paid
+  for itself by exposing a whole class of ligature bug (§10.10) that the first could not
+  reach. Still far short of a corpus: every threshold in `detect.rs`, `layout.rs` and
+  `tables.rs` remains a judgement call, and more fixtures is still the highest-value work
+  available.
+- **M6 — Images (Tier B, do first).** *(mostly done)* Extract `/XObject` images per page:
+  DCTDecode passthrough, Flate+samples → PNG, `/Indexed` palettes expanded, positioned by
+  the `Do`-operator CTM, emitted as `Image` blocks — see §10.8.
+  **Still to do:** images nested inside form XObjects, `/SMask` compositing, and sub-byte
+  sample depths.
+- **M7 — Reading order (Tier B).** *(done, one caveat)* L6's recursive XY-cut landed early
+  during M3 (§10.4); the L1.5 tagged-tree reader and the `Block` model followed. A tagged
+  page's reading order now comes from its `/StructTreeRoot`, everything else from geometry.
+  **Caveat:** neither corpus document is tagged, so the tagged path is proven only against
+  PDFs the test suite builds byte by byte (§10.9). Structure tags are also not yet used for
+  block *types* — an `/H1` is still just a short text block.
+- **M8 — Tables (Tier C).** *(ruled path done)* Ruled-line detection from vector graphics:
+  the interpreter now reports painted axis-aligned rules, `tables.rs` clusters them into a
+  grid, and cells are filled with the text inside them, columns numbered right-to-left —
+  see §10.11. 18 tables found in `bar_Persons.pdf`, none invented in the other fixture.
+  **Still to do:** the tagged `/Table`/`/TR`/`/TD` path, rotated header cells, and
+  borderless/alignment inference — the last remains a stretch and explicitly best-effort.
 - **M9 — HTML export (Tier D, stretch).** Render the block model to HTML: `dir="rtl"`,
   blocks in reading order, `Span` styling as inline CSS, extracted images inlined. Purely
   additive — it consumes the model, and needs no change to any layer below it.
@@ -391,6 +400,11 @@ Rationale: `qalam-core` knows nothing about Python, so it stays independently us
   lookup plus a tint transform to resolve exactly. Plan: handle the three device spaces
   precisely, approximate `/ICCBased` by its `/N` component count (1 -> Gray, 3 -> RGB,
   4 -> CMYK), and record anything else as `Color::Unknown` rather than guessing wrong.
+- **Kashida (tatweel) justification.** `bar_Persons.pdf` stretches words to the margin by
+  inserting U+0640 between letters, so `المعظم` is stored as `المعظــم`. We extract it
+  faithfully, which is right — it is in the file — but it means extracted text will not
+  match a search for the normally-typed word. Stripping it should be a flag alongside the
+  tashkeel one, defaulting to preserve.
 - **Is colour meaningful or incidental?** Body text is near-black in most documents, so
   colour may carry little signal beyond headings and links. Cheap to record, so we do —
   but do not design any *extraction* logic that depends on it.
@@ -475,6 +489,88 @@ The `/ToUnicode` stream is a PostScript-flavoured CMap. The parser only needs a 
 - Destinations are **UTF-16BE**, possibly multiple code units → decode to a `String`.
 It is NOT full PostScript; a small tokenizer over these keywords is enough. Do not pull in
 a PostScript interpreter.
+
+### 10.11 — Tables: geometry finds the grid, but only the text can confirm it
+
+`bar_Persons.pdf` yields 18 ruled tables. Page 5's comes out essentially perfect — seven
+columns of governorate statistics, `المحافظات` as column 0 because the page is RTL.
+
+Two rules did the work:
+
+- **A border is drawn one of two ways, and both must be read.** A stroked segment
+  (`m`/`l`/`S`) *or* a filled rectangle so thin it reads as a line (`re`/`f`). The second
+  is at least as common, and an implementation looking only for strokes misses half the
+  tables in the world. Thin filled rects are collapsed to their centre line so everything
+  downstream sees one representation.
+- **`re W n` paints nothing.** Every page in the first corpus opens with a full-page
+  clipping rectangle; treating path *construction* as painting would draw a border around
+  all 44 of them.
+
+**The finding that matters: detection cannot be done on geometry alone.** Page 4 of the
+first corpus draws a rounded frame **twice**, one offset behind the other as a shadow —
+four horizontal rules and four vertical, every one spanning the full extent. That is
+geometrically indistinguishable from a 3x3 grid, and reading it as one shredded a
+paragraph into empty cells. The golden file caught it; nothing else would have.
+
+What separates a table from a frame is not where the lines are but **what is inside**: a
+real table fills most of its cells, a frame has everything in the middle one and nothing
+elsewhere. So the rejection lives in `Table::is_plausible`, *after* the text has been
+placed — not in `detect`, which genuinely cannot know. A false table is worse than a
+missed one: missing one leaves text merely unstructured, inventing one destroys it.
+
+Open: rotated header cells. Narrow headers are set vertically, so every glyph becomes its
+own line and `أقل من (١٥)` comes back as `أ( ق ل م ن ٥١ )`. Cell lines are sorted for
+reading order, which makes the result deterministic but not correct.
+
+### 10.10 — A second class of ligature, and why one corpus could not find it
+
+`bar_Persons.pdf` uses `Type1` simple fonts, and 14 of its glyph codes map through
+`/ToUnicode` to **several base letters at once**: `لم`, `لج`, `بح`, `في`, `هم`, `لله`. One
+glyph, several letters, already in reading order.
+
+Our line-level reversal was reaching inside them, so `المعظم` came out `املعظم` and
+`بحياة` came out `حبياة`. PyMuPDF has the same bug on this file.
+
+This is §10.1's rule generalised, and the generalisation is the lesson:
+
+> A multi-character `/ToUnicode` value is an **atom of logical text**. The visual-to-logical
+> reversal must not reach inside it.
+
+The first corpus could not have found this. Its ligatures mapped to *single* presentation
+forms — `ﻻ` is one character until NFKC expands it, and NFKC runs after the reorder, so the
+order-of-operations rule protected them for free. Here the CMap hands back base letters
+directly; there is nothing left to defer, and the ordering has to be right at the reversal
+step. `/ActualText` had already needed exactly this treatment, so the fix was to stop
+special-casing it and apply the rule to every piece.
+
+**Residual, and not ours:** some words come back short — `القوانــن` for `القوانين`. PyMuPDF
+produces the same, so the file's own `/ToUnicode` is lossy. Guessing the missing letters
+would be exactly the invention this project refuses.
+
+### 10.9 — Tagged PDFs, tested against bytes we wrote ourselves
+
+Neither corpus document is tagged: `/StructTreeRoot` appears **zero** times in both. Rather
+than ship a reader that had never seen real input, the test suite builds tagged PDFs from
+scratch — real indirect objects, a real xref table, parsed by the same `lopdf` the library
+uses. Weaker evidence than a document from Word or InDesign, far stronger than asserting
+against hand-made structs.
+
+The fixture is built so **structure order and geometry disagree**: `Alpha` painted low,
+`Beta` above it. Geometry reads `Beta` first; the tree says `Alpha`. That premise is
+*asserted*, not assumed — if the geometric path ever started agreeing, the tagged tests
+would pass for the wrong reason and nobody would notice.
+
+Rules this produced:
+- **Everything degrades to "no opinion", never to an error.** A tree can cover part of a
+  page, name marked-content ids the content stream never defines, or exist without the
+  `/Marked` flag. All are ordinary; none deserves a warning. `ReadingOrder::from_structure`
+  returns `None` and geometry takes over silently.
+- **A tree covering under 80% of a page is refused.** Ordering a tagged fragment
+  confidently and appending the rest reads *worse* than ordering the whole page
+  geometrically.
+- **`/Pg` is inherited down the tree**, like the page tree's own inheritable attributes.
+- `cargo test` runs in parallel: two tests writing one temp path produced a truncated file
+  and an `InvalidFileHeader` that read exactly like a parser bug.
 
 ### 10.8 — Images: passthrough is the feature, and a blank logo is not a bug
 

@@ -33,7 +33,7 @@ use lopdf::content::{Content, Operation};
 use lopdf::Object;
 
 use crate::graphics::{ColorSpaceKind, GraphicsStack, Matrix};
-use crate::types::{FontInfo, Glyph, Style, TextRenderMode};
+use crate::types::{FontInfo, Glyph, Style, TextOrientation, TextRenderMode};
 
 /// Supplies the advance width of a glyph, in fractions of an em.
 ///
@@ -126,6 +126,54 @@ pub struct McidSpan {
     pub end: usize,
 }
 
+/// A straight, axis-aligned line painted on the page.
+///
+/// Table borders are drawn one of two ways, and both arrive here: as a
+/// **stroked** segment (`m`/`l`/`S`), or as a **filled rectangle so thin it
+/// reads as a line** (`re`/`f`). The second is at least as common as the first,
+/// and an implementation that only looks for strokes misses half the tables in
+/// the world.
+///
+/// Coordinates are in device space, with the CTM already applied.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct RuledLine {
+    /// Left or bottom end.
+    pub x0: f64,
+    /// Left or bottom end.
+    pub y0: f64,
+    /// Right or top end.
+    pub x1: f64,
+    /// Right or top end.
+    pub y1: f64,
+}
+
+impl RuledLine {
+    /// How far the line runs horizontally.
+    pub fn width(&self) -> f64 {
+        (self.x1 - self.x0).abs()
+    }
+
+    /// How far the line runs vertically.
+    pub fn height(&self) -> f64 {
+        (self.y1 - self.y0).abs()
+    }
+
+    /// A line that runs left to right.
+    pub fn is_horizontal(&self) -> bool {
+        self.width() > self.height()
+    }
+
+    /// A line that runs bottom to top.
+    pub fn is_vertical(&self) -> bool {
+        !self.is_horizontal()
+    }
+
+    /// The longer of the two extents.
+    pub fn length(&self) -> f64 {
+        self.width().max(self.height())
+    }
+}
+
 /// Everything the interpreter recovered from one page.
 #[derive(Debug, Default)]
 pub struct PageGlyphs {
@@ -148,6 +196,12 @@ pub struct PageGlyphs {
     ///
     /// Empty for the overwhelming majority of files, which are untagged.
     pub mcid_spans: Vec<McidSpan>,
+    /// Thin axis-aligned lines painted on the page — candidate table borders.
+    ///
+    /// Only *painted* geometry is here. A rectangle used as a clipping path
+    /// (`re W n`) draws nothing, and recording it would put a spurious border
+    /// around every page: our own corpus opens each page with a full-page clip.
+    pub ruled_lines: Vec<RuledLine>,
 }
 
 /// The text-object state, reset at every `BT`.
@@ -212,12 +266,30 @@ struct Interpreter<'a> {
     widths: &'a dyn GlyphWidths,
     /// What we have found so far.
     out: PageGlyphs,
+    /// The path being built by `m`, `l` and `re`, not yet painted.
+    ///
+    /// PDF separates *constructing* a path from *painting* it, and only the
+    /// painting operators say whether anything was actually drawn.
+    path: Vec<PathSegment>,
+    /// Where the current subpath began, for `h` (closepath).
+    path_start: Option<(f64, f64)>,
+    /// The pen's current position in device space.
+    path_cursor: Option<(f64, f64)>,
     /// The open marked-content sections, innermost last.
     ///
     /// Each entry remembers the glyph index where the section began and its
     /// `/ActualText`, if any. A stack because `BDC`/`BMC` sections nest, and a
     /// nested one must not close its parent.
     marked_content: Vec<MarkedSection>,
+}
+
+/// A piece of the path under construction, in device space.
+#[derive(Debug, Clone, Copy)]
+enum PathSegment {
+    /// A straight run between two points, from `m` then `l`.
+    Line { x0: f64, y0: f64, x1: f64, y1: f64 },
+    /// A rectangle from `re`, kept whole because a thin one is a rule.
+    Rect { x0: f64, y0: f64, x1: f64, y1: f64 },
 }
 
 /// One open marked-content section.
@@ -255,6 +327,9 @@ pub fn interpret(content: &[u8], fonts: &[FontInfo], widths: &dyn GlyphWidths) -
         fonts,
         widths,
         out: PageGlyphs::default(),
+        path: Vec::new(),
+        path_start: None,
+        path_cursor: None,
         marked_content: Vec::new(),
     };
 
@@ -420,6 +495,70 @@ impl Interpreter<'_> {
                 }
             }
 
+            // ---- path construction ---------------------------------------
+            // These build a path; nothing is drawn until a painting operator
+            // says so. Coordinates are transformed by the CTM as they arrive,
+            // so a later `Q` cannot change where an already-built segment is.
+            "m" => {
+                if let [x, y] = nums[..] {
+                    self.path_start = Some(self.graphics.current().ctm.apply(x, y));
+                    self.path_cursor = self.path_start;
+                }
+            }
+            "l" => {
+                if let [x, y] = nums[..] {
+                    let to = self.graphics.current().ctm.apply(x, y);
+                    if let Some((x0, y0)) = self.path_cursor {
+                        self.push_segment(PathSegment::Line {
+                            x0,
+                            y0,
+                            x1: to.0,
+                            y1: to.1,
+                        });
+                    }
+                    self.path_cursor = Some(to);
+                }
+            }
+            "re" => {
+                if let [x, y, w, h] = nums[..] {
+                    // The CTM may flip or rotate, so transform two opposite
+                    // corners and let `Rect`-style normalisation sort them out.
+                    let ctm = self.graphics.current().ctm;
+                    let (x0, y0) = ctm.apply(x, y);
+                    let (x1, y1) = ctm.apply(x + w, y + h);
+                    self.push_segment(PathSegment::Rect { x0, y0, x1, y1 });
+                    // `re` leaves the current point at the rectangle's origin.
+                    self.path_cursor = Some((x0, y0));
+                    self.path_start = self.path_cursor;
+                }
+            }
+            "h" => {
+                // Close the subpath: a line back to where it started.
+                if let (Some((x0, y0)), Some((x1, y1))) = (self.path_cursor, self.path_start) {
+                    self.push_segment(PathSegment::Line { x0, y0, x1, y1 });
+                }
+                self.path_cursor = self.path_start;
+            }
+            // Curves. Their control points are not tracked — a table border is
+            // never a Bézier — but the current point must still follow, or a
+            // later `l` would draw a line from the wrong place.
+            "c" | "v" | "y" => {
+                if nums.len() >= 2 {
+                    let (x, y) = (nums[nums.len() - 2], nums[nums.len() - 1]);
+                    self.path_cursor = Some(self.graphics.current().ctm.apply(x, y));
+                }
+            }
+
+            // ---- path painting -------------------------------------------
+            // Only these actually put ink on the page. `n` is the important
+            // exception: it ends a path *without* painting, and is what every
+            // clipping rectangle uses. Treating it as a paint would draw a
+            // border around every page in our own corpus.
+            "S" | "s" | "f" | "F" | "f*" | "B" | "B*" | "b" | "b*" => {
+                self.paint_path();
+            }
+            "n" => self.clear_path(),
+
             // ---- marked content ------------------------------------------
             // `BDC` opens a section with a property list, which is where
             // `/ActualText` lives. `BMC` opens one without properties. Both are
@@ -498,6 +637,85 @@ impl Interpreter<'_> {
                 // irrelevant to where text lands, so silently ignored.
             }
         }
+    }
+
+    /// Add a segment to the path under construction.
+    ///
+    /// Bounded, because a page of dense vector artwork can hold hundreds of
+    /// thousands of segments and none of them is a table border.
+    fn push_segment(&mut self, segment: PathSegment) {
+        const MAX_SEGMENTS: usize = 8192;
+        if self.path.len() < MAX_SEGMENTS {
+            self.path.push(segment);
+        }
+    }
+
+    /// A painting operator ran: keep whatever in the path looks like a rule.
+    fn paint_path(&mut self) {
+        // A filled rectangle thinner than this reads as a line rather than a
+        // block of colour. Table rules are hairlines to a couple of points;
+        // anything thicker is a band or a background.
+        const MAX_RULE_THICKNESS: f64 = 3.0;
+        // Shorter than this and it is a tick, a bullet or a dash, not a border.
+        const MIN_RULE_LENGTH: f64 = 4.0;
+        // How far from axis-aligned a segment may be. Table borders are
+        // straight; a diagonal is artwork.
+        const AXIS_TOLERANCE: f64 = 0.5;
+
+        for segment in std::mem::take(&mut self.path) {
+            let line = match segment {
+                PathSegment::Line { x0, y0, x1, y1 } => {
+                    // Keep only near-axis-aligned segments.
+                    let (dx, dy) = ((x1 - x0).abs(), (y1 - y0).abs());
+                    if dx > AXIS_TOLERANCE && dy > AXIS_TOLERANCE {
+                        continue;
+                    }
+                    RuledLine { x0, y0, x1, y1 }
+                }
+                PathSegment::Rect { x0, y0, x1, y1 } => {
+                    let (left, right) = (x0.min(x1), x0.max(x1));
+                    let (bottom, top) = (y0.min(y1), y0.max(y1));
+                    let (w, h) = (right - left, top - bottom);
+
+                    // A thin rectangle *is* a rule: collapse it to its centre
+                    // line so the two ways of drawing a border become one
+                    // representation downstream.
+                    if h <= MAX_RULE_THICKNESS && w > h {
+                        let mid = (bottom + top) / 2.0;
+                        RuledLine {
+                            x0: left,
+                            y0: mid,
+                            x1: right,
+                            y1: mid,
+                        }
+                    } else if w <= MAX_RULE_THICKNESS && h > w {
+                        let mid = (left + right) / 2.0;
+                        RuledLine {
+                            x0: mid,
+                            y0: bottom,
+                            x1: mid,
+                            y1: top,
+                        }
+                    } else {
+                        // A filled area, not a border. Its *edges* could be
+                        // read as rules, but a table cell shaded grey would
+                        // then invent four borders it does not have.
+                        continue;
+                    }
+                }
+            };
+
+            if line.length() >= MIN_RULE_LENGTH {
+                self.out.ruled_lines.push(line);
+            }
+        }
+    }
+
+    /// End the path without painting: `n`, and what every clip uses.
+    fn clear_path(&mut self) {
+        self.path.clear();
+        self.path_cursor = None;
+        self.path_start = None;
     }
 
     /// Set a fill or stroke colour from a `g`/`rg`/`k` family operator.
@@ -611,6 +829,9 @@ impl Interpreter<'_> {
             code,
             x,
             y,
+            // Where the matrix sends the unit x vector is the direction the
+            // text advances, and so which way it is meant to be read.
+            orientation: TextOrientation::from_advance(trm.a, trm.b),
             advance: tx * to_device.horizontal_scale(),
             style: Style {
                 color,
@@ -1045,6 +1266,89 @@ mod tests {
         let out = run("EMC BT /F1 12 Tf (x) Tj ET", &[simple_font("F1")]);
         assert_eq!(out.glyphs.len(), 1);
         assert!(out.actual_text.is_empty());
+    }
+
+    // ---- ruled lines ------------------------------------------------------
+
+    #[test]
+    fn a_stroked_segment_becomes_a_ruled_line() {
+        let out = run("100 700 m 400 700 l S", &[]);
+        assert_eq!(out.ruled_lines.len(), 1);
+        let line = out.ruled_lines[0];
+        assert!(line.is_horizontal());
+        assert_eq!((line.x0, line.x1), (100.0, 400.0));
+        assert_eq!(line.length(), 300.0);
+    }
+
+    #[test]
+    fn a_thin_filled_rectangle_is_also_a_ruled_line() {
+        // At least as common as a stroke, and collapsed to the same
+        // representation so that downstream code sees one kind of border.
+        let out = run("100 700 300 0.7 re f", &[]);
+        assert_eq!(out.ruled_lines.len(), 1);
+        let line = out.ruled_lines[0];
+        assert!(line.is_horizontal());
+        // Collapsed to the rectangle's centre line.
+        // Tolerance note: lopdf stores a PDF real as , so 0.7 reaches us
+        // as 0.69999999. That is the file's precision, not our error.
+        assert!((line.y0 - 700.35).abs() < 1e-4, "got {}", line.y0);
+    }
+
+    #[test]
+    fn a_thin_vertical_rectangle_is_a_vertical_rule() {
+        let out = run("100 400 0.7 300 re f", &[]);
+        assert_eq!(out.ruled_lines.len(), 1);
+        assert!(out.ruled_lines[0].is_vertical());
+        assert_eq!(out.ruled_lines[0].length(), 300.0);
+    }
+
+    #[test]
+    fn a_clipping_rectangle_paints_nothing() {
+        // The case that would put a border around every page: our own corpus
+        // opens each one with a full-page clip.
+        let out = run("0 0 595 842 re W n", &[]);
+        assert!(out.ruled_lines.is_empty());
+    }
+
+    #[test]
+    fn a_filled_block_is_not_a_border() {
+        // A shaded cell background. Reading its edges as rules would invent
+        // four borders the table does not have.
+        let out = run("100 100 200 150 re f", &[]);
+        assert!(out.ruled_lines.is_empty());
+    }
+
+    #[test]
+    fn diagonals_and_ticks_are_not_borders() {
+        // A diagonal is artwork; a 2pt dash is a bullet.
+        let out = run("0 0 m 100 100 l S 10 10 m 12 10 l S", &[]);
+        assert!(out.ruled_lines.is_empty());
+    }
+
+    #[test]
+    fn the_ctm_places_the_line() {
+        // A rule inside a transformed group lands where the transform puts it,
+        // and a later `Q` must not move it back.
+        let out = run("q 2 0 0 2 50 50 cm 0 100 m 100 100 l S Q", &[]);
+        assert_eq!(out.ruled_lines.len(), 1);
+        let line = out.ruled_lines[0];
+        assert_eq!((line.x0, line.x1), (50.0, 250.0));
+        assert_eq!(line.y0, 250.0);
+    }
+
+    #[test]
+    fn a_closed_rectangle_path_gives_four_borders() {
+        // Drawn as four strokes rather than `re`, which real writers do.
+        let out = run("100 100 m 300 100 l 300 200 l 100 200 l h S", &[]);
+        assert_eq!(out.ruled_lines.len(), 4);
+        assert_eq!(
+            out.ruled_lines.iter().filter(|l| l.is_horizontal()).count(),
+            2
+        );
+        assert_eq!(
+            out.ruled_lines.iter().filter(|l| l.is_vertical()).count(),
+            2
+        );
     }
 
     #[test]

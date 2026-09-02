@@ -34,25 +34,52 @@ use std::path::{Path, PathBuf};
 
 use qalam_core::Document;
 
-/// The fixture and its golden output.
+/// The corpus: each fixture and the golden file recording its output.
 ///
 /// Integration tests run with the working directory set to the *package* root
 /// (`crates/qalam-core`), while the corpus lives at the repository root, as
 /// PLAN.md §5 lays it out — hence the `../..`.
-const FIXTURE: &str = "../../tests/fixtures/test_for_arabic_barser.pdf";
-const GOLDEN: &str = "../../tests/expected/test_for_arabic_barser.txt";
+///
+/// The two documents exercise genuinely different machinery, which is the
+/// point of having both:
+///
+/// - `test_for_arabic_barser` — `Type0` composite fonts, `Identity-H`, 2-byte
+///   CIDs, presentation forms folded by NFKC, multi-column card layouts.
+/// - `bar_Persons` — `Type1` simple fonts, 1-byte codes, ligatures whose
+///   `/ToUnicode` values are already several base letters, and 18 ruled tables.
+const CORPUS: &[(&str, &str)] = &[
+    (
+        "../../tests/fixtures/test_for_arabic_barser.pdf",
+        "../../tests/expected/test_for_arabic_barser.txt",
+    ),
+    (
+        "../../tests/fixtures/bar_Persons.pdf",
+        "../../tests/expected/bar_Persons.txt",
+    ),
+];
 
-/// Load the fixture, or `None` when it is absent.
+/// The first fixture, which most of the named regressions below refer to.
+const FIXTURE: &str = CORPUS[0].0;
+
+/// The tables fixture.
+const TABLES_FIXTURE: &str = CORPUS[1].0;
+
+/// Open a document, or `None` when the fixture is absent.
 ///
 /// The corpus is large and binary, so a checkout without it must still be able
-/// to run `cargo test`. Every test below returns early rather than failing —
-/// with a printed note, so a skipped test never passes silently.
-fn fixture() -> Option<Document> {
-    if !Path::new(FIXTURE).exists() {
-        eprintln!("note: {FIXTURE} not present — skipping");
+/// to run `cargo test`. Every test returns early rather than failing — with a
+/// printed note, so a skipped test never passes silently.
+fn open(path: &str) -> Option<Document> {
+    if !Path::new(path).exists() {
+        eprintln!("note: {path} not present — skipping");
         return None;
     }
-    Some(Document::open(FIXTURE).expect("the fixture should open"))
+    Some(Document::open(path).expect("the fixture should open"))
+}
+
+/// Load the main fixture.
+fn fixture() -> Option<Document> {
+    open(FIXTURE)
 }
 
 /// Render a document to the golden format: one block per page, with the
@@ -82,22 +109,29 @@ fn render(doc: &Document) -> String {
 
 #[test]
 fn output_matches_the_golden_file() {
-    let Some(doc) = fixture() else { return };
-    let actual = render(&doc);
-    let path = PathBuf::from(GOLDEN);
+    for (pdf, golden) in CORPUS {
+        let Some(doc) = open(pdf) else { continue };
+        compare_against_golden(&doc, golden);
+    }
+}
+
+/// Diff one document's rendering against its golden file.
+fn compare_against_golden(doc: &Document, golden: &str) {
+    let actual = render(doc);
+    let path = PathBuf::from(golden);
 
     // `UPDATE_GOLDEN=1` rewrites the file instead of asserting. Gated behind an
     // environment variable so it can never happen by accident in CI.
     if std::env::var_os("UPDATE_GOLDEN").is_some() {
-        std::fs::create_dir_all(path.parent().expect("GOLDEN has a parent"))
+        std::fs::create_dir_all(path.parent().expect("the golden path has a parent"))
             .and_then(|()| std::fs::write(&path, &actual))
             .expect("could not write the golden file");
-        eprintln!("note: rewrote {GOLDEN}");
+        eprintln!("note: rewrote {golden}");
         return;
     }
 
     let Ok(expected) = std::fs::read_to_string(&path) else {
-        panic!("{GOLDEN} is missing — run with UPDATE_GOLDEN=1 to create it");
+        panic!("{golden} is missing — run with UPDATE_GOLDEN=1 to create it");
     };
 
     if actual != expected {
@@ -105,7 +139,7 @@ fn output_matches_the_golden_file() {
         // line and its neighbours — enough to see what moved.
         let (line, exp, got) = first_difference(&expected, &actual);
         panic!(
-            "golden mismatch at line {line}\n  expected: {exp}\n  actual:   {got}\n\
+            "golden mismatch in {golden} at line {line}\n  expected: {exp}\n  actual:   {got}\n\
              \nRun `UPDATE_GOLDEN=1 cargo test -p qalam-core --test golden` \
              and read the diff if this change was intended."
         );
@@ -258,6 +292,117 @@ fn every_readable_page_resolves_every_glyph() {
             page.report.signals.unresolved, 0,
             "page {} left {} glyph(s) unresolved",
             page.number, page.report.signals.unresolved
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The tables fixture.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn ruled_tables_are_reconstructed() {
+    use qalam_core::Block;
+
+    let Some(doc) = open(TABLES_FIXTURE) else {
+        return;
+    };
+
+    let tables: Vec<&qalam_core::TableBlock> = doc
+        .pages()
+        .iter()
+        .flat_map(|p| &p.blocks)
+        .filter_map(|b| match b {
+            Block::Table(t) => Some(t),
+            _ => None,
+        })
+        .collect();
+
+    assert!(
+        tables.len() >= 15,
+        "expected the document's ruled tables, found {}",
+        tables.len()
+    );
+
+    // Page 5's table of governorates: seven columns, and the first column in
+    // reading order is the rightmost one, because the page is Arabic.
+    let page5 = doc.page(5).expect("page 5");
+    let table = page5
+        .blocks
+        .iter()
+        .find_map(|b| match b {
+            Block::Table(t) => Some(&t.table),
+            _ => None,
+        })
+        .expect("page 5 has a table");
+
+    assert_eq!(table.column_count(), 7);
+    assert!(table.confidence > 0.8);
+
+    // The header row, right to left.
+    let headers: Vec<&str> = table.rows[1].iter().map(|c| c.text.as_str()).collect();
+    assert_eq!(headers[0], "المحافظات", "column 0 should be the rightmost");
+    assert_eq!(headers[1], "ذكور");
+
+    // A data row, with its numbers in the right cells.
+    let muscat = table
+        .rows
+        .iter()
+        .find(|r| r.first().is_some_and(|c| c.text == "مسقط"))
+        .expect("Muscat row");
+    assert_eq!(muscat[1].text, "3,313");
+    assert_eq!(muscat[3].text, "5,263");
+}
+
+#[test]
+fn no_table_is_invented_in_the_untagged_corpus() {
+    use qalam_core::Block;
+
+    // The other fixture has no tables at all — only decorative frames, one of
+    // which is a rounded rectangle drawn twice and geometrically identical to
+    // a 3x3 grid. Reading it as one shredded a paragraph into empty cells.
+    let Some(doc) = fixture() else { return };
+
+    let tables = doc
+        .pages()
+        .iter()
+        .flat_map(|p| &p.blocks)
+        .filter(|b| matches!(b, Block::Table(_)))
+        .count();
+
+    assert_eq!(tables, 0, "a decorative frame was read as a table");
+}
+
+#[test]
+fn multi_character_ligatures_keep_their_order() {
+    // `bar_Persons.pdf` maps 14 codes to several base letters at once — `لم`,
+    // `لج`, `بح`. Those values are already logical, so the line-level reversal
+    // must not reach inside them. It used to, turning `المعظم` into `املعظم`.
+    let Some(doc) = open(TABLES_FIXTURE) else {
+        return;
+    };
+    // This document is justified with **kashida**: U+0640 tatweel is inserted
+    // between letters to stretch a word to the margin, so `المعظم` is stored as
+    // `المعظــم`. That is real content — it is in the file and we extract it
+    // faithfully — but it is decoration for this assertion, so strip it here
+    // rather than making the extractor lossy.
+    let text: String = doc
+        .page(3)
+        .expect("page 3")
+        .text()
+        .chars()
+        .filter(|c| *c != '\u{0640}')
+        .collect();
+
+    for (correct, corrupted) in [("الجلال", "اجلالل"), ("المعظم", "املعظم"), ("بحياة", "حبياة")]
+    {
+        assert!(
+            text.contains(correct),
+            "expected {correct:?} — the ligature order regressed"
+        );
+        assert!(
+            !text.contains(corrupted),
+            "found the swapped form {corrupted:?}"
         );
     }
 }

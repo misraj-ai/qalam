@@ -27,6 +27,7 @@ use crate::content::PageGlyphs;
 use crate::font::FontMap;
 use crate::images::{ExtractedImage, PlacedImage};
 use crate::structure::ReadingOrder;
+use crate::tables::{self, Table};
 use crate::types::Rect;
 
 /// One piece of a page.
@@ -36,9 +37,8 @@ pub enum Block {
     Text(TextBlock),
     /// A picture.
     Image(ImageBlock),
-    // `Table` joins these at M8. The enum is the reason that will be an
-    // additive change: every `match` on a `Block` will stop compiling until it
-    // handles the new case, which is exactly the reminder we want.
+    /// A ruled table, reconstructed from the lines drawn around it.
+    Table(TableBlock),
 }
 
 impl Block {
@@ -47,6 +47,7 @@ impl Block {
         match self {
             Block::Text(b) => b.reading_index,
             Block::Image(b) => b.reading_index,
+            Block::Table(b) => b.reading_index,
         }
     }
 
@@ -57,6 +58,7 @@ impl Block {
         match self {
             Block::Text(b) => Some(b.bbox),
             Block::Image(b) => b.bbox,
+            Block::Table(b) => Some(b.table.bbox),
         }
     }
 
@@ -65,6 +67,20 @@ impl Block {
         match self {
             Block::Text(b) => b.text(),
             Block::Image(_) => String::new(),
+            // A table flattens to its cells, row by row, so that plain-text
+            // extraction still yields the words in reading order.
+            Block::Table(b) => b
+                .table
+                .rows
+                .iter()
+                .map(|row| {
+                    row.iter()
+                        .map(|cell| cell.text.as_str())
+                        .collect::<Vec<_>>()
+                        .join("\t")
+                })
+                .collect::<Vec<_>>()
+                .join("\n"),
         }
     }
 }
@@ -114,6 +130,15 @@ pub struct ImageBlock {
     pub is_background: bool,
 }
 
+/// A reconstructed table.
+#[derive(Debug, Clone)]
+pub struct TableBlock {
+    /// The table itself.
+    pub table: Table,
+    /// Position in the page's reading order.
+    pub reading_index: usize,
+}
+
 /// An image covering at least this fraction of the page is a background.
 ///
 /// Generous on purpose: a cover photograph is often placed *larger* than the
@@ -128,7 +153,7 @@ pub fn assemble(
     images: &[PlacedImage],
     page_box: Rect,
     order: Option<&ReadingOrder>,
-) -> Vec<Block> {
+) -> (Vec<Block>, Vec<TextLine>) {
     // Split the images into the ones that can take part in the reading-order
     // pass and the ones that cannot.
     let mut backgrounds = Vec::new();
@@ -146,10 +171,19 @@ pub fn assemble(
     let boxes: Vec<Rect> = positioned.iter().map(|(_, b)| *b).collect();
     let regions = arabic::reconstruct_regions(glyphs, fonts, &boxes, order);
 
+    // Ruled tables, from the lines L1 saw painted. Detected before the blocks
+    // are emitted so that a cell's text is claimed by its table rather than
+    // being left in the ordinary flow as well.
+    let grids = tables::detect(&glyphs.ruled_lines);
+
     // Which positioned images a region claimed. The tagged path does not place
     // images at all, so anything left over is appended rather than lost.
-    let mut claimed = vec![false; positioned.len()];
+    let mut image_claimed = vec![false; positioned.len()];
     let mut blocks = Vec::new();
+
+    // Every line, in reading order, whether or not a table claimed it. The
+    // detector (L4) needs the complete set to judge the page, and a caller
+    // wanting raw lines should not have to walk into cells to find them.
 
     // Backgrounds first: that is where they are painted, and a reader
     // encounters them before anything on top of them.
@@ -157,31 +191,102 @@ pub fn assemble(
         blocks.push(image_block(&images[index], blocks.len(), true));
     }
 
-    for region in regions {
-        // Within a region, text comes before the images that fell inside it.
-        // Regions are small by construction, so a finer rule would be inventing
-        // precision we do not have.
-        if !region.lines.is_empty() {
+    // Tables are filled from the **whole page**, not region by region. The
+    // XY-cut splits a ruled table into one region per cell — the borders leave
+    // gutters everywhere — so a table asked to fill itself from a single
+    // region would find one cell of text and report the rest empty.
+    let all_lines: Vec<TextLine> = regions
+        .iter()
+        .flat_map(|r| r.lines.iter().cloned())
+        .collect();
+    let rtl = all_lines
+        .first()
+        .is_some_and(|l| l.direction == crate::bidi::Direction::Rtl);
+
+    let mut claimed = vec![None; all_lines.len()];
+    let mut built: Vec<Option<Table>> = Vec::new();
+
+    for grid in grids.iter() {
+        let (table, consumed) = tables::fill(grid, &all_lines, rtl);
+
+        // A grid with almost nothing in it is decoration, not a table — see
+        // `Table::is_plausible`. Rejecting it here rather than in `detect`
+        // is deliberate: only once the text has been placed can we tell a
+        // doubled picture frame from a real 3x3 grid.
+        if consumed.is_empty() || !table.is_plausible() {
+            built.push(None);
+            continue;
+        }
+        let index = built.len();
+        for line in consumed {
+            // First grid wins if two overlap; a line belongs to one table.
+            claimed[line].get_or_insert(index);
+        }
+        built.push(Some(table));
+    }
+
+    // Walk the regions in reading order, emitting each table at the point its
+    // first line appears and the leftover prose around it.
+    let mut emitted = vec![false; grids.len()];
+    let mut cursor = 0usize;
+
+    for region in &regions {
+        let mut prose: Vec<TextLine> = Vec::new();
+
+        for line in &region.lines {
+            let owner = claimed[cursor];
+            cursor += 1;
+
+            let Some(index) = owner else {
+                prose.push(line.clone());
+                continue;
+            };
+
+            if emitted[index] {
+                continue;
+            }
+            emitted[index] = true;
+
+            // Flush the prose seen so far, so the table lands between the text
+            // before it and the text after it.
+            if !prose.is_empty() {
+                blocks.push(Block::Text(TextBlock {
+                    confidence: block_confidence(&prose),
+                    bbox: region.bbox,
+                    reading_index: blocks.len(),
+                    lines: std::mem::take(&mut prose),
+                }));
+            }
+            if let Some(table) = built[index].clone() {
+                blocks.push(Block::Table(TableBlock {
+                    table,
+                    reading_index: blocks.len(),
+                }));
+            }
+        }
+
+        if !prose.is_empty() {
             blocks.push(Block::Text(TextBlock {
-                confidence: block_confidence(&region.lines),
+                confidence: block_confidence(&prose),
                 bbox: region.bbox,
                 reading_index: blocks.len(),
-                lines: region.lines,
+                lines: prose,
             }));
         }
-        for extra in region.extras {
+
+        for extra in &region.extras {
             // `extras` indexes the `boxes` slice, which is parallel to
             // `positioned`, which carries the original image index.
-            if let Some((index, _)) = positioned.get(extra) {
-                claimed[extra] = true;
-                blocks.push(image_block(&images[*index], blocks.len(), false));
+            if let Some((image_index, _)) = positioned.get(*extra) {
+                image_claimed[*extra] = true;
+                blocks.push(image_block(&images[*image_index], blocks.len(), false));
             }
         }
     }
 
     // Positioned images no region claimed — the tagged path never places them.
     for (slot, (index, _)) in positioned.iter().enumerate() {
-        if !claimed[slot] {
+        if !image_claimed[slot] {
             blocks.push(image_block(&images[*index], blocks.len(), false));
         }
     }
@@ -192,7 +297,7 @@ pub fn assemble(
         blocks.push(image_block(&images[index], blocks.len(), false));
     }
 
-    blocks
+    (blocks, all_lines)
 }
 
 /// Build one image block.
@@ -289,7 +394,7 @@ mod tests {
             placed(None),
             placed(Some(Rect::new(-303.0, -40.0, 1070.0, 876.0))),
         ];
-        let blocks = assemble(
+        let (blocks, _) = assemble(
             &PageGlyphs::default(),
             &FontMap::default(),
             &images,
@@ -317,7 +422,7 @@ mod tests {
             placed(Some(Rect::new(10.0, 10.0, 20.0, 20.0))),
             placed(None),
         ];
-        let blocks = assemble(
+        let (blocks, _) = assemble(
             &PageGlyphs::default(),
             &FontMap::default(),
             &images,

@@ -263,11 +263,17 @@ fn region_bbox(lines: &[TextLine], extras: &[usize], extra_boxes: &[Rect]) -> Re
 /// program, which is far more work than choosing a column boundary justifies.
 fn item_for(placed: &Placed) -> Item {
     let g = &placed.glyph;
+    // Rotated text occupies a tall, narrow box rather than a short, wide one.
+    let (w, h) = if g.orientation.is_vertical() {
+        (g.style.size, g.advance)
+    } else {
+        (g.advance, g.style.size)
+    };
     Item {
         x0: g.x,
-        x1: g.x + g.advance,
-        y0: g.y - g.style.size * 0.25,
-        y1: g.y + g.style.size * 0.75,
+        x1: g.x + w,
+        y0: g.y - h * 0.25,
+        y1: g.y + h * 0.75,
         size: g.style.size,
     }
 }
@@ -360,7 +366,8 @@ fn group_into_lines(glyphs: &[Placed]) -> Vec<Vec<Placed>> {
 
     let mut lines: Vec<Vec<Placed>> = Vec::new();
     let mut current: Vec<Placed> = Vec::new();
-    let mut current_y = sorted[0].glyph.y;
+    let mut current_across = sorted[0].glyph.across();
+    let mut current_orientation = sorted[0].glyph.orientation;
 
     for placed in sorted {
         // Tolerance scales with the type size: 2pt of drift is a different
@@ -368,9 +375,14 @@ fn group_into_lines(glyphs: &[Placed]) -> Vec<Vec<Placed>> {
         // and diacritics sit slightly off the baseline and must not split it.
         let tolerance = (placed.glyph.style.size * 0.3).max(0.5);
 
-        if (placed.glyph.y - current_y).abs() > tolerance && !current.is_empty() {
+        // Text running a different way is never the same line, however close.
+        let turned = placed.glyph.orientation != current_orientation;
+        let moved = (placed.glyph.across() - current_across).abs() > tolerance;
+
+        if (turned || moved) && !current.is_empty() {
             lines.push(std::mem::take(&mut current));
-            current_y = placed.glyph.y;
+            current_across = placed.glyph.across();
+            current_orientation = placed.glyph.orientation;
         }
         current.push(placed);
     }
@@ -391,7 +403,7 @@ fn build_line(placed: &[Placed], fonts: &FontMap) -> Option<TextLine> {
     // Left to right, which is the order the glyphs were painted in — the
     // *visual* order we are about to undo.
     let mut ordered: Vec<&Placed> = placed.iter().collect();
-    ordered.sort_by(|a, b| a.glyph.x.total_cmp(&b.glyph.x));
+    ordered.sort_by(|a, b| a.glyph.along().total_cmp(&b.glyph.along()));
 
     // Decode every glyph up front. The base direction decides how combining
     // marks are placed, and that cannot be known until the text exists.
@@ -454,7 +466,7 @@ fn build_line(placed: &[Placed], fonts: &FontMap) -> Option<TextLine> {
         // top of the letter before it, so it can never open a word.
         if !is_mark {
             if let Some(edge) = right_edge {
-                let gap = glyph.x - edge;
+                let gap = glyph.along() - edge;
                 let already_spaced = matches!(pieces.last(), Some(Piece::Decoded(t)) if t == " ");
                 if gap > glyph.style.size * WORD_GAP_FRACTION && !already_spaced {
                     pieces.push(Piece::Decoded(" ".to_string()));
@@ -463,7 +475,9 @@ fn build_line(placed: &[Placed], fonts: &FontMap) -> Option<TextLine> {
             }
         }
 
-        let end = glyph.x + glyph.advance;
+        // The advance is a magnitude, so it always moves *forward* along the
+        // reading axis whichever way that axis points.
+        let end = glyph.along() + glyph.advance;
         right_edge = Some(right_edge.map_or(end, |e| e.max(end)));
 
         // Drop the blank placeholders an `/ActualText` span leaves behind.
@@ -490,9 +504,13 @@ fn build_line(placed: &[Placed], fonts: &FontMap) -> Option<TextLine> {
     }
 
     // ---- the order-of-operations rule -----------------------------------
-    // Step 1: reorder, while ligatures are still single glyphs.
-    let logical = bidi::visual_to_logical(&assemble_visual(&pieces, direction), direction);
+    // Step 0: repair numbers whose digits come back in two different scripts.
+    // This has to happen *before* the reorder, because the mixture is exactly
+    // what breaks it. See `unify_digit_runs`.
+    let visual = unify_digit_runs(&assemble_visual(&pieces));
 
+    // Step 1: reorder, while ligatures are still single glyphs.
+    let logical = bidi::visual_to_logical(&visual, direction);
     // Step 2: only now normalise. NFKC folds U+FExx presentation forms to base
     // letters and expands `ﻻ` into `ل` + `ا` — in the order the reorder left
     // them, which is the correct one.
@@ -534,31 +552,181 @@ enum Piece {
 
 /// Assemble the pieces into the visual-order string the reorder expects.
 ///
-/// # The `/ActualText` problem
+/// # A piece is an atom, and the line reversal must not reach inside it
 ///
-/// Decoded glyphs arrive in visual order and the reorder below turns them into
-/// logical order. `/ActualText` is *already* logical — the writer wrote it for
-/// a human. Passing it through unchanged would leave the reorder to reverse it,
-/// producing a backwards word inside an otherwise correct line.
+/// Decoded glyphs arrive in visual order, and the reorder below turns the line
+/// into logical order by reversing it. That is right for a run of single
+/// characters — but two kinds of piece are **already logical** and would be
+/// scrambled by it:
 ///
-/// So an RTL override is reversed on the way in, and the line's reorder undoes
-/// that. This is exact for a span of a single direction, which is what
-/// `/ActualText` is used for in practice — a ligature, a hyphenated word, a
-/// logo's name. It carries the same caveat as the whole visual→logical
-/// inversion (see `bidi.rs`): a span mixing directions internally may not round
-/// trip perfectly. PLAN.md §8 tracks that.
-fn assemble_visual(pieces: &[Piece], direction: Direction) -> String {
+/// - **`/ActualText`**, which a human wrote for a human.
+/// - **A ligature glyph whose `/ToUnicode` value is several characters.** One
+///   glyph, several letters, given in reading order. `bar_Persons.pdf` maps 14
+///   such codes: `لم`, `لج`, `بح`, `في`, `هم`, `لله`. Reversing inside them
+///   turns `المعظم` into `املعظم` — the lam and meem swapped.
+///
+/// Both are handled the same way: reverse the piece on the way in, so the
+/// line's reversal puts it back. Single-character pieces are unaffected, so the
+/// rule can simply be applied to every piece.
+///
+/// # Why the first corpus never showed this
+///
+/// Its ligatures mapped to *single* presentation-form codepoints — `ﻻ` is one
+/// character until NFKC expands it, and NFKC runs after the reorder (PLAN.md
+/// §3). Here the CMap gives base letters directly, so there is nothing left to
+/// defer and the ordering has to be right at this step.
+///
+/// This is exact for a piece of one direction, which is what ligatures and
+/// `/ActualText` spans are in practice. It carries the same caveat as the whole
+/// visual-to-logical inversion (see `bidi.rs`).
+fn assemble_visual(pieces: &[Piece]) -> String {
     let mut visual = String::new();
     for piece in pieces {
-        match piece {
-            Piece::Decoded(text) => visual.push_str(text),
-            Piece::Actual(text) if direction == Direction::Rtl => {
-                visual.extend(text.chars().rev());
-            }
-            Piece::Actual(text) => visual.push_str(text),
+        let text = piece_str(piece);
+        if needs_pre_reversal(text) {
+            visual.extend(text.chars().rev());
+        } else {
+            visual.push_str(text);
         }
     }
     visual
+}
+
+/// Will the reorder reverse this piece, and so must we pre-reverse it?
+///
+/// The question is about the **piece**, not the line it sits in: the reorder
+/// reverses right-to-left runs wherever they occur, so an Arabic phrase inside
+/// a Latin line needs the same treatment as one inside an Arabic line.
+///
+/// # Digits are left-to-right, even in Arabic
+///
+/// This is where an over-broad rule did real damage. `bar_Persons.pdf` has a
+/// glyph whose `/ToUnicode` value is the **three characters `201`** — a single
+/// glyph for a year's leading digits. Reversing it produced `102`, so
+/// `(2016 - 2017)` came back as `(1026 - 1027)`: not visibly broken, just
+/// quietly the wrong number, which is far worse.
+///
+/// Numbers read left to right in every script. Arabic-Indic digits `٠`–`٩` are
+/// bidi class AN and Latin ones EN, and **neither is reversed** by the
+/// algorithm — so neither may be pre-reversed here. Only a run containing a
+/// strong right-to-left *letter* qualifies.
+fn needs_pre_reversal(text: &str) -> bool {
+    // `chars().count()` rather than `len()`: the latter counts UTF-8 bytes,
+    // and every Arabic character is two of them, so it would treat every
+    // single letter as multi-character.
+    text.chars().count() > 1
+        && text
+            .chars()
+            .any(|c| bidi::is_rtl_char(c) && digit_system(c).is_none())
+}
+
+/// Which numeral system a digit belongs to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Digits {
+    /// `0`–`9`, U+0030–0039. Bidi class EN (European Number).
+    Latin,
+    /// `٠`–`٩`, U+0660–0669. Bidi class AN (Arabic Number).
+    Arabic,
+    /// `۰`–`۹`, U+06F0–06F9, used for Persian and Urdu. Also EN.
+    Extended,
+}
+
+/// Classify a character as a digit, or not one.
+fn digit_system(c: char) -> Option<Digits> {
+    match c as u32 {
+        0x0030..=0x0039 => Some(Digits::Latin),
+        0x0660..=0x0669 => Some(Digits::Arabic),
+        0x06F0..=0x06F9 => Some(Digits::Extended),
+        _ => None,
+    }
+}
+
+/// Rewrite a digit into another system, keeping its value.
+fn convert_digit(c: char, to: Digits) -> char {
+    let Some(from) = digit_system(c) else {
+        return c;
+    };
+    let base = |system| match system {
+        Digits::Latin => 0x0030,
+        Digits::Arabic => 0x0660,
+        Digits::Extended => 0x06F0,
+    };
+    // The three blocks are laid out in the same order, so the offset carries
+    // straight across.
+    let value = c as u32 - base(from);
+    char::from_u32(base(to) + value).unwrap_or(c)
+}
+
+/// Make every number use a single numeral system.
+///
+/// # Why a number in two scripts is not merely ugly
+///
+/// `bar_Persons.pdf` has fonts whose `/ToUnicode` maps most digit glyphs to one
+/// script and a few to the other: `2017` arrives as `20١7` — Latin two, zero
+/// and seven around an Arabic-Indic one. The rendered page shows `٢٠١٧`
+/// throughout, so this is the file's map being inconsistent, not the document.
+///
+/// The damage is out of all proportion to the cause. Latin digits are bidi
+/// class **EN** and Arabic-Indic ones are **AN**, so a mixed number is not one
+/// run but three, and the reorder moves them independently: `20١7` comes out
+/// `1027`. The digits are not merely in the wrong script, they are in the wrong
+/// *order*, and the number is silently wrong rather than obviously broken.
+///
+/// So each maximal run of digits is unified to whichever script most of its
+/// digits already use. That is a repair, not a guess: **a number cannot be
+/// written in two numeral systems at once**, so a run that appears to be is
+/// certainly the map's fault, and the majority is the best evidence available
+/// of what it should have been.
+///
+/// Runs are broken by any non-digit, so `2016 - ٢٠١٧` keeps both intact.
+fn unify_digit_runs(text: &str) -> String {
+    let chars: Vec<char> = text.chars().collect();
+    let mut out = String::with_capacity(text.len());
+    let mut i = 0;
+
+    while i < chars.len() {
+        let Some(_) = digit_system(chars[i]) else {
+            out.push(chars[i]);
+            i += 1;
+            continue;
+        };
+
+        // Take the whole run of digits.
+        let start = i;
+        while i < chars.len() && digit_system(chars[i]).is_some() {
+            i += 1;
+        }
+        let run = &chars[start..i];
+
+        // Which script wins? Count each, and keep the run as it is when there
+        // is nothing to fix.
+        let mut counts = [0usize; 3];
+        for c in run {
+            match digit_system(*c) {
+                Some(Digits::Latin) => counts[0] += 1,
+                Some(Digits::Arabic) => counts[1] += 1,
+                Some(Digits::Extended) => counts[2] += 1,
+                None => {}
+            }
+        }
+        let mixed = counts.iter().filter(|n| **n > 0).count() > 1;
+        if !mixed {
+            out.extend(run);
+            continue;
+        }
+
+        // Ties go to Latin: it is the more common encoding in these files, and
+        // an arbitrary but fixed choice beats a result that depends on order.
+        let target = if counts[1] > counts[0] && counts[1] >= counts[2] {
+            Digits::Arabic
+        } else if counts[2] > counts[0] && counts[2] > counts[1] {
+            Digits::Extended
+        } else {
+            Digits::Latin
+        };
+        out.extend(run.iter().map(|c| convert_digit(*c, target)));
+    }
+    out
 }
 
 /// Remove the placeholder space that NFKC puts before an isolated mark.
@@ -675,12 +843,20 @@ fn line_bbox(glyphs: &[&Placed]) -> Rect {
 
     for placed in glyphs {
         let g = &placed.glyph;
-        x0 = x0.min(g.x);
-        x1 = x1.max(g.x + g.advance);
+        // A rotated glyph advances along y, so its box must grow that way.
+        let (ax, ay) = match g.orientation {
+            crate::types::TextOrientation::Rightward => (g.advance, 0.0),
+            crate::types::TextOrientation::Leftward => (-g.advance, 0.0),
+            crate::types::TextOrientation::Upward => (0.0, g.advance),
+            crate::types::TextOrientation::Downward => (0.0, -g.advance),
+        };
+        x0 = x0.min(g.x).min(g.x + ax);
+        x1 = x1.max(g.x).max(g.x + ax);
+        let _ = ay;
         // Descenders drop below the baseline, ascenders rise above it. These
         // fractions are the usual rough proportions of a Latin/Arabic face.
-        y0 = y0.min(g.y - g.style.size * 0.25);
-        y1 = y1.max(g.y + g.style.size * 0.75);
+        y0 = y0.min(g.y - g.style.size * 0.25).min(g.y + ay);
+        y1 = y1.max(g.y + g.style.size * 0.75).max(g.y + ay);
     }
 
     // An empty slice would leave the infinities in place; the caller only ever
@@ -743,6 +919,7 @@ mod tests {
                 size,
                 render_mode: TextRenderMode::Fill,
             },
+            orientation: crate::types::TextOrientation::Rightward,
         }
     }
 
@@ -950,7 +1127,7 @@ mod tests {
             }
         }
 
-        let visual = assemble_visual(&pieces, Direction::Rtl);
+        let visual = assemble_visual(&pieces);
         let logical = bidi::visual_to_logical(&visual, Direction::Rtl);
         let text = tidy_whitespace(&strip_mark_bases(&logical.nfkc().collect::<String>()));
 
@@ -1023,6 +1200,78 @@ mod tests {
         );
     }
 
+    // ---- numbers ---------------------------------------------------------
+
+    #[test]
+    fn a_multi_digit_glyph_is_never_reversed() {
+        // `bar_Persons.pdf` has a glyph whose `/ToUnicode` value is the three
+        // characters `201` — one glyph for a year's leading digits. Treating
+        // it like an Arabic ligature and reversing it produced `102`, so
+        // `(2016 - 2017)` came back as `(1026 - 1027)`. Not visibly broken,
+        // just quietly the wrong number.
+        assert!(!needs_pre_reversal("201"));
+        assert!(
+            !needs_pre_reversal("٢٠١"),
+            "Arabic-Indic digits read LTR too"
+        );
+
+        // Arabic letters still must be.
+        assert!(needs_pre_reversal("\u{0644}\u{0645}"));
+        // A single character never needs it, whatever it is.
+        assert!(!needs_pre_reversal("\u{0644}"));
+    }
+
+    #[test]
+    fn the_year_regression() {
+        // The whole line as painted, left to right, with `201` arriving as one
+        // piece exactly as the font delivers it.
+        let pieces = vec![
+            Piece::Decoded("(".to_string()),
+            Piece::Decoded("201".to_string()),
+            Piece::Decoded("6".to_string()),
+            Piece::Decoded(")".to_string()),
+            Piece::Decoded("\u{0645}".to_string()),
+        ];
+        let visual = assemble_visual(&pieces);
+        assert!(
+            visual.contains("2016"),
+            "the digits were scrambled: {visual:?}"
+        );
+    }
+
+    #[test]
+    fn a_number_split_between_two_scripts_is_unified() {
+        // A font mapping most digit glyphs to one script and a few to the
+        // other. Latin digits are bidi class EN and Arabic-Indic ones AN, so a
+        // mixed number is three runs rather than one and the reorder moves them
+        // independently — the digits end up in the wrong order, not merely the
+        // wrong script.
+        assert_eq!(unify_digit_runs("20\u{0661}7"), "2017");
+        assert_eq!(unify_digit_runs("\u{0662}\u{0660}\u{0661}6"), "٢٠١٦");
+    }
+
+    #[test]
+    fn numbers_already_in_one_script_are_left_alone() {
+        assert_eq!(unify_digit_runs("2016"), "2016");
+        assert_eq!(unify_digit_runs("٢٠١٦"), "٢٠١٦");
+        // Runs are broken by any non-digit, so two numbers in different
+        // scripts each keep their own.
+        assert_eq!(unify_digit_runs("2016 - ٢٠١٧"), "2016 - ٢٠١٧");
+        assert_eq!(unify_digit_runs("no digits here"), "no digits here");
+    }
+
+    #[test]
+    fn digit_conversion_preserves_value() {
+        for value in 0..10u32 {
+            let latin = char::from_u32(0x30 + value).unwrap();
+            let arabic = char::from_u32(0x660 + value).unwrap();
+            assert_eq!(convert_digit(latin, Digits::Arabic), arabic);
+            assert_eq!(convert_digit(arabic, Digits::Latin), latin);
+        }
+        // A non-digit passes through untouched.
+        assert_eq!(convert_digit('\u{0644}', Digits::Latin), '\u{0644}');
+    }
+
     #[test]
     fn ltr_marks_stay_after_their_base() {
         // Latin combining marks already follow their base and must not be moved.
@@ -1030,7 +1279,7 @@ mod tests {
             Piece::Decoded("e".to_string()),
             Piece::Decoded("\u{0301}".to_string()),
         ];
-        let visual = assemble_visual(&pieces, Direction::Ltr);
+        let visual = assemble_visual(&pieces);
         let logical = bidi::visual_to_logical(&visual, Direction::Ltr);
         let text: String = logical.nfkc().collect();
         assert_eq!(text, "é");
@@ -1103,7 +1352,7 @@ mod tests {
         let arabic = "\u{0645}\u{0631}\u{062D}\u{0628}\u{0627}"; // مرحبا
         let pieces = vec![Piece::Actual(arabic.to_string())];
 
-        let visual = assemble_visual(&pieces, Direction::Rtl);
+        let visual = assemble_visual(&pieces);
         let logical = bidi::visual_to_logical(&visual, Direction::Rtl);
         assert_eq!(logical, arabic, "the override came back reversed");
     }
@@ -1111,7 +1360,7 @@ mod tests {
     #[test]
     fn an_ltr_override_passes_through_unchanged() {
         let pieces = vec![Piece::Actual("ffi".to_string())];
-        assert_eq!(assemble_visual(&pieces, Direction::Ltr), "ffi");
+        assert_eq!(assemble_visual(&pieces), "ffi");
     }
 
     #[test]

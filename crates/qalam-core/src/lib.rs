@@ -58,6 +58,7 @@ pub mod images;
 pub mod layout;
 pub mod parser;
 pub mod structure;
+pub mod tables;
 pub mod types;
 
 // Re-export the handful of names most callers need, so they can write
@@ -65,9 +66,9 @@ pub mod types;
 // The module paths stay public too, for anyone who wants the long form.
 pub use arabic::{lines_to_text, reconstruct, reconstruct_regions, Region, TextLine};
 pub use bidi::Direction;
-pub use blocks::{assemble, Block, ImageBlock, TextBlock};
+pub use blocks::{assemble, Block, ImageBlock, TableBlock, TextBlock};
 pub use content::{
-    interpret, ActualText, AssumedWidths, GlyphWidths, McidSpan, PageGlyphs, XObjectUse,
+    interpret, ActualText, AssumedWidths, GlyphWidths, McidSpan, PageGlyphs, RuledLine, XObjectUse,
 };
 pub use detect::{assess, PageReport, Recoverability, Signals};
 pub use document::{extract_text, Document, Page};
@@ -77,6 +78,7 @@ pub use graphics::Matrix;
 pub use images::{ExtractedImage, Image, ImageFormat, PlacedImage};
 pub use parser::Pdf;
 pub use structure::{ReadingOrder, StructRun};
+pub use tables::{Cell, Grid, Table};
 pub use types::{
     ClipTextMode, CodeToUnicode, Color, FontInfo, Glyph, PageInfo, RawFont, Rect, Rotation, Style,
     TextRenderMode,
