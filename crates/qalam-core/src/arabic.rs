@@ -21,6 +21,7 @@ use crate::bidi::{self, Direction};
 use crate::content::PageGlyphs;
 use crate::font::FontMap;
 use crate::layout::{self, Item};
+use crate::structure::ReadingOrder;
 use crate::types::{Glyph, Rect, Style};
 
 /// One reconstructed line of text.
@@ -82,7 +83,7 @@ struct Placed {
 /// This is the whole of Tier A in one call: L1 gave us the glyphs, L2 gave us
 /// `fonts`, and what comes back is readable.
 pub fn reconstruct(page: &PageGlyphs, fonts: &FontMap) -> Vec<TextLine> {
-    reconstruct_regions(page, fonts, &[])
+    reconstruct_regions(page, fonts, &[], None)
         .into_iter()
         .flat_map(|region| region.lines)
         .collect()
@@ -118,10 +119,18 @@ pub fn reconstruct_regions(
     page: &PageGlyphs,
     fonts: &FontMap,
     extra_boxes: &[Rect],
+    order: Option<&ReadingOrder>,
 ) -> Vec<Region> {
     let placed = apply_actual_text(page);
     if placed.is_empty() && extra_boxes.is_empty() {
         return Vec::new();
+    }
+
+    // A tagged document states its own reading order, and a statement beats an
+    // inference. Fall through to geometry whenever there is no usable tree —
+    // which is nearly always (PLAN.md §10.3).
+    if let Some(order) = order {
+        return regions_from_structure(&placed, fonts, order);
     }
 
     // L6 first. Grouping by baseline across a whole page interleaves columns:
@@ -168,6 +177,47 @@ pub fn reconstruct_regions(
                 bbox: region_bbox(&lines, &extras, extra_boxes),
                 lines,
                 extras,
+            })
+        })
+        .collect()
+}
+
+/// Build regions from a tagged document's structure tree.
+///
+/// Each structure element becomes one region, in the tree's document order.
+/// Lines *within* a region are still grouped by baseline: the tree says which
+/// glyphs belong together and in what order, not where the line breaks fall,
+/// so geometry remains the right tool for that.
+///
+/// Images are not placed here. A tagged file usually tags its figures too, but
+/// this reader only follows text marked-content ids, so the caller appends any
+/// images afterwards rather than guessing where they belong.
+fn regions_from_structure(placed: &[Placed], fonts: &FontMap, order: &ReadingOrder) -> Vec<Region> {
+    order
+        .runs
+        .iter()
+        .filter_map(|run| {
+            let glyphs: Vec<Placed> = run
+                .ranges
+                .iter()
+                // `get` rather than indexing: the tree names glyph ranges we
+                // computed separately, and a malformed file could put them out
+                // of step. A missing glyph should drop, not panic.
+                .flat_map(|&(start, end)| (start..end).filter_map(|i| placed.get(i).cloned()))
+                .collect();
+
+            let lines: Vec<TextLine> = group_into_lines(&glyphs)
+                .into_iter()
+                .filter_map(|line| build_line(&line, fonts))
+                .collect();
+
+            if lines.is_empty() {
+                return None;
+            }
+            Some(Region {
+                bbox: region_bbox(&lines, &[], &[]),
+                lines,
+                extras: Vec::new(),
             })
         })
         .collect()

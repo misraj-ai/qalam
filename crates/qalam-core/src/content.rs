@@ -108,6 +108,24 @@ pub struct XObjectUse {
     pub glyph_index: usize,
 }
 
+/// A run of glyphs belonging to one marked-content sequence.
+///
+/// In a *tagged* PDF, `/P << /MCID 3 >> BDC … EMC` says "these glyphs are
+/// marked-content item 3", and the structure tree elsewhere in the file says
+/// where item 3 sits in the document's logical order. That is the whole
+/// mechanism: the content stream numbers its pieces, and the tree orders them.
+///
+/// Without this the tree is unusable — it would name pieces we could not find.
+#[derive(Debug, Clone, PartialEq)]
+pub struct McidSpan {
+    /// The `/MCID` value.
+    pub mcid: u32,
+    /// Index of the first glyph covered.
+    pub start: usize,
+    /// One past the last glyph covered.
+    pub end: usize,
+}
+
 /// Everything the interpreter recovered from one page.
 #[derive(Debug, Default)]
 pub struct PageGlyphs {
@@ -126,6 +144,10 @@ pub struct PageGlyphs {
     pub unsupported: Vec<String>,
     /// `/ActualText` overrides, as glyph ranges. Usually empty.
     pub actual_text: Vec<ActualText>,
+    /// Marked-content spans carrying an `/MCID`, for tagged documents.
+    ///
+    /// Empty for the overwhelming majority of files, which are untagged.
+    pub mcid_spans: Vec<McidSpan>,
 }
 
 /// The text-object state, reset at every `BT`.
@@ -204,6 +226,8 @@ struct MarkedSection {
     start: usize,
     /// The section's `/ActualText`, if it declared one.
     actual_text: Option<String>,
+    /// The section's `/MCID`, if it declared one.
+    mcid: Option<u32>,
 }
 
 /// Interpret one page's content stream.
@@ -401,14 +425,21 @@ impl Interpreter<'_> {
             // `/ActualText` lives. `BMC` opens one without properties. Both are
             // closed by `EMC`.
             "BDC" | "BMC" => {
+                // Both properties live in the same place, so read the operand
+                // once and pull each out of it.
+                let properties = op.operands.get(1).and_then(|o| o.as_dict().ok());
+
+                let mcid = properties
+                    .and_then(|d| d.get(b"MCID").ok())
+                    .and_then(|o| o.as_i64().ok())
+                    .and_then(|n| u32::try_from(n).ok());
+
                 let actual_text = if op.operator == "BDC" {
                     // Operands are `/Tag /PropertyName` or `/Tag << ... >>`.
                     // Only the inline-dictionary form is readable here: the
                     // named form points into `/Resources /Properties`, which
                     // this module deliberately does not have.
-                    op.operands
-                        .get(1)
-                        .and_then(|o| o.as_dict().ok())
+                    properties
                         .and_then(|d| d.get(b"ActualText").ok())
                         .and_then(object_string)
                         .map(pdf_text_string)
@@ -423,20 +454,27 @@ impl Interpreter<'_> {
                     self.marked_content.push(MarkedSection {
                         start: self.out.glyphs.len(),
                         actual_text,
+                        mcid,
                     });
                 }
             }
             "EMC" => {
                 if let Some(section) = self.marked_content.pop() {
                     let end = self.out.glyphs.len();
-                    // Record only sections that both declared an override and
-                    // actually painted something.
-                    if let Some(text) = section.actual_text {
-                        if end > section.start {
+                    // Record only sections that actually painted something.
+                    if end > section.start {
+                        if let Some(text) = section.actual_text {
                             self.out.actual_text.push(ActualText {
                                 start: section.start,
                                 end,
                                 text,
+                            });
+                        }
+                        if let Some(mcid) = section.mcid {
+                            self.out.mcid_spans.push(McidSpan {
+                                mcid,
+                                start: section.start,
+                                end,
                             });
                         }
                     }
@@ -960,6 +998,46 @@ mod tests {
         // The outer covers all three.
         assert_eq!(out.actual_text[1].text, "outer");
         assert_eq!((out.actual_text[1].start, out.actual_text[1].end), (0, 3));
+    }
+
+    #[test]
+    fn mcids_are_recorded_as_glyph_ranges() {
+        let out = run(
+            "BT /F1 12 Tf /P <</MCID 0>> BDC (ab) Tj EMC /P <</MCID 7>> BDC (c) Tj EMC ET",
+            &[simple_font("F1")],
+        );
+        assert_eq!(out.glyphs.len(), 3);
+        assert_eq!(
+            out.mcid_spans,
+            vec![
+                McidSpan {
+                    mcid: 0,
+                    start: 0,
+                    end: 2
+                },
+                McidSpan {
+                    mcid: 7,
+                    start: 2,
+                    end: 3
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn an_untagged_page_records_no_mcids() {
+        // The overwhelmingly common case: no `/MCID` anywhere, so the tagged
+        // path must stay entirely out of the way.
+        let out = run("BT /F1 12 Tf (x) Tj ET", &[simple_font("F1")]);
+        assert!(out.mcid_spans.is_empty());
+    }
+
+    #[test]
+    fn an_mcid_section_that_paints_nothing_is_not_recorded() {
+        // An empty span would name a glyph range that does not exist, and the
+        // structure tree would then point at nothing.
+        let out = run("/P <</MCID 0>> BDC EMC", &[simple_font("F1")]);
+        assert!(out.mcid_spans.is_empty());
     }
 
     #[test]

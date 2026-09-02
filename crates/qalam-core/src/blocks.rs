@@ -26,6 +26,7 @@ use crate::arabic::{self, TextLine};
 use crate::content::PageGlyphs;
 use crate::font::FontMap;
 use crate::images::{ExtractedImage, PlacedImage};
+use crate::structure::ReadingOrder;
 use crate::types::Rect;
 
 /// One piece of a page.
@@ -126,6 +127,7 @@ pub fn assemble(
     fonts: &FontMap,
     images: &[PlacedImage],
     page_box: Rect,
+    order: Option<&ReadingOrder>,
 ) -> Vec<Block> {
     // Split the images into the ones that can take part in the reading-order
     // pass and the ones that cannot.
@@ -142,8 +144,11 @@ pub fn assemble(
     }
 
     let boxes: Vec<Rect> = positioned.iter().map(|(_, b)| *b).collect();
-    let regions = arabic::reconstruct_regions(glyphs, fonts, &boxes);
+    let regions = arabic::reconstruct_regions(glyphs, fonts, &boxes, order);
 
+    // Which positioned images a region claimed. The tagged path does not place
+    // images at all, so anything left over is appended rather than lost.
+    let mut claimed = vec![false; positioned.len()];
     let mut blocks = Vec::new();
 
     // Backgrounds first: that is where they are painted, and a reader
@@ -168,8 +173,16 @@ pub fn assemble(
             // `extras` indexes the `boxes` slice, which is parallel to
             // `positioned`, which carries the original image index.
             if let Some((index, _)) = positioned.get(extra) {
+                claimed[extra] = true;
                 blocks.push(image_block(&images[*index], blocks.len(), false));
             }
+        }
+    }
+
+    // Positioned images no region claimed — the tagged path never places them.
+    for (slot, (index, _)) in positioned.iter().enumerate() {
+        if !claimed[slot] {
+            blocks.push(image_block(&images[*index], blocks.len(), false));
         }
     }
 
@@ -276,7 +289,13 @@ mod tests {
             placed(None),
             placed(Some(Rect::new(-303.0, -40.0, 1070.0, 876.0))),
         ];
-        let blocks = assemble(&PageGlyphs::default(), &FontMap::default(), &images, A4);
+        let blocks = assemble(
+            &PageGlyphs::default(),
+            &FontMap::default(),
+            &images,
+            A4,
+            None,
+        );
 
         assert_eq!(blocks.len(), 3);
         // The background, then the positioned figure, then the one we could
@@ -298,7 +317,13 @@ mod tests {
             placed(Some(Rect::new(10.0, 10.0, 20.0, 20.0))),
             placed(None),
         ];
-        let blocks = assemble(&PageGlyphs::default(), &FontMap::default(), &images, A4);
+        let blocks = assemble(
+            &PageGlyphs::default(),
+            &FontMap::default(),
+            &images,
+            A4,
+            None,
+        );
 
         for (position, block) in blocks.iter().enumerate() {
             assert_eq!(block.reading_index(), position);

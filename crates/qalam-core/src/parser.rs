@@ -19,7 +19,8 @@ use lopdf::{Dictionary, Document, Object, ObjectId};
 
 use crate::error::{Error, Result};
 use crate::types::{
-    CodeToUnicode, FontInfo, ImageColorSpace, PageInfo, Palette, RawFont, RawImage, Rect, Rotation,
+    CodeToUnicode, FontInfo, ImageColorSpace, PageInfo, Palette, RawFont, RawImage, RawStructure,
+    Rect, Rotation, StructElement,
 };
 
 /// An opened PDF document.
@@ -103,6 +104,143 @@ impl Pdf {
             .into_iter()
             .map(|(name, dict)| self.raw_font(&name, dict))
             .collect())
+    }
+
+    /// Read the document's structure tree, if it has one.
+    ///
+    /// Returns an empty [`RawStructure`] for the overwhelming majority of
+    /// files, which are untagged. That is not a failure and must not be
+    /// reported as one — it is the normal case, and the geometric path
+    /// (L6) exists precisely because of it.
+    pub fn structure(&self) -> RawStructure {
+        let mut out = RawStructure::default();
+
+        let Ok(catalog) = self.doc.catalog() else {
+            return out;
+        };
+
+        out.marked = self
+            .lookup(catalog, b"MarkInfo")
+            .and_then(|o| o.as_dict().ok())
+            .and_then(|d| d.get(b"Marked").ok())
+            .and_then(|o| o.as_bool().ok())
+            .unwrap_or(false);
+
+        let Some(root) = self
+            .lookup(catalog, b"StructTreeRoot")
+            .and_then(|o| o.as_dict().ok())
+        else {
+            return out;
+        };
+
+        // Page object ids, so `/Pg` references can be turned into page numbers.
+        let page_numbers: std::collections::HashMap<ObjectId, u32> = self
+            .doc
+            .get_pages()
+            .into_iter()
+            .map(|(number, id)| (id, number))
+            .collect();
+
+        let mut seen = std::collections::HashSet::new();
+        self.walk_structure(root, 0, None, &page_numbers, &mut seen, &mut out.elements);
+        out
+    }
+
+    /// Depth-first walk of the structure tree, emitting elements in order.
+    ///
+    /// `inherited_page` carries `/Pg` down the tree: the spec lets a parent
+    /// name the page once and its children omit it, exactly like the page
+    /// tree's inheritable attributes.
+    ///
+    /// `seen` guards against a `/K` cycle. A malformed file can contain one,
+    /// and without the guard this recurses until the stack runs out.
+    #[allow(clippy::too_many_arguments)]
+    fn walk_structure(
+        &self,
+        element: &Dictionary,
+        depth: usize,
+        inherited_page: Option<u32>,
+        page_numbers: &std::collections::HashMap<ObjectId, u32>,
+        seen: &mut std::collections::HashSet<ObjectId>,
+        out: &mut Vec<StructElement>,
+    ) {
+        const MAX_DEPTH: usize = 64;
+        if depth > MAX_DEPTH {
+            return;
+        }
+
+        let page = element
+            .get(b"Pg")
+            .ok()
+            .and_then(|o| o.as_reference().ok())
+            .and_then(|id| page_numbers.get(&id).copied())
+            .or(inherited_page);
+
+        // `/S` is the element's tag. The tree root has none, and is a container
+        // rather than content — so it contributes no element of its own.
+        let tag = element
+            .get(b"S")
+            .ok()
+            .and_then(|o| o.as_name().ok())
+            .map(|n| String::from_utf8_lossy(n).into_owned());
+
+        // `/K` holds the kids: child elements, integers (marked-content ids),
+        // or a marked-content reference dictionary. All three forms occur.
+        let mut mcids = Vec::new();
+        let mut children: Vec<&Dictionary> = Vec::new();
+
+        if let Some(kids) = element.get(b"K").ok().map(|o| self.resolve_or(o)) {
+            // A single kid need not be wrapped in an array.
+            let items: Vec<&Object> = match kids.as_array() {
+                Ok(array) => array.iter().collect(),
+                Err(_) => vec![kids],
+            };
+
+            for item in items {
+                match item {
+                    // A bare integer is a marked-content id on this element's page.
+                    Object::Integer(n) => {
+                        if let Ok(mcid) = u32::try_from(*n) {
+                            mcids.push(mcid);
+                        }
+                    }
+                    _ => {
+                        // A reference to a child element, or a `/MCR` /
+                        // `/OBJR` dictionary that names an MCID indirectly.
+                        if let Ok(id) = item.as_reference() {
+                            if !seen.insert(id) {
+                                continue;
+                            }
+                        }
+                        if let Ok(dict) = self.resolve_or(item).as_dict() {
+                            match dict.get(b"MCID").ok().and_then(|o| o.as_i64().ok()) {
+                                Some(n) => {
+                                    if let Ok(mcid) = u32::try_from(n) {
+                                        mcids.push(mcid);
+                                    }
+                                }
+                                None => children.push(dict),
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Emit this element before descending, so the flattened order is
+        // document order.
+        if let Some(tag) = tag {
+            out.push(StructElement {
+                tag,
+                depth,
+                page,
+                mcids,
+            });
+        }
+
+        for child in children {
+            self.walk_structure(child, depth + 1, page, page_numbers, seen, out);
+        }
     }
 
     /// Pull every image XObject on a page out of the object graph.

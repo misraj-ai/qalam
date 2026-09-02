@@ -583,6 +583,54 @@ pub struct RawImage {
     pub has_smask: bool,
 }
 
+/// One element of a tagged PDF's structure tree, flattened.
+///
+/// The tree is walked depth-first and emitted in document order, because
+/// **that order is the reading order**. It is the one thing a tagged PDF gives
+/// us that geometry can only guess at.
+#[derive(Debug, Clone, PartialEq)]
+pub struct StructElement {
+    /// The `/S` tag: `P`, `H1`, `Figure`, `Table`, `TD`, `L`, `LI`, …
+    pub tag: String,
+    /// How deep in the tree, for reconstructing nesting later.
+    pub depth: usize,
+    /// The 1-based page this element's content sits on, from `/Pg`.
+    ///
+    /// `None` when the element names no page — a `/Document` wrapper, say,
+    /// whose children carry the actual content.
+    pub page: Option<u32>,
+    /// The marked-content ids this element owns on that page.
+    ///
+    /// These are the link to the content stream: `content.rs` records which
+    /// glyphs each `/MCID` covers, and the tree says what order the ids go in.
+    pub mcids: Vec<u32>,
+}
+
+/// A document's structure tree, flattened into document order.
+///
+/// The hand-off from L0 to L1.5, mirroring [`RawFont`] and [`RawImage`]:
+/// `parser.rs` walks references and resolves them, `structure.rs` interprets
+/// what comes out.
+#[derive(Debug, Clone, Default)]
+pub struct RawStructure {
+    /// Every element, depth-first, in document order.
+    pub elements: Vec<StructElement>,
+    /// Whether the catalog claims the document is tagged
+    /// (`/MarkInfo << /Marked true >>`).
+    ///
+    /// Separate from "has a structure tree", because the two disagree in the
+    /// wild: files carry a tree without the flag, and claim the flag with no
+    /// usable tree.
+    pub marked: bool,
+}
+
+impl RawStructure {
+    /// Whether there is a tree worth using.
+    pub fn is_usable(&self) -> bool {
+        self.elements.iter().any(|e| !e.mcids.is_empty())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

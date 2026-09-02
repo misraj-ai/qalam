@@ -19,6 +19,7 @@
 //! | L2 | [`font`]     | glyph code → Unicode, via `/ToUnicode` & friends |
 //! | L3 | [`arabic`]   | line grouping → bidi reorder → NFKC normalise |
 //! | L3 | [`bidi`]     | UAX #9 wrapper: visual order → logical order |
+//! | L1.5 | [`structure`] | tagged `/StructTreeRoot`: reading order, when present |
 //! | L4 | [`detect`]   | recoverability scoring: `ok` vs `needs_ocr` |
 //! | L6 | [`layout`]   | recursive XY-cut: columns and reading order (RTL) |
 //! | L7 | [`images`]   | `/XObject` image extraction: passthrough or PNG |
@@ -56,6 +57,7 @@ pub mod graphics;
 pub mod images;
 pub mod layout;
 pub mod parser;
+pub mod structure;
 pub mod types;
 
 // Re-export the handful of names most callers need, so they can write
@@ -64,7 +66,9 @@ pub mod types;
 pub use arabic::{lines_to_text, reconstruct, reconstruct_regions, Region, TextLine};
 pub use bidi::Direction;
 pub use blocks::{assemble, Block, ImageBlock, TextBlock};
-pub use content::{interpret, ActualText, AssumedWidths, GlyphWidths, PageGlyphs, XObjectUse};
+pub use content::{
+    interpret, ActualText, AssumedWidths, GlyphWidths, McidSpan, PageGlyphs, XObjectUse,
+};
 pub use detect::{assess, PageReport, Recoverability, Signals};
 pub use document::{extract_text, Document, Page};
 pub use error::{Error, Result};
@@ -72,6 +76,7 @@ pub use font::{CMap, Font, FontMap};
 pub use graphics::Matrix;
 pub use images::{ExtractedImage, Image, ImageFormat, PlacedImage};
 pub use parser::Pdf;
+pub use structure::{ReadingOrder, StructRun};
 pub use types::{
     ClipTextMode, CodeToUnicode, Color, FontInfo, Glyph, PageInfo, RawFont, Rect, Rotation, Style,
     TextRenderMode,

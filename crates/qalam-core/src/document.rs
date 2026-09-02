@@ -25,6 +25,7 @@ use crate::detect::{self, PageReport, Recoverability};
 use crate::font::FontMap;
 use crate::images::{self, PlacedImage};
 use crate::parser::Pdf;
+use crate::structure::ReadingOrder;
 use crate::types::Rotation;
 use crate::Result;
 
@@ -56,6 +57,13 @@ pub struct Page {
     pub lines: Vec<TextLine>,
     /// What the detector concluded about this page (L4).
     pub report: PageReport,
+    /// Whether this page's reading order came from the document's own
+    /// structure tree rather than from geometry (L1.5 vs L6).
+    ///
+    /// `true` is the lucky case: the writer stated the order and we followed
+    /// it. `false` means we reconstructed it, which is best-effort — see
+    /// `TextBlock::confidence`. Almost every real PDF is `false`.
+    pub tagged: bool,
     /// The page's content as typed blocks, in reading order.
     ///
     /// The richer model PLAN.md §3 describes: text and images interleaved by
@@ -112,8 +120,10 @@ impl Document {
         let pdf = Pdf::open(path)?;
 
         // Read the page summaries once. `Pdf::pages` walks the object graph, so
-        // calling it per page would make the whole run quadratic.
+        // calling it per page would make the whole run quadratic. The structure
+        // tree is a single document-wide object, so it is read once too.
         let summaries = pdf.pages();
+        let structure = pdf.structure();
         let mut pages = Vec::with_capacity(summaries.len());
 
         for info in &summaries {
@@ -124,18 +134,41 @@ impl Document {
             let fonts = FontMap::from_raw(pdf.page_raw_fonts(number)?);
             let content = pdf.page_content(number)?;
 
-            // L1 → L3 → L4.
+            // L1: the content stream.
             let glyphs = crate::content::interpret(&content, &info.fonts, &fonts);
-            let lines = arabic::reconstruct(&glyphs, &fonts);
-            let report = detect::assess(number, &glyphs, &fonts, &lines);
+
+            // L1.5: does the document state its own reading order for this
+            // page? Nearly always `None`, and then L6's geometry decides.
+            let order = ReadingOrder::from_structure(
+                &structure,
+                number,
+                &glyphs.mcid_spans,
+                glyphs.glyphs.len(),
+            );
 
             // L7, off the critical path for text: images come from
             // `/Resources`, and their positions from the `Do` operators L1 saw.
             let raw_images = pdf.page_raw_images(number)?;
             let images = images::extract_placed(&raw_images, &glyphs.xobjects);
 
-            // The unified model: text regions and images ordered together.
-            let blocks = blocks::assemble(&glyphs, &fonts, &images, info.media_box);
+            // L3 + L6: the unified model, text and images ordered together.
+            let blocks = blocks::assemble(&glyphs, &fonts, &images, info.media_box, order.as_ref());
+
+            // `lines` is a *view* over the blocks, not a second extraction.
+            // Reconstructing the page twice would cost twice as much and, worse,
+            // let the two disagree — the flat text saying one thing and the
+            // structured model another.
+            let lines: Vec<TextLine> = blocks
+                .iter()
+                .filter_map(|block| match block {
+                    Block::Text(text) => Some(text.lines.iter().cloned()),
+                    Block::Image(_) => None,
+                })
+                .flatten()
+                .collect();
+
+            // L4 last: it judges what every layer below it produced.
+            let report = detect::assess(number, &glyphs, &fonts, &lines);
 
             pages.push(Page {
                 number,
@@ -144,6 +177,7 @@ impl Document {
                 rotation: info.rotation,
                 lines,
                 report,
+                tagged: order.is_some(),
                 blocks,
                 images,
             });
@@ -199,6 +233,18 @@ impl Document {
         self.pages
             .iter()
             .filter(|p| p.needs_ocr())
+            .map(|p| p.number)
+            .collect()
+    }
+
+    /// The pages whose reading order came from a structure tree.
+    ///
+    /// Empty for nearly every real document. Worth surfacing because it says
+    /// which pages' ordering is *stated* rather than inferred.
+    pub fn tagged_pages(&self) -> Vec<u32> {
+        self.pages
+            .iter()
+            .filter(|p| p.tagged)
             .map(|p| p.number)
             .collect()
     }
