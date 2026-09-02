@@ -9,6 +9,7 @@
 //! qalam extract <file.pdf> [page]   # L3 output: correct logical Arabic
 //! qalam images  <file.pdf> [dir]    # L7 output: write embedded images to disk
 //! qalam blocks  <file.pdf> [page]   # the structured model: typed blocks in order
+//! qalam html    <file.pdf> [out]    # render to a standalone HTML page
 //! ```
 
 use std::process::ExitCode;
@@ -41,6 +42,8 @@ fn main() -> ExitCode {
                 return ExitCode::FAILURE;
             }
         },
+        [cmd, path] if cmd == "html" => html(path, None),
+        [cmd, path, out] if cmd == "html" => html(path, Some(out)),
         [cmd, path] if cmd == "images" => images(path, None),
         [cmd, path, dir] if cmd == "images" => images(path, Some(dir)),
         [cmd, path, page] if cmd == "extract" => match page.parse() {
@@ -93,7 +96,8 @@ fn usage() {
          \x20 qalam text <file.pdf> [page]      codes resolved through /ToUnicode (L2)\n\
          \x20 qalam extract <file.pdf> [page]   correct logical Arabic (L3; page or `all`)\n\
          \x20 qalam images <file.pdf> [dir]     write embedded images to a directory (L7)\n\
-         \x20 qalam blocks <file.pdf> [page]    typed blocks in reading order"
+         \x20 qalam blocks <file.pdf> [page]    typed blocks in reading order\n\
+         \x20 qalam html <file.pdf> [out.html]  render to a standalone HTML page"
     );
 }
 
@@ -406,6 +410,36 @@ fn images(path: &str, out_dir: Option<&str>) -> qalam_core::Result<()> {
     }
     if skipped > 0 {
         println!("{skipped} image(s) could not be decoded");
+    }
+    Ok(())
+}
+
+/// Render a document to HTML, to a file or to standard output.
+fn html(path: &str, out_path: Option<&str>) -> qalam_core::Result<()> {
+    let doc = qalam_core::Document::open(path)?;
+
+    // Report what the heading inference assumed. A PDF never says "this is a
+    // heading"; it says some text is larger, and the mapping is a guess worth
+    // showing rather than hiding.
+    let headings = qalam_core::Headings::analyse(&doc);
+    eprintln!("body text is {:.1}pt", headings.body_size());
+    for (size, level) in headings.inferred() {
+        eprintln!("  {size:>5.1}pt -> h{level}");
+    }
+    if headings.inferred().is_empty() {
+        eprintln!("  (no larger sizes found — every block will be a paragraph)");
+    }
+
+    let rendered = doc.to_html();
+    match out_path {
+        Some(file) => {
+            std::fs::write(file, &rendered).map_err(|source| qalam_core::Error::Io {
+                path: std::path::PathBuf::from(file),
+                source,
+            })?;
+            eprintln!("wrote {} ({} KB)", file, rendered.len() / 1024);
+        }
+        None => println!("{rendered}"),
     }
     Ok(())
 }

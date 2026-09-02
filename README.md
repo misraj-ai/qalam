@@ -212,6 +212,35 @@ for line in doc.page(4).lines:
 Effective size is composed from the text matrix, not read off `Tf` — writers routinely emit
 `/C2_0 1 Tf` and put the real scale in the matrix.
 
+### HTML output
+
+```python
+html = doc.to_html()                                   # standalone page
+html = doc.to_html(include_images=False, title="…")    # smaller, no data: URIs
+
+body_size, headings = doc.heading_sizes()
+# 14.0, [(26.0, 1), (24.0, 2), (18.0, 3)]
+```
+
+Reading order, headings, colour, tables with `dir="rtl"` and images inlined as `data:` URIs —
+one self-contained file, no assets. Use `include_images=False` for a document full of
+pictures; on the test corpus that is 308 KB versus 73 KB.
+
+**Headings are inferred, not read.** A PDF never says "this is a heading" — it says some text
+is larger. `qalam` finds the body size by character weight and maps larger sizes to `h1`–`h6`.
+`heading_sizes()` reports what was assumed, because it is a guess. A document that signals
+headings by weight or colour rather than size comes back with none: flat, not wrong.
+
+Two things are deliberately dropped. **Near-white text loses its colour** — in the PDF it sits
+on a coloured banner, and since page backgrounds are not reproduced, honouring it would paint
+white text on a white page. And **lines within a block are joined with a space**, not `<br>`,
+because block boundaries already came from the layout pass and the line breaks inside one are
+the column width talking, not the author.
+
+For Markdown, run the HTML through `turndown`, `pandoc` or `html2text`. Markdown cannot state
+text direction, so an Arabic table — whose first column is the *rightmost* — comes out
+mirrored with no way to fix it. HTML → Markdown is easy; Markdown → correct RTL is not.
+
 ### Errors
 
 ```python
@@ -265,6 +294,7 @@ judged, so no accessor can fail.
 ```sh
 qalam extract <file.pdf> [page|all]   # correct logical Arabic
 qalam blocks  <file.pdf> [page]       # typed blocks in reading order
+qalam html    <file.pdf> [out.html]  # render to a standalone HTML page
 qalam images  <file.pdf> [dir]        # list, or write images to a directory
 qalam inspect <file.pdf>              # pages, geometry, fonts, recoverability
 ```
@@ -324,6 +354,7 @@ document taught us — including several bugs that produced correct-looking, wro
 - **PDF creation or editing.**
 - **Pixel-perfect layout.** Ordered typed blocks, not a visual clone.
 - **Borderless tables.** Ruled tables only; alignment-inferred tables are a stretch goal.
+- **Page backgrounds in HTML output.** Images are placed in the flow, not behind the text.
 - **`/SMask` compositing**, `/FontFile` (Type 1) and `/FontFile2` (TrueType) glyph names,
   and text rotated to angles other than quarter turns.
 

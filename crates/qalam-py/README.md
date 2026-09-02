@@ -62,4 +62,16 @@ Each line carries its geometry and styling — `line.direction`, `line.size`, `l
 `page.tagged` says whether the reading order came from the document's own structure tree
 rather than from geometry.
 
-Built on a Rust core; the GIL is released during extraction.
+## HTML output
+
+```python
+open("out.html", "w").write(doc.to_html())
+```
+
+Reading order, headings inferred from type size, colour, tables with `dir="rtl"`, images
+inlined. `doc.heading_sizes()` reports what the heading inference assumed.
+
+For Markdown, convert the HTML with `turndown` or `pandoc` — Markdown cannot state text
+direction, so an Arabic table comes out mirrored.
+
+Built on a Rust core; the GIL is released during extraction and rendering.

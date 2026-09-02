@@ -240,6 +240,19 @@ impl Document {
             .join("\n\n")
     }
 
+    /// Render the document as a complete, standalone HTML page.
+    ///
+    /// The richer output: reading order, inferred headings, colour, tables with
+    /// their direction stated, and images inlined. See [`crate::html`].
+    pub fn to_html(&self) -> String {
+        crate::html::to_html(self, &crate::html::HtmlOptions::default())
+    }
+
+    /// Render as HTML with non-default options.
+    pub fn to_html_with(&self, options: &crate::html::HtmlOptions) -> String {
+        crate::html::to_html(self, options)
+    }
+
     /// The numbers of the pages that [`Document::text`] omitted.
     ///
     /// The actionable half of the signal: hand these to an OCR engine.

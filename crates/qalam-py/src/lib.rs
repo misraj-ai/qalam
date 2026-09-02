@@ -472,6 +472,8 @@ pub struct Document {
     #[pyo3(get)]
     pages_needing_ocr: Vec<u32>,
     pages: Vec<Py<Page>>,
+    /// Kept so the document can be re-rendered without extracting again.
+    document: qalam_core::Document,
 }
 
 #[pymethods]
@@ -501,7 +503,46 @@ impl Document {
             confidence: doc.confidence(),
             pages_needing_ocr: doc.pages_needing_ocr(),
             pages,
+            document: doc,
         })
+    }
+
+    /// Render the document as a complete, standalone HTML page.
+    ///
+    /// Reading order, headings inferred from type size, colour, tables with
+    /// their direction stated, and images inlined as `data:` URIs.
+    ///
+    /// `include_images=False` leaves the pictures out, which for a
+    /// picture-heavy document is the difference between a few kilobytes and a
+    /// few megabytes.
+    #[pyo3(signature = (*, include_images = true, include_color = true, title = None))]
+    fn to_html(
+        &self,
+        py: Python<'_>,
+        include_images: bool,
+        include_color: bool,
+        title: Option<String>,
+    ) -> String {
+        let options = qalam_core::HtmlOptions {
+            include_images,
+            include_color,
+            title: title.unwrap_or_else(|| "Extracted document".to_string()),
+        };
+        // Rendering is pure Rust over data we already hold, so the GIL can go.
+        py.detach(|| qalam_core::to_html(&self.document, &options))
+    }
+
+    /// The type size the document's body text is set in, and the heading levels
+    /// inferred from it.
+    ///
+    /// Returned as `(body_size, [(size, level), ...])`, largest first. A PDF
+    /// never says "this is a heading" — it says some text is larger — so this
+    /// is a guess, and one worth being able to inspect. A document that signals
+    /// headings by weight or colour rather than size comes back with an empty
+    /// list: flat, not wrong.
+    fn heading_sizes(&self) -> (f64, Vec<(f64, u8)>) {
+        let headings = qalam_core::Headings::analyse(&self.document);
+        (headings.body_size(), headings.inferred())
     }
 
     /// Every page, in document order.
