@@ -7,3 +7,4 @@ edition = "2021"
 lopdf = { workspace = true }
 unicode-normalization = { workspace = true }
 unicode-bidi = { workspace = true }
+thiserror = { workspace = true }

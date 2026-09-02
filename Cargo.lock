@@ -603,6 +603,7 @@ name = "qalam-core"
 version = "0.1.0"
 dependencies = [
  "lopdf",
+ "thiserror",
  "unicode-bidi",
  "unicode-normalization",
 ]

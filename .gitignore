@@ -1,0 +1,15 @@
+# Rust build artifacts
+/target/
+**/target/
+
+# Python virtualenvs (the PyO3/maturin side of the project)
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# Editor / OS noise
+.DS_Store
+*.swp
+.idea/
+.vscode/
