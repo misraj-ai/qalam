@@ -1,94 +1,65 @@
 //! The `extract` command — the end of Tier A.
 //!
-//! Runs the whole pipeline for real: L0 opens the file, L1 interprets the
-//! content stream, L2 resolves codes through `/ActualText` and `/ToUnicode`,
-//! L3 groups lines, reorders them and normalises them, and L4 judges whether
-//! the result can be trusted.
+//! Deliberately thin. Every step of the pipeline lives in
+//! [`qalam_core::Document`], so this file only decides what to *print*. The
+//! Python bindings call the same API, which is what keeps the two front ends
+//! from drifting apart.
 
-use qalam_core::{FontMap, Pdf, Recoverability};
+use qalam_core::{Document, Recoverability};
 
 /// Extract one page, or the whole document when `page` is `None`.
 pub fn extract(path: &str, page: Option<u32>) -> qalam_core::Result<()> {
-    let pdf = Pdf::open(path)?;
+    let doc = Document::open(path)?;
 
-    // Read the page summaries once. `pages()` walks the object graph, so
-    // calling it per page would make the whole run quadratic.
-    let all_pages = pdf.pages();
-
-    let numbers: Vec<u32> = match page {
-        Some(n) => vec![n],
-        None => all_pages.iter().map(|p| p.number).collect(),
+    // `match` on the Option to pick what to walk; one page or all of them
+    // takes the same code path from here on.
+    let pages: Vec<&qalam_core::Page> = match page {
+        Some(n) => vec![doc.page(n).ok_or(qalam_core::Error::PageNotFound(n))?],
+        None => doc.pages().iter().collect(),
     };
 
-    let mut reports = Vec::new();
-
-    for number in numbers {
-        let Some(info) = all_pages.iter().find(|p| p.number == number) else {
-            return Err(qalam_core::Error::PageNotFound(number));
-        };
-
-        // L2 first: the font map supplies both the code→text mapping and the
-        // real advance widths that L1 needs.
-        let fonts = FontMap::from_raw(pdf.page_raw_fonts(number)?);
-        let content = pdf.page_content(number)?;
-        let glyphs = qalam_core::interpret(&content, &info.fonts, &fonts);
-
-        // L3: geometry → bidi reorder → NFKC.
-        let lines = qalam_core::reconstruct(&glyphs, &fonts);
-
-        // L4: is any of this trustworthy?
-        let report = qalam_core::assess(number, &glyphs, &fonts, &lines);
-
-        println!("── page {number} [{}]──", report.verdict.as_str());
-        for reason in &report.reasons {
+    for page in &pages {
+        println!(
+            "── page {} [{}]──",
+            page.number,
+            page.report.verdict.as_str()
+        );
+        for reason in &page.report.reasons {
             println!("   ! {reason}");
         }
 
         // The whole point: do not print text we have judged untrustworthy as
         // though it were a result.
-        if report.verdict == Recoverability::NeedsOcr {
+        if page.needs_ocr() {
             println!("   (no trustworthy text — this page needs OCR)");
         } else {
-            for line in &lines {
-                println!("{}", line.text);
-            }
+            println!("{}", page.text());
         }
         println!();
-
-        reports.push(report);
     }
 
-    summarise(&reports);
+    if pages.len() > 1 {
+        summarise(&doc);
+    }
     Ok(())
 }
 
-/// Print a one-line-per-verdict tally across the pages processed.
-fn summarise(reports: &[qalam_core::PageReport]) {
-    if reports.len() <= 1 {
-        return;
-    }
-
-    let count = |v: Recoverability| reports.iter().filter(|r| r.verdict == v).count();
-
-    // The mean confidence across pages, which is more informative than a
-    // glyph-level rate because a page with no glyphs scores 0, not 100%.
-    let mean: f64 = reports.iter().map(|r| r.confidence).sum::<f64>() / reports.len() as f64;
+/// Print a tally of verdicts across the document.
+fn summarise(doc: &Document) {
+    let count = |v: Recoverability| doc.pages().iter().filter(|p| p.report.verdict == v).count();
 
     println!(
         "{} page(s): {} ok, {} degraded, {} need OCR — mean confidence {:.2}",
-        reports.len(),
+        doc.page_count(),
         count(Recoverability::Ok),
         count(Recoverability::Degraded),
         count(Recoverability::NeedsOcr),
-        mean,
+        doc.confidence(),
     );
 
-    let needs: Vec<String> = reports
-        .iter()
-        .filter(|r| r.verdict == Recoverability::NeedsOcr)
-        .map(|r| r.page.to_string())
-        .collect();
+    let needs = doc.pages_needing_ocr();
     if !needs.is_empty() {
-        println!("pages needing OCR: {}", needs.join(", "));
+        let list: Vec<String> = needs.iter().map(u32::to_string).collect();
+        println!("pages needing OCR: {}", list.join(", "));
     }
 }
