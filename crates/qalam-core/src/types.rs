@@ -428,6 +428,51 @@ pub struct Glyph {
     pub style: Style,
 }
 
+/// A font's data pulled out of the PDF object graph, in plain Rust form.
+///
+/// This is the hand-off from L0 to L2. `parser.rs` knows how to walk `/ToUnicode`
+/// references, `/DescendantFonts` and `/W` arrays; `font.rs` knows how to make
+/// sense of what comes out. Splitting them at plain data means the CMap parser
+/// can be unit-tested on a byte string with no PDF anywhere in sight.
+///
+/// All widths here are in **glyph space**: thousandths of an em, as PDF stores
+/// them. A width of 500 is half an em.
+#[derive(Debug, Clone)]
+pub struct RawFont {
+    /// The summary from L0 — subtype, encoding, recoverability route.
+    pub info: FontInfo,
+    /// The undecoded bytes of the `/ToUnicode` CMap stream, if the font has one.
+    pub to_unicode: Option<Vec<u8>>,
+    /// `/FirstChar`: the code that `widths[0]` describes. Simple fonts only.
+    pub first_char: u32,
+    /// `/Widths`: one entry per code from `first_char` upwards. Simple fonts only.
+    pub widths: Vec<f64>,
+    /// `/FontDescriptor /MissingWidth`: the width for codes outside `/Widths`.
+    /// Defaults to 0, per the spec.
+    pub missing_width: f64,
+    /// `/DW`, the default width for a CID font. The spec's default is 1000.
+    pub default_width: f64,
+    /// `/W`, flattened to inclusive `(first_cid, last_cid, width)` triples.
+    /// Composite fonts only.
+    pub cid_widths: Vec<(u32, u32, f64)>,
+}
+
+impl RawFont {
+    /// An empty font description, used as the starting point when filling one in.
+    pub fn new(info: FontInfo) -> Self {
+        Self {
+            info,
+            to_unicode: None,
+            first_char: 0,
+            widths: Vec::new(),
+            missing_width: 0.0,
+            // The spec's default when `/DW` is absent.
+            default_width: 1000.0,
+            cid_widths: Vec::new(),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

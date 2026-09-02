@@ -16,7 +16,7 @@
 //! | L0 | [`parser`] | PDF object graph → pages, geometry, font resources |
 //! | L1 | [`content`]  | content stream → positioned, styled glyph codes |
 //! | L1 | [`graphics`] | graphics-state stack (`q`/`Q`, `cm`) and colour operators |
-//! | L2 | `font`     | glyph code → Unicode, via `/ToUnicode` & friends |
+//! | L2 | [`font`]     | glyph code → Unicode, via `/ToUnicode` & friends |
 //! | L3 | `arabic`   | line grouping → bidi reorder → NFKC normalise |
 //! | L4 | `detect`   | recoverability scoring: `ok` vs `needs_ocr` |
 //!
@@ -42,6 +42,7 @@
 
 pub mod content;
 pub mod error;
+pub mod font;
 pub mod graphics;
 pub mod parser;
 pub mod types;
@@ -51,9 +52,10 @@ pub mod types;
 // The module paths stay public too, for anyone who wants the long form.
 pub use content::{interpret, AssumedWidths, GlyphWidths, PageGlyphs};
 pub use error::{Error, Result};
+pub use font::{CMap, Font, FontMap};
 pub use graphics::Matrix;
 pub use parser::Pdf;
 pub use types::{
-    ClipTextMode, CodeToUnicode, Color, FontInfo, Glyph, PageInfo, Rect, Rotation, Style,
+    ClipTextMode, CodeToUnicode, Color, FontInfo, Glyph, PageInfo, RawFont, Rect, Rotation, Style,
     TextRenderMode,
 };

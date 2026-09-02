@@ -18,7 +18,7 @@
 use lopdf::{Dictionary, Document, Object, ObjectId};
 
 use crate::error::{Error, Result};
-use crate::types::{CodeToUnicode, FontInfo, PageInfo, Rect, Rotation};
+use crate::types::{CodeToUnicode, FontInfo, PageInfo, RawFont, Rect, Rotation};
 
 /// An opened PDF document.
 ///
@@ -84,6 +84,156 @@ impl Pdf {
     pub fn page_content(&self, page_number: u32) -> Result<Vec<u8>> {
         let id = self.page_id(page_number)?;
         Ok(self.doc.get_page_content(id))
+    }
+
+    /// Pull every font on a page out of the object graph, ready for L2.
+    ///
+    /// This is where indirect references get followed and streams get
+    /// decompressed, so that `font.rs` never has to touch `lopdf`. See
+    /// [`RawFont`] for what comes out.
+    pub fn page_raw_fonts(&self, page_number: u32) -> Result<Vec<RawFont>> {
+        let id = self.page_id(page_number)?;
+        let Ok(fonts) = self.doc.get_page_fonts(id) else {
+            return Ok(Vec::new());
+        };
+
+        Ok(fonts
+            .into_iter()
+            .map(|(name, dict)| self.raw_font(&name, dict))
+            .collect())
+    }
+
+    /// Extract one font dictionary into plain data.
+    fn raw_font(&self, resource_name: &[u8], dict: &Dictionary) -> RawFont {
+        let mut raw = RawFont::new(self.font_info(resource_name, dict));
+
+        // /ToUnicode is a stream: follow the reference, then undo its filters.
+        raw.to_unicode = dict
+            .get(b"ToUnicode")
+            .ok()
+            .and_then(|obj| self.resolve(obj).ok())
+            .and_then(|obj| obj.as_stream().ok())
+            // `decompressed_content` applies /FlateDecode and friends. A CMap
+            // that will not decompress is treated as absent rather than fatal.
+            .and_then(|stream| stream.decompressed_content().ok());
+
+        if raw.info.is_two_byte() {
+            self.read_cid_widths(dict, &mut raw);
+        } else {
+            self.read_simple_widths(dict, &mut raw);
+        }
+        raw
+    }
+
+    /// Read `/FirstChar` and `/Widths` from a simple (1-byte) font.
+    fn read_simple_widths(&self, dict: &Dictionary, raw: &mut RawFont) {
+        raw.first_char = self
+            .lookup(dict, b"FirstChar")
+            .and_then(|o| o.as_i64().ok())
+            // A negative /FirstChar is nonsense; clamp rather than wrap.
+            .map(|n| n.max(0) as u32)
+            .unwrap_or(0);
+
+        if let Some(array) = self.lookup(dict, b"Widths").and_then(|o| o.as_array().ok()) {
+            raw.widths = array.iter().filter_map(|o| self.number(o)).collect();
+        }
+
+        // /MissingWidth lives one level down, in the font descriptor.
+        raw.missing_width = self
+            .lookup(dict, b"FontDescriptor")
+            .and_then(|o| o.as_dict().ok())
+            .and_then(|fd| self.lookup(fd, b"MissingWidth"))
+            .and_then(|o| self.number(o))
+            .unwrap_or(0.0);
+    }
+
+    /// Read `/DW` and `/W` from a composite font's descendant.
+    ///
+    /// A `Type0` font is a shell: the widths live in `/DescendantFonts[0]`,
+    /// which is the actual CIDFont (PLAN.md §10.1).
+    fn read_cid_widths(&self, dict: &Dictionary, raw: &mut RawFont) {
+        let Some(descendant) = self
+            .lookup(dict, b"DescendantFonts")
+            .and_then(|o| o.as_array().ok())
+            .and_then(|a| a.first())
+            .and_then(|o| self.resolve(o).ok())
+            .and_then(|o| o.as_dict().ok())
+        else {
+            return;
+        };
+
+        if let Some(dw) = self.lookup(descendant, b"DW").and_then(|o| self.number(o)) {
+            raw.default_width = dw;
+        }
+
+        let Some(w) = self
+            .lookup(descendant, b"W")
+            .and_then(|o| o.as_array().ok())
+        else {
+            return;
+        };
+
+        // The /W array interleaves two shapes:
+        //   c [w1 w2 ...]      widths for c, c+1, c+2, ...
+        //   cfirst clast w     one width for the whole inclusive range
+        // Which one is next is decided by whether an array follows the number.
+        let mut i = 0;
+        while i < w.len() {
+            let Some(first) = self.number(&w[i]).map(|n| n.max(0.0) as u32) else {
+                // Not a number where one is required: the array is malformed,
+                // and guessing where it resynchronises would be worse than
+                // stopping with the widths we already have.
+                break;
+            };
+
+            match w.get(i + 1).map(|o| self.resolve_or(o)) {
+                Some(next) if next.as_array().is_ok() => {
+                    let list = next.as_array().expect("checked just above");
+                    for (offset, item) in list.iter().enumerate() {
+                        if let Some(width) = self.number(item) {
+                            let cid = first + offset as u32;
+                            raw.cid_widths.push((cid, cid, width));
+                        }
+                    }
+                    i += 2;
+                }
+                Some(_) => {
+                    // The `cfirst clast w` form needs a third operand.
+                    let last = w.get(i + 1).and_then(|o| self.number(o));
+                    let width = w.get(i + 2).and_then(|o| self.number(o));
+                    if let (Some(last), Some(width)) = (last, width) {
+                        raw.cid_widths.push((first, last.max(0.0) as u32, width));
+                    }
+                    i += 3;
+                }
+                None => break,
+            }
+        }
+    }
+
+    /// Get `key` from `dict`, following an indirect reference if there is one.
+    fn lookup<'a>(&'a self, dict: &'a Dictionary, key: &[u8]) -> Option<&'a Object> {
+        dict.get(key).ok().and_then(|obj| self.resolve(obj).ok())
+    }
+
+    /// Follow an indirect reference; pass a direct object through unchanged.
+    fn resolve<'a>(&'a self, obj: &'a Object) -> Result<&'a Object> {
+        match obj.as_reference() {
+            Ok(id) => Ok(self.doc.get_object(id)?),
+            Err(_) => Ok(obj),
+        }
+    }
+
+    /// [`Self::resolve`], but a dangling reference yields the reference itself
+    /// rather than an error — for the places where we only need to *classify*
+    /// the object.
+    fn resolve_or<'a>(&'a self, obj: &'a Object) -> &'a Object {
+        self.resolve(obj).unwrap_or(obj)
+    }
+
+    /// Read an object as a number, following a reference first if needed.
+    fn number(&self, obj: &Object) -> Option<f64> {
+        self.resolve(obj).ok()?.as_float().ok().map(|f| f as f64)
     }
 
     /// Look up the object id of a 1-based page number.

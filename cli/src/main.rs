@@ -5,11 +5,12 @@
 //! qalam inspect <file.pdf>          # pages, geometry, fonts, recoverability hint
 //! qalam raw     <file.pdf> [page]   # dump a page's raw content stream (default 1)
 //! qalam glyphs  <file.pdf> [page]   # L1 output: positioned, styled glyph codes
+//! qalam text    <file.pdf> [page]   # L2 output: codes resolved through /ToUnicode
 //! ```
 
 use std::process::ExitCode;
 
-use qalam_core::{AssumedWidths, CodeToUnicode, Pdf};
+use qalam_core::{AssumedWidths, CodeToUnicode, FontMap, Pdf};
 
 /// # Rust lesson: `main` can return
 ///
@@ -25,16 +26,20 @@ fn main() -> ExitCode {
         [cmd, path] if cmd == "inspect" => inspect(path),
         [cmd, path] if cmd == "raw" => raw(path, 1),
         [cmd, path] if cmd == "glyphs" => glyphs(path, 1),
+        [cmd, path] if cmd == "text" => text(path, 1),
         // Both page-taking commands parse their argument the same way, so they
         // share one arm and dispatch on the command name inside it.
-        [cmd, path, page] if cmd == "raw" || cmd == "glyphs" => match page.parse() {
-            Ok(n) if cmd == "raw" => raw(path, n),
-            Ok(n) => glyphs(path, n),
-            Err(_) => {
-                eprintln!("error: `{page}` is not a page number");
-                return ExitCode::FAILURE;
+        [cmd, path, page] if cmd == "raw" || cmd == "glyphs" || cmd == "text" => {
+            match page.parse() {
+                Ok(n) if cmd == "raw" => raw(path, n),
+                Ok(n) if cmd == "glyphs" => glyphs(path, n),
+                Ok(n) => text(path, n),
+                Err(_) => {
+                    eprintln!("error: `{page}` is not a page number");
+                    return ExitCode::FAILURE;
+                }
             }
-        },
+        }
         _ => {
             usage();
             return ExitCode::FAILURE;
@@ -58,7 +63,8 @@ fn usage() {
          usage:\n\
          \x20 qalam inspect <file.pdf>          pages, geometry and font resources\n\
          \x20 qalam raw <file.pdf> [page]       raw content stream of a page (default 1)\n\
-         \x20 qalam glyphs <file.pdf> [page]    positioned, styled glyph codes (L1)"
+         \x20 qalam glyphs <file.pdf> [page]    positioned, styled glyph codes (L1)\n\
+         \x20 qalam text <file.pdf> [page]      codes resolved through /ToUnicode (L2)"
     );
 }
 
@@ -206,4 +212,83 @@ fn print_run(run: &[qalam_core::Glyph]) {
     // hex strings in `qalam raw` output.
     let codes: Vec<String> = run.iter().map(|g| format!("{:04X}", g.code)).collect();
     println!("    {}", codes.join(" "));
+}
+
+/// Resolve a page's glyph codes through their fonts and print the result.
+///
+/// **The output is expected to look wrong.** This is the M1 checkpoint from
+/// PLAN.md: Arabic here is still in *visual* order and still made of
+/// presentation forms, because that is exactly what the PDF stores. Seeing the
+/// garbage is the point — M2 fixes it with bidi reordering followed by NFKC,
+/// in that order.
+fn text(path: &str, page: u32) -> qalam_core::Result<()> {
+    let pdf = Pdf::open(path)?;
+    let info = pdf
+        .pages()
+        .into_iter()
+        .find(|p| p.number == page)
+        .ok_or(qalam_core::Error::PageNotFound(page))?;
+
+    // L2: parse every /ToUnicode CMap on the page. The same map also supplies
+    // real advance widths, so L1 no longer needs `AssumedWidths`.
+    let fonts = FontMap::from_raw(pdf.page_raw_fonts(page)?);
+
+    for font in fonts.iter() {
+        println!(
+            "font /{}: {} code(s) mappable, {}-byte codes",
+            font.resource_name,
+            font.to_unicode.len(),
+            if font.two_byte { 2 } else { 1 },
+        );
+    }
+
+    let content = pdf.page_content(page)?;
+    let out = qalam_core::interpret(&content, &info.fonts, &fonts);
+
+    // Group glyphs into lines by their baseline. Crude on purpose: proper
+    // geometric grouping is L3's job, and doing it here would prejudge it.
+    let mut line = String::new();
+    // `Option<f64>`, not `f64::NAN`: every comparison with NaN is false, so a
+    // NaN sentinel would make the "new line?" test never fire and pile the
+    // whole page onto one line. The type system makes "no baseline yet" a case
+    // you have to handle rather than a value that quietly misbehaves.
+    let mut baseline: Option<f64> = None;
+    let mut unresolved = 0usize;
+    let mut total = 0usize;
+
+    for glyph in &out.glyphs {
+        let new_line = baseline.is_none_or(|b| (glyph.y - b).abs() > 0.5);
+        if new_line {
+            flush(&mut line, baseline);
+            baseline = Some(glyph.y);
+        }
+        total += 1;
+        match fonts.decode(&glyph.style.font, glyph.code) {
+            Some(text) => line.push_str(&text),
+            None => {
+                // The honest marker: a code no font could resolve. Never a
+                // silently dropped character.
+                unresolved += 1;
+                line.push('\u{FFFD}');
+            }
+        }
+    }
+    flush(&mut line, baseline);
+
+    println!("\n{unresolved} of {total} glyph(s) unresolved");
+    if out.skipped_forms > 0 {
+        println!("{} form XObject(s) not entered", out.skipped_forms);
+    }
+    Ok(())
+}
+
+/// Print one accumulated line and clear the buffer.
+///
+/// Takes `&mut String` and empties it, so the caller reuses one allocation
+/// across the whole page rather than building a fresh string per line.
+fn flush(line: &mut String, baseline: Option<f64>) {
+    if let (false, Some(y)) = (line.is_empty(), baseline) {
+        println!("[y={y:7.1}] {line}");
+        line.clear();
+    }
 }
