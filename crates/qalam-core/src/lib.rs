@@ -62,13 +62,13 @@ pub mod types;
 // The module paths stay public too, for anyone who wants the long form.
 pub use arabic::{lines_to_text, reconstruct, TextLine};
 pub use bidi::Direction;
-pub use content::{interpret, ActualText, AssumedWidths, GlyphWidths, PageGlyphs};
+pub use content::{interpret, ActualText, AssumedWidths, GlyphWidths, PageGlyphs, XObjectUse};
 pub use detect::{assess, PageReport, Recoverability, Signals};
 pub use document::{extract_text, Document, Page};
 pub use error::{Error, Result};
 pub use font::{CMap, Font, FontMap};
 pub use graphics::Matrix;
-pub use images::{ExtractedImage, Image, ImageFormat};
+pub use images::{ExtractedImage, Image, ImageFormat, PlacedImage};
 pub use parser::Pdf;
 pub use types::{
     ClipTextMode, CodeToUnicode, Color, FontInfo, Glyph, PageInfo, RawFont, Rect, Rotation, Style,

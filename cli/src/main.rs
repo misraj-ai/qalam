@@ -7,6 +7,7 @@
 //! qalam glyphs  <file.pdf> [page]   # L1 output: positioned, styled glyph codes
 //! qalam text    <file.pdf> [page]   # L2 output: codes resolved through /ToUnicode
 //! qalam extract <file.pdf> [page]   # L3 output: correct logical Arabic
+//! qalam images  <file.pdf> [dir]    # L7 output: write embedded images to disk
 //! ```
 
 use std::process::ExitCode;
@@ -31,6 +32,8 @@ fn main() -> ExitCode {
         [cmd, path] if cmd == "glyphs" => glyphs(path, 1),
         [cmd, path] if cmd == "text" => text(path, 1),
         [cmd, path] if cmd == "extract" => extract::extract(path, None),
+        [cmd, path] if cmd == "images" => images(path, None),
+        [cmd, path, dir] if cmd == "images" => images(path, Some(dir)),
         [cmd, path, page] if cmd == "extract" => match page.parse() {
             Ok(n) => extract::extract(path, Some(n)),
             // `all` extracts the whole document, which is what a user of the
@@ -79,7 +82,8 @@ fn usage() {
          \x20 qalam raw <file.pdf> [page]       raw content stream of a page (default 1)\n\
          \x20 qalam glyphs <file.pdf> [page]    positioned, styled glyph codes (L1)\n\
          \x20 qalam text <file.pdf> [page]      codes resolved through /ToUnicode (L2)\n\
-         \x20 qalam extract <file.pdf> [page]   correct logical Arabic (L3; page or `all`)"
+         \x20 qalam extract <file.pdf> [page]   correct logical Arabic (L3; page or `all`)\n\
+         \x20 qalam images <file.pdf> [dir]     write embedded images to a directory (L7)"
     );
 }
 
@@ -166,10 +170,11 @@ fn glyphs(path: &str, page: u32) -> qalam_core::Result<()> {
     let out = qalam_core::interpret(&content, &info.fonts, &AssumedWidths);
 
     println!("page {page}: {} glyph(s)", out.glyphs.len());
-    if out.skipped_forms > 0 {
+    if !out.xobjects.is_empty() {
         println!(
-            "  note: {} form XObject(s) not entered — they may contain text",
-            out.skipped_forms
+            "  note: {} XObject(s) drawn — forms among them are not entered, \
+             so they may hide text",
+            out.xobjects.len()
         );
     }
 
@@ -291,8 +296,11 @@ fn text(path: &str, page: u32) -> qalam_core::Result<()> {
     flush(&mut line, baseline);
 
     println!("\n{unresolved} of {total} glyph(s) unresolved");
-    if out.skipped_forms > 0 {
-        println!("{} form XObject(s) not entered", out.skipped_forms);
+    if !out.xobjects.is_empty() {
+        println!(
+            "{} XObject(s) drawn (forms are not entered)",
+            out.xobjects.len()
+        );
     }
     Ok(())
 }
@@ -306,4 +314,74 @@ fn flush(line: &mut String, baseline: Option<f64>) {
         println!("[y={y:7.1}] {line}");
         line.clear();
     }
+}
+
+/// List a document's images, and write them out when given a directory.
+///
+/// Without a directory this only reports, so the common "what is in here?"
+/// question never scatters files across the working directory by accident.
+fn images(path: &str, out_dir: Option<&str>) -> qalam_core::Result<()> {
+    use qalam_core::ExtractedImage;
+
+    let doc = qalam_core::Document::open(path)?;
+    let mut written = 0usize;
+    let mut skipped = 0usize;
+
+    for (page, placed) in doc.images() {
+        // Where on the page it landed, or an honest admission that we do not
+        // know because it is drawn inside a form we do not enter.
+        let position = match placed.bbox {
+            Some(b) => format!(
+                "at ({:.0}, {:.0}) {:.0}x{:.0}pt",
+                b.x0,
+                b.y0,
+                b.width(),
+                b.height()
+            ),
+            None => "position unknown (drawn inside a form?)".to_string(),
+        };
+
+        match &placed.image {
+            ExtractedImage::Ready(image) => {
+                let name = format!("p{page:03}-{}", image.file_name());
+                println!(
+                    "{name:<20} {}x{}px {position}{}",
+                    image.width,
+                    image.height,
+                    if image.dropped_transparency {
+                        "  [has an /SMask we did not composite — may look blank]"
+                    } else {
+                        ""
+                    },
+                );
+
+                if let Some(dir) = out_dir {
+                    std::fs::create_dir_all(dir)
+                        .and_then(|()| {
+                            std::fs::write(std::path::Path::new(dir).join(&name), &image.data)
+                        })
+                        .map_err(|source| qalam_core::Error::Io {
+                            path: std::path::Path::new(dir).join(&name),
+                            source,
+                        })?;
+                    written += 1;
+                }
+            }
+            ExtractedImage::Unsupported {
+                resource_name,
+                reason,
+            } => {
+                skipped += 1;
+                println!("p{page:03}-{resource_name:<14} not extracted: {reason}");
+            }
+        }
+    }
+
+    if let Some(dir) = out_dir {
+        println!("\nwrote {written} image(s) to {dir}/");
+    }
+    if skipped > 0 {
+        println!("{skipped} image(s) could not be decoded");
+    }
+    Ok(())
 }

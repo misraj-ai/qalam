@@ -22,6 +22,7 @@
 use crate::arabic::{self, TextLine};
 use crate::detect::{self, PageReport, Recoverability};
 use crate::font::FontMap;
+use crate::images::{self, PlacedImage};
 use crate::parser::Pdf;
 use crate::types::Rotation;
 use crate::Result;
@@ -54,6 +55,12 @@ pub struct Page {
     pub lines: Vec<TextLine>,
     /// What the detector concluded about this page (L4).
     pub report: PageReport,
+    /// The images drawn on this page, each with where it landed (L7).
+    ///
+    /// Independent of the text: an image needs no font, no reading order and no
+    /// recoverability judgement, so it is extracted whatever the page's verdict
+    /// — including on a page that needs OCR, where the image *is* the content.
+    pub images: Vec<PlacedImage>,
 }
 
 impl Page {
@@ -100,6 +107,11 @@ impl Document {
             let lines = arabic::reconstruct(&glyphs, &fonts);
             let report = detect::assess(number, &glyphs, &fonts, &lines);
 
+            // L7, off the critical path for text: images come from
+            // `/Resources`, and their positions from the `Do` operators L1 saw.
+            let raw_images = pdf.page_raw_images(number)?;
+            let images = images::extract_placed(&raw_images, &glyphs.xobjects);
+
             pages.push(Page {
                 number,
                 width: info.media_box.width(),
@@ -107,6 +119,7 @@ impl Document {
                 rotation: info.rotation,
                 lines,
                 report,
+                images,
             });
         }
 
@@ -126,6 +139,13 @@ impl Document {
     /// How many pages the document has.
     pub fn page_count(&self) -> usize {
         self.pages.len()
+    }
+
+    /// Every image in the document, paired with the page it appears on.
+    pub fn images(&self) -> impl Iterator<Item = (u32, &PlacedImage)> {
+        self.pages
+            .iter()
+            .flat_map(|page| page.images.iter().map(move |img| (page.number, img)))
     }
 
     /// The whole document's text, pages separated by a blank line.

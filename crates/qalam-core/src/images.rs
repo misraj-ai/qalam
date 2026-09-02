@@ -26,7 +26,9 @@
 //! A full-page image on a page with no text is not a figure; it is a scan, and
 //! the detector (L4) is what should be consulted about it.
 
-use crate::types::{ImageColorSpace, Palette, RawImage};
+use crate::content::XObjectUse;
+use crate::graphics::Matrix;
+use crate::types::{ImageColorSpace, Palette, RawImage, Rect};
 
 /// A container format an extracted image can be written as.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -106,6 +108,92 @@ impl Image {
 /// Extract every image on a page.
 pub fn extract(raws: &[RawImage]) -> Vec<ExtractedImage> {
     raws.iter().map(extract_one).collect()
+}
+
+/// An image together with where on the page it was painted.
+#[derive(Debug, Clone)]
+pub struct PlacedImage {
+    /// The image, or the reason we declined to decode it.
+    pub image: ExtractedImage,
+    /// Where it landed, in PDF points from the bottom-left of the page.
+    ///
+    /// `None` means the image is declared in `/Resources` but we never saw it
+    /// drawn. That is not proof it is absent from the page: it is very likely
+    /// drawn *inside a form XObject*, which we do not enter. Reporting the
+    /// image with an unknown position beats dropping it and beats inventing
+    /// one.
+    pub bbox: Option<Rect>,
+}
+
+/// Extract a page's images and locate each one.
+///
+/// `uses` comes from [`crate::content::interpret`]; names in it that match no
+/// image resource are forms, and are ignored here.
+///
+/// An image drawn more than once appears once per placement, so the decoded
+/// bytes are duplicated. Real pages almost never do this, and the alternative —
+/// handing callers an index into a separate list — makes every caller pay for a
+/// case that rarely happens.
+pub fn extract_placed(raws: &[RawImage], uses: &[XObjectUse]) -> Vec<PlacedImage> {
+    let mut placed = Vec::new();
+
+    for raw in raws {
+        let decoded = extract_one(raw);
+
+        // Every `Do` that names this image resource.
+        let mut drawn = uses
+            .iter()
+            .filter(|use_| use_.name == raw.resource_name)
+            .peekable();
+
+        if drawn.peek().is_none() {
+            placed.push(PlacedImage {
+                image: decoded,
+                bbox: None,
+            });
+            continue;
+        }
+
+        for use_ in drawn {
+            placed.push(PlacedImage {
+                image: decoded.clone(),
+                bbox: Some(placement_box(use_.ctm)),
+            });
+        }
+    }
+    placed
+}
+
+/// Where the unit square lands once the CTM is applied.
+///
+/// PDF paints every image into the square from (0,0) to (1,1); the matrix does
+/// all the scaling, rotation and positioning. So the placed rectangle is that
+/// square's four corners transformed — all four, not just two, because a
+/// rotated or flipped matrix would otherwise give a nonsensical box.
+///
+/// A negative `d` is completely normal here, and is why the corners must be
+/// normalised afterwards: images are commonly placed with a flipped y axis,
+/// since image rows run top-down while PDF space runs bottom-up.
+fn placement_box(ctm: Matrix) -> Rect {
+    let corners = [
+        ctm.apply(0.0, 0.0),
+        ctm.apply(1.0, 0.0),
+        ctm.apply(0.0, 1.0),
+        ctm.apply(1.0, 1.0),
+    ];
+
+    let xs = corners.map(|(x, _)| x);
+    let ys = corners.map(|(_, y)| y);
+
+    // `fold` with `f64::min` rather than `.min()` on an iterator, because
+    // `f64` is only `PartialOrd` — there is no total order to take a minimum
+    // over without deciding what to do about NaN.
+    Rect::new(
+        xs.iter().copied().fold(f64::INFINITY, f64::min),
+        ys.iter().copied().fold(f64::INFINITY, f64::min),
+        xs.iter().copied().fold(f64::NEG_INFINITY, f64::max),
+        ys.iter().copied().fold(f64::NEG_INFINITY, f64::max),
+    )
 }
 
 /// Decide what one image is and produce it.
@@ -406,6 +494,88 @@ mod tests {
                 reason(&result)
             );
         }
+    }
+
+    fn use_of(name: &str, ctm: Matrix) -> XObjectUse {
+        XObjectUse {
+            name: name.to_string(),
+            ctm,
+            glyph_index: 0,
+        }
+    }
+
+    #[test]
+    fn placement_transforms_the_unit_square() {
+        // 200x100 points, with its lower-left corner at (50, 600).
+        let bbox = placement_box(Matrix::new(200.0, 0.0, 0.0, 100.0, 50.0, 600.0));
+        assert_eq!((bbox.x0, bbox.y0), (50.0, 600.0));
+        assert_eq!((bbox.width(), bbox.height()), (200.0, 100.0));
+    }
+
+    #[test]
+    fn a_flipped_image_still_gets_a_sane_box() {
+        // A negative `d` is normal: image rows run top-down, PDF space runs
+        // bottom-up, so placements routinely flip the y axis. Without
+        // normalising the corners this would come out inside out.
+        let bbox = placement_box(Matrix::new(200.0, 0.0, 0.0, -100.0, 50.0, 700.0));
+        assert_eq!((bbox.y0, bbox.y1), (600.0, 700.0));
+        assert_eq!(bbox.height(), 100.0);
+    }
+
+    #[test]
+    fn a_rotated_placement_uses_all_four_corners() {
+        // Quarter turn: taking only two corners would give a zero-area box.
+        let bbox = placement_box(Matrix::new(0.0, 100.0, -50.0, 0.0, 0.0, 0.0));
+        assert_eq!((bbox.width(), bbox.height()), (50.0, 100.0));
+    }
+
+    #[test]
+    fn an_image_never_drawn_is_reported_with_no_position() {
+        // Almost certainly drawn inside a form XObject we do not enter.
+        // Dropping it would hide a real image; inventing a box would be worse.
+        let raws = [raw(
+            &["DCTDecode"],
+            ImageColorSpace::Rgb,
+            8,
+            vec![0xFF, 0xD8],
+        )];
+        let placed = extract_placed(&raws, &[]);
+        assert_eq!(placed.len(), 1);
+        assert!(placed[0].bbox.is_none());
+    }
+
+    #[test]
+    fn an_image_drawn_twice_is_placed_twice() {
+        let raws = [raw(
+            &["DCTDecode"],
+            ImageColorSpace::Rgb,
+            8,
+            vec![0xFF, 0xD8],
+        )];
+        let uses = [
+            use_of("Im0", Matrix::new(10.0, 0.0, 0.0, 10.0, 0.0, 0.0)),
+            use_of("Im0", Matrix::new(10.0, 0.0, 0.0, 10.0, 100.0, 100.0)),
+        ];
+        let placed = extract_placed(&raws, &uses);
+        assert_eq!(placed.len(), 2);
+        assert_eq!(placed[0].bbox.map(|b| b.x0), Some(0.0));
+        assert_eq!(placed[1].bbox.map(|b| b.x0), Some(100.0));
+    }
+
+    #[test]
+    fn a_form_invocation_matches_no_image() {
+        // `/Fm0 Do` names a form, not an image resource; it must not attach
+        // itself to an unrelated image.
+        let raws = [raw(
+            &["DCTDecode"],
+            ImageColorSpace::Rgb,
+            8,
+            vec![0xFF, 0xD8],
+        )];
+        let uses = [use_of("Fm0", Matrix::IDENTITY)];
+        let placed = extract_placed(&raws, &uses);
+        assert_eq!(placed.len(), 1);
+        assert!(placed[0].bbox.is_none());
     }
 
     #[test]

@@ -84,19 +84,43 @@ pub struct ActualText {
     pub text: String,
 }
 
+/// One `Do` operator: an XObject painted somewhere on the page.
+///
+/// The interpreter cannot tell an image from a form here — that needs the
+/// page's `/Resources /XObject` dictionary, which this module deliberately does
+/// not have. It records *every* invocation with the transform in effect, and
+/// leaves the classifying to whoever holds the resources.
+#[derive(Debug, Clone, PartialEq)]
+pub struct XObjectUse {
+    /// The resource name, e.g. `Im0` in `/Im0 Do`.
+    pub name: String,
+    /// The current transformation matrix at the moment of the `Do`.
+    ///
+    /// This is the whole of an image's geometry. PDF paints an image into the
+    /// **unit square** — (0,0) to (1,1) — and lets the CTM scale, rotate and
+    /// move it into place. The pixel dimensions say nothing about where it
+    /// lands or how big it is; this matrix says both.
+    pub ctm: Matrix,
+    /// How many glyphs had been painted when this happened.
+    ///
+    /// A cheap ordering key: it says whether the object was drawn before or
+    /// after the text around it, without needing a full reading-order pass.
+    pub glyph_index: usize,
+}
+
 /// Everything the interpreter recovered from one page.
 #[derive(Debug, Default)]
 pub struct PageGlyphs {
     /// Every glyph painted, in the order the stream painted them — which for
     /// Arabic is **visual** order, not reading order. Fixing that is L3's job.
     pub glyphs: Vec<Glyph>,
-    /// Count of form XObjects (`/Fm0 Do`) we walked past without entering.
+    /// Every `Do` on the page, in the order they were painted.
     ///
-    /// A form is a reusable sub-stream with its own resources, and it may
-    /// contain text. Recursing into one needs the page's `/XObject` dictionary,
-    /// which this module deliberately does not have. Reporting the count keeps
-    /// the omission visible instead of silently losing text.
-    pub skipped_forms: usize,
+    /// Images are matched against these to find where they landed. Forms are in
+    /// here too: a form is a reusable sub-stream with its own resources, which
+    /// we do not enter, so it may hide text and images from us. Recording the
+    /// invocation keeps that omission visible rather than silent.
+    pub xobjects: Vec<XObjectUse>,
     /// Operators we recognised as text-affecting but chose not to implement.
     /// Useful while building; expected to stay empty on ordinary files.
     pub unsupported: Vec<String>,
@@ -421,9 +445,15 @@ impl Interpreter<'_> {
 
             // ---- everything else -----------------------------------------
             "Do" => {
-                // Image XObjects are L7's business. Form XObjects may hold text
-                // we are missing, so count them (see `PageGlyphs::skipped_forms`).
-                self.out.skipped_forms += 1;
+                // Record the name and the transform; deciding what the object
+                // *is* belongs to a layer that can see `/Resources`.
+                if let Some(name) = op.operands.first().and_then(object_name) {
+                    self.out.xobjects.push(XObjectUse {
+                        name,
+                        ctm: self.graphics.current().ctm,
+                        glyph_index: self.out.glyphs.len(),
+                    });
+                }
             }
             _ => {
                 // Paths, clipping, shading, marked content, inline images: all
@@ -805,10 +835,49 @@ mod tests {
     }
 
     #[test]
-    fn form_xobjects_are_counted_not_silently_dropped() {
+    fn xobjects_are_recorded_with_the_transform_that_places_them() {
+        // A `cm` before the `Do` is the whole of an image's geometry: PDF
+        // paints into the unit square and lets the matrix scale and move it.
+        let out = run("q 200 0 0 100 50 600 cm /Im0 Do Q", &[]);
+        assert_eq!(out.xobjects.len(), 1);
+        assert_eq!(out.xobjects[0].name, "Im0");
+
+        let ctm = out.xobjects[0].ctm;
+        // The unit square's corners map to the image's placed rectangle.
+        assert_eq!(ctm.apply(0.0, 0.0), (50.0, 600.0));
+        assert_eq!(ctm.apply(1.0, 1.0), (250.0, 700.0));
+    }
+
+    #[test]
+    fn q_restores_the_transform_between_two_placements() {
+        // Two images placed from the same saved state must not accumulate each
+        // other's transforms.
+        let out = run(
+            "q 10 0 0 10 0 0 cm /Im0 Do Q q 20 0 0 20 100 100 cm /Im1 Do Q",
+            &[],
+        );
+        assert_eq!(out.xobjects.len(), 2);
+        assert_eq!(out.xobjects[0].ctm.apply(1.0, 1.0), (10.0, 10.0));
+        assert_eq!(out.xobjects[1].ctm.apply(1.0, 1.0), (120.0, 120.0));
+    }
+
+    #[test]
+    fn a_form_invocation_is_recorded_even_though_we_do_not_enter_it() {
+        // We cannot tell a form from an image here, and must not pretend the
+        // object was not there.
         let out = run("q /Fm0 Do Q", &[]);
-        assert_eq!(out.skipped_forms, 1);
+        assert_eq!(out.xobjects.len(), 1);
+        assert_eq!(out.xobjects[0].name, "Fm0");
         assert!(out.glyphs.is_empty());
+    }
+
+    #[test]
+    fn an_xobject_drawn_after_text_records_the_glyph_count() {
+        let out = run(
+            "BT /F1 12 Tf (ab) Tj ET q 1 0 0 1 0 0 cm /Im0 Do Q",
+            &[simple_font("F1")],
+        );
+        assert_eq!(out.xobjects[0].glyph_index, 2);
     }
 
     #[test]
