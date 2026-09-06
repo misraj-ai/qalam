@@ -1,0 +1,146 @@
+# Build wheels for every platform we support, then publish them to PyPI.
+#
+# Publishing uses PyPI's *trusted publishing* (OpenID Connect): PyPI is told to
+# trust this repository and this workflow file by name, and GitHub hands the job
+# a short-lived token at run time. There is no API token stored in the repo's
+# secrets, so there is nothing to leak or rotate.
+#
+# On PyPI, configure the publisher as:
+#   owner:              <your GitHub user or org>
+#   repository:         qalam
+#   workflow filename:  release.yml      <- this file; the name is load-bearing
+#   environment:        pypi             <- must match `environment:` below
+#
+# Renaming this file breaks publishing until the PyPI publisher is updated to
+# match, because PyPI checks the filename in the OIDC token it receives.
+
+name: release
+
+on:
+  # Publish when a version tag is pushed: `git tag v0.1.0 && git push --tags`.
+  push:
+    tags:
+      - "v*"
+  # Build (but do not publish) on demand, so the matrix can be tested without
+  # burning a version number.
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # The wheels.
+  #
+  # The extension is built against Python's *stable ABI* (`abi3-py39`, see
+  # crates/qalam-py/Cargo.toml), so one wheel per platform serves Python 3.9 and
+  # every later version. That is why this matrix varies the platform and the CPU
+  # architecture but never the interpreter version.
+  # ---------------------------------------------------------------------------
+  wheels:
+    name: wheel (${{ matrix.platform.runner }} / ${{ matrix.platform.target }})
+    runs-on: ${{ matrix.platform.runner }}
+    strategy:
+      # One broken platform should not cancel the wheels that were fine.
+      fail-fast: false
+      matrix:
+        platform:
+          - runner: ubuntu-latest
+            target: x86_64
+          - runner: ubuntu-latest
+            target: aarch64
+          - runner: macos-latest
+            target: x86_64        # Intel Macs
+          - runner: macos-latest
+            target: aarch64       # Apple Silicon
+          - runner: windows-latest
+            target: x64
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.9"
+
+      - name: Build wheel
+        uses: PyO3/maturin-action@v1
+        with:
+          target: ${{ matrix.platform.target }}
+          # `manylinux` only affects the Linux runners; it builds inside a
+          # container old enough that the wheel runs on essentially any modern
+          # distribution. `auto` picks the right image for the target.
+          manylinux: auto
+          # `--manifest-path` matters: the workspace root is a Rust workspace,
+          # and the Python extension is one crate inside it.
+          args: >-
+            --release
+            --out dist
+            --manifest-path crates/qalam-py/Cargo.toml
+          sccache: "true"
+
+      - name: Upload wheel
+        uses: actions/upload-artifact@v4
+        with:
+          name: wheels-${{ matrix.platform.runner }}-${{ matrix.platform.target }}
+          path: dist
+
+  # ---------------------------------------------------------------------------
+  # The source distribution.
+  #
+  # A wheel is a compiled artifact for one platform; the sdist is the source,
+  # and it is what lets someone on a platform we did not build for install by
+  # compiling locally. PyPI wants both.
+  # ---------------------------------------------------------------------------
+  sdist:
+    name: sdist
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build sdist
+        uses: PyO3/maturin-action@v1
+        with:
+          command: sdist
+          args: >-
+            --out dist
+            --manifest-path crates/qalam-py/Cargo.toml
+
+      - name: Upload sdist
+        uses: actions/upload-artifact@v4
+        with:
+          name: wheels-sdist
+          path: dist
+
+  # ---------------------------------------------------------------------------
+  # Publish.
+  #
+  # Runs only for a tag push, so a manual `workflow_dispatch` run exercises the
+  # whole build without touching PyPI.
+  # ---------------------------------------------------------------------------
+  publish:
+    name: publish to PyPI
+    needs: [wheels, sdist]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    # The environment name must match what the PyPI publisher is configured
+    # with. It is also where a required-reviewer rule would go, if you want a
+    # human to approve each release.
+    environment:
+      name: pypi
+      url: https://pypi.org/p/qalam
+    permissions:
+      # This is the whole point: it lets the job mint the OIDC token PyPI
+      # verifies. Without it, trusted publishing fails.
+      id-token: write
+    steps:
+      - name: Download every artifact
+        uses: actions/download-artifact@v4
+        with:
+          # Each build job uploaded under `wheels-*`; merge them into one dist/.
+          pattern: wheels-*
+          merge-multiple: true
+          path: dist
+
+      - name: Publish
+        uses: pypa/gh-action-pypi-publish@release/v1
+        # No `password:` — the action detects trusted publishing and uses the
+        # OIDC token instead of an API token.
