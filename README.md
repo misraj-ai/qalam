@@ -36,26 +36,6 @@ The ordering rule that most tools get wrong: **reorder before normalising.** NFK
 lam-alef ligature `ﻻ` into two characters; reorder afterwards and they swap. `qalam` reorders
 while ligatures are still single glyphs, then normalises.
 
-### Measured against the alternatives
-
-On a 44-page Arabic government document (`scripts/compare.py`):
-
-```
-                                   qalam      pdfium     pymupdf
-  logical word order                 yes          NO         yes¹
-  lam-alef ligature                  yes          NO         yes¹
-  tashkeel attached                  yes          NO          NO
-  columns kept whole (of 3)            3           0           3
-  presentation forms left              0           0       31080
-  tells you a page needs OCR         yes          NO          NO
-  speed (median of 5)              0.217s      0.313s      0.236s
-```
-
-¹ only after the caller applies NFKC themselves; PyMuPDF returns presentation forms.
-
-pdfium's word-order failure cannot be repaired downstream — once glyphs are flattened into a
-string in the wrong sequence, the information needed to undo it is gone.
-
 ---
 
 ## Installing

@@ -14,7 +14,7 @@
 //! is*. Line joins, dash patterns, blend modes and clipping paths are tracked
 //! nowhere — see PLAN.md §1, "out of scope".
 
-use crate::types::Color;
+use crate::types::{Color, TextRenderMode};
 
 /// A PDF transformation matrix.
 ///
@@ -188,6 +188,61 @@ impl ColorSpaceKind {
     }
 }
 
+/// The text state *parameters*, which live in the graphics state.
+///
+/// # Rust lesson: the spec decides where state belongs
+///
+/// It is tempting to keep everything text-related together in the text
+/// interpreter. ISO 32000 §8.4.1 says otherwise: these eight parameters are
+/// part of the **graphics** state, so `q` saves them and `Q` restores them,
+/// exactly like the transform and the colours.
+///
+/// Treating them as interpreter globals instead is not a subtle difference. A
+/// PDF that sets `-4.02 Tc` inside one `q … Q` block expects it to end at the
+/// `Q`; if it does not, every later glyph on the page is advanced 4pt too
+/// little, the computed positions collapse into each other, and text sorted by
+/// position comes out shuffled. Fixture `1.pdf` does exactly this
+/// (PLAN.md §10.17).
+///
+/// The two text *matrices* are **not** here, because they are not part of the
+/// graphics state: they are created by `BT` and die at `ET`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TextParams {
+    /// The font resource name from `Tf`.
+    pub font: String,
+    /// The `Tf` size operand — often a meaningless 1, with the real scale in
+    /// the text matrix. Never report this as the font size.
+    pub font_size: f64,
+    /// `Tc`, extra space after every glyph, in unscaled text units.
+    pub char_spacing: f64,
+    /// `Tw`, extra space after single-byte code 32 only.
+    pub word_spacing: f64,
+    /// `Tz` as a fraction: the operator takes a percentage, 1.0 means 100.
+    pub horizontal_scale: f64,
+    /// `TL`, the line height used by `T*`, `'` and `"`.
+    pub leading: f64,
+    /// `Ts`, superscript and subscript offset.
+    pub rise: f64,
+    /// `Tr`, how glyphs are painted — including mode 3, invisible.
+    pub render_mode: TextRenderMode,
+}
+
+impl Default for TextParams {
+    fn default() -> Self {
+        Self {
+            font: String::new(),
+            font_size: 0.0,
+            char_spacing: 0.0,
+            word_spacing: 0.0,
+            // 100%, stored as a fraction so it can be multiplied directly.
+            horizontal_scale: 1.0,
+            leading: 0.0,
+            rise: 0.0,
+            render_mode: TextRenderMode::Fill,
+        }
+    }
+}
+
 /// The graphics state saved by `q` and restored by `Q`.
 ///
 /// Every field here has a spec-defined initial value, which is what
@@ -204,6 +259,8 @@ pub struct GraphicsState {
     pub fill_space: ColorSpaceKind,
     /// Space selected by `CS`, needed to read a later `SCN`.
     pub stroke_space: ColorSpaceKind,
+    /// The text state parameters — saved and restored with everything else.
+    pub text: TextParams,
 }
 
 impl Default for GraphicsState {
@@ -214,6 +271,7 @@ impl Default for GraphicsState {
             stroke_color: Color::BLACK,
             fill_space: ColorSpaceKind::Gray,
             stroke_space: ColorSpaceKind::Gray,
+            text: TextParams::default(),
         }
     }
 }
@@ -334,6 +392,26 @@ mod tests {
         stack.restore();
         assert!(stack.current().fill_color.is_black());
         assert_eq!(stack.depth(), 0);
+    }
+
+    #[test]
+    fn q_and_q_restore_the_text_parameters_too() {
+        // The bug in `1.pdf`: `-4.02 Tc` set inside a `q … Q` block leaked out
+        // of it, so every later glyph advanced 4pt too little and the computed
+        // positions collapsed together. ISO 32000 §8.4.1 puts these parameters
+        // in the graphics state precisely so this cannot happen.
+        let mut stack = GraphicsStack::new();
+        assert_eq!(stack.current().text.char_spacing, 0.0);
+
+        stack.save();
+        stack.current_mut().text.char_spacing = -4.02;
+        stack.current_mut().text.font = "F4".to_string();
+        stack.current_mut().text.horizontal_scale = 0.5;
+
+        stack.restore();
+        assert_eq!(stack.current().text.char_spacing, 0.0, "Tc leaked past `Q`");
+        assert_eq!(stack.current().text.font, "");
+        assert_eq!(stack.current().text.horizontal_scale, 1.0);
     }
 
     #[test]

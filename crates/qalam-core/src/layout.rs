@@ -79,6 +79,36 @@ enum Axis {
 /// never be mistaken for a column boundary.
 const MIN_GUTTER_EMS: f64 = 1.5;
 
+/// The width demanded of a gutter in a **tall** region, in ems.
+///
+/// A gap in the x-projection means *no glyph anywhere in the region* occupies
+/// that band — so in a region of many lines it is not a word space that
+/// happened to be wide, it is a band every single line agreed to leave empty.
+/// The taller the region, the less plausible that is as coincidence, and the
+/// less the raw width has to prove on its own.
+///
+/// This matters in practice: the magazine pages in `9.pdf` set two columns of
+/// 11pt text with a **14pt** gutter — 1.27 em, comfortably visible to a reader
+/// and comfortably under the 1.5 em a short region must clear. Every page of
+/// the document merged its columns line by line because of that 2.5pt
+/// (PLAN.md §10.19).
+const MIN_GUTTER_EMS_TALL: f64 = 0.9;
+
+/// How wide each side of a column cut must be, in ems.
+///
+/// A column has to be able to hold words. A narrower strip than this is
+/// furniture — a margin rule, a bullet, or the ring of numbered badges running
+/// down the edge of each column on page 14 of `test_for_arabic_barser.pdf`,
+/// which the projection sees as a perfectly good gutter and which splitting
+/// tears away from the text it numbers.
+const MIN_COLUMN_EMS: f64 = 5.0;
+
+/// How tall a region must be, in ems, before the relaxed threshold applies.
+///
+/// Roughly five lines of body text. Below that a coincidentally aligned run of
+/// wide word spaces is still conceivable, so the strict width is kept.
+const TALL_REGION_EMS: f64 = 8.0;
+
 /// A horizontal gap must be this many ems tall to separate two blocks.
 ///
 /// Above normal line leading, so the lines of one paragraph stay together.
@@ -134,21 +164,33 @@ fn cut(items: &[Item], region: Vec<usize>, rtl: bool, depth: usize, out: &mut Ve
     // A single line must never be split into "columns" — every word space
     // would qualify.
     let columns = if height >= em * MIN_MULTILINE_HEIGHT_EMS {
-        widest_gap(items, &region, |i| (i.x0, i.x1))
+        // Both sides must be wide enough to be columns; see `MIN_COLUMN_EMS`.
+        widest_gap(items, &region, |i| (i.x0, i.x1), em * MIN_COLUMN_EMS)
     } else {
         None
     };
-    let rows = widest_gap(items, &region, |i| (i.y0, i.y1));
+    // Rows have no such constraint: a one-line band between two paragraphs is a
+    // perfectly ordinary thing to cut away.
+    let rows = widest_gap(items, &region, |i| (i.y0, i.y1), 0.0);
+
+    // How wide a gutter has to be depends on how much of the page agreed to
+    // leave it empty — see `MIN_GUTTER_EMS_TALL`.
+    let min_gutter = em
+        * if height >= em * TALL_REGION_EMS {
+            MIN_GUTTER_EMS_TALL
+        } else {
+            MIN_GUTTER_EMS
+        };
 
     // Take whichever cut is more pronounced, provided it clears its threshold.
     // This is what lets a full-width heading be removed before the columns
     // underneath it are looked for.
     let choice = match (columns, rows) {
-        (Some(c), Some(r)) if c.width >= em * MIN_GUTTER_EMS && c.width > r.width => {
+        (Some(c), Some(r)) if c.width >= min_gutter && c.width > r.width => {
             Some((Axis::Columns, c.at))
         }
         (_, Some(r)) if r.width >= em * MIN_ROW_GAP_EMS => Some((Axis::Rows, r.at)),
-        (Some(c), _) if c.width >= em * MIN_GUTTER_EMS => Some((Axis::Columns, c.at)),
+        (Some(c), _) if c.width >= min_gutter => Some((Axis::Columns, c.at)),
         _ => None,
     };
 
@@ -202,7 +244,12 @@ struct Gap {
 /// Only gaps *between* items count. Margins at either end are not gaps, which
 /// falls out of the sweep naturally and is what we want: the blank left margin
 /// of a page is not a column boundary.
-fn widest_gap(items: &[Item], region: &[usize], extent: fn(&Item) -> (f64, f64)) -> Option<Gap> {
+fn widest_gap(
+    items: &[Item],
+    region: &[usize],
+    extent: fn(&Item) -> (f64, f64),
+    min_side: f64,
+) -> Option<Gap> {
     let mut spans: Vec<(f64, f64)> = region.iter().map(|&i| extent(&items[i])).collect();
     if spans.len() < 2 {
         return None;
@@ -212,6 +259,9 @@ fn widest_gap(items: &[Item], region: &[usize], extent: fn(&Item) -> (f64, f64))
     // coordinate sorts to one end instead of corrupting the result.
     spans.sort_by(|a, b| a.0.total_cmp(&b.0));
 
+    let start = spans[0].0;
+    let end = spans.iter().fold(f64::NEG_INFINITY, |acc, s| acc.max(s.1));
+
     let mut best: Option<Gap> = None;
     // The furthest right (or highest) any item has reached so far. Overlapping
     // items must not appear to leave a gap, so this is a running maximum.
@@ -219,7 +269,12 @@ fn widest_gap(items: &[Item], region: &[usize], extent: fn(&Item) -> (f64, f64))
 
     for &(lo, hi) in &spans[1..] {
         let width = lo - reach;
-        if width > 0.0 && best.is_none_or(|b| width > b.width) {
+        // A gap that leaves too little on either side is not a boundary
+        // between two parts of the page; it is an edge with furniture beyond
+        // it. `min_side` is 0 where that distinction does not apply.
+        let room = reach - start >= min_side && end - lo >= min_side;
+
+        if width > 0.0 && room && best.is_none_or(|b| width > b.width) {
             best = Some(Gap { width, at: reach });
         }
         reach = reach.max(hi);
@@ -343,7 +398,7 @@ mod tests {
         // Confirm the premise: no gutter exists across the page as a whole.
         let all: Vec<usize> = (0..items.len()).collect();
         assert!(
-            widest_gap(&items, &all, |i| (i.x0, i.x1)).is_none(),
+            widest_gap(&items, &all, |i| (i.x0, i.x1), 0.0).is_none(),
             "the heading should span both columns"
         );
 
@@ -354,6 +409,70 @@ mod tests {
         assert_eq!(group_of(&groups, 1), Some(0));
         assert_eq!(group_of(&groups, 5), Some(1)); // right column
         assert_eq!(group_of(&groups, 2), Some(2)); // left column
+    }
+
+    #[test]
+    fn a_tall_region_admits_a_narrower_gutter() {
+        // The magazine pages in `9.pdf`: two columns of 11pt text with a 14pt
+        // gutter — 1.27 em. Every page merged its columns line by line because
+        // the threshold demanded 1.5 em. A band that *every* line of a tall
+        // region agreed to leave empty is not a coincidence.
+        let columns = |lines: usize| {
+            let mut items = Vec::new();
+            for column in 0..2 {
+                for line in 0..lines {
+                    let x = 100.0 + column as f64 * 214.0;
+                    items.push(Item {
+                        x0: x,
+                        x1: x + 200.0,
+                        y0: 500.0 - line as f64 * 14.0,
+                        y1: 500.0 - line as f64 * 14.0 + 11.0,
+                        size: 11.0,
+                    });
+                }
+            }
+            segment(&items, true).len()
+        };
+
+        assert_eq!(columns(20), 2, "a tall two-column region should split");
+        // Three lines is not enough for the band to prove itself, so the
+        // stricter width still applies and the region stays whole.
+        assert_eq!(columns(3), 1, "a short region keeps the strict threshold");
+    }
+
+    #[test]
+    fn a_narrow_strip_is_not_a_column() {
+        // Page 14 of `test_for_arabic_barser.pdf` runs a ring of numbered
+        // badges down the inside edge of each column. The projection sees a
+        // perfectly good gutter beside them, and splitting there tears every
+        // number away from the item it numbers.
+        let mut items = Vec::new();
+        for line in 0..20 {
+            let y = 500.0 - line as f64 * 14.0;
+            // A one-character badge, then a wide gap, then the text.
+            if line % 5 == 0 {
+                items.push(Item {
+                    x0: 100.0,
+                    x1: 110.0,
+                    y0: y,
+                    y1: y + 11.0,
+                    size: 11.0,
+                });
+            }
+            items.push(Item {
+                x0: 128.0,
+                x1: 400.0,
+                y0: y,
+                y1: y + 11.0,
+                size: 11.0,
+            });
+        }
+
+        assert_eq!(
+            segment(&items, true).len(),
+            1,
+            "the badge strip was split off as a column"
+        );
     }
 
     #[test]
@@ -375,7 +494,7 @@ mod tests {
             word(310.0, 700.0, 50.0),
         ];
         let all: Vec<usize> = (0..items.len()).collect();
-        assert!(widest_gap(&items, &all, |i| (i.x0, i.x1)).is_none());
+        assert!(widest_gap(&items, &all, |i| (i.x0, i.x1), 0.0).is_none());
     }
 
     #[test]

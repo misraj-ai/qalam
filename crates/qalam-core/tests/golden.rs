@@ -56,6 +56,10 @@ const CORPUS: &[(&str, &str)] = &[
         "../../tests/fixtures/bar_Persons.pdf",
         "../../tests/expected/bar_Persons.txt",
     ),
+    ("../../tests/fixtures/1.pdf", "../../tests/expected/1.txt"),
+    ("../../tests/fixtures/3.pdf", "../../tests/expected/3.txt"),
+    ("../../tests/fixtures/8.pdf", "../../tests/expected/8.txt"),
+    ("../../tests/fixtures/12.pdf", "../../tests/expected/12.txt"),
 ];
 
 /// The first fixture, which most of the named regressions below refer to.
@@ -63,6 +67,19 @@ const FIXTURE: &str = CORPUS[0].0;
 
 /// The tables fixture.
 const TABLES_FIXTURE: &str = CORPUS[1].0;
+
+/// A document that sets `Tc` inside a `q … Q` block and relies on `Q` to
+/// restore it.
+const SPACING_FIXTURE: &str = CORPUS[2].0;
+
+/// A document that draws some letters as zero-advance overlays.
+const OVERLAY_FIXTURE: &str = CORPUS[3].0;
+
+/// A document whose font maps several glyphs to U+FFFD on purpose.
+const NO_TEXT_GLYPH_FIXTURE: &str = CORPUS[4].0;
+
+/// A document that tightens its tracking with a large negative `Tc`.
+const TIGHT_TRACKING_FIXTURE: &str = CORPUS[5].0;
 
 /// Open a document, or `None` when the fixture is absent.
 ///
@@ -430,4 +447,248 @@ fn text_inside_form_xobjects_is_found() {
         !text.contains(char::REPLACEMENT_CHARACTER),
         "form text did not decode: {text}"
     );
+}
+
+#[test]
+fn character_spacing_does_not_leak_past_a_restore() {
+    // `1.pdf` sets `-4.02 Tc` inside a `q … Q` block. Leaking it advanced every
+    // later glyph 4pt too little, so the computed positions collapsed into each
+    // other and text sorted by position came out shuffled:
+    //
+    //   before:  الشركةع البرو طةين– ات رنساشن وايلن
+    //   after:   الشركة عبر الوطنية – ترانس ناشيونال
+    //
+    // Every character was present and correct; only their order was wrong,
+    // which is the kind of failure that reads as a bad extractor rather than a
+    // bug (PLAN.md §10.17).
+    let Some(doc) = open(SPACING_FIXTURE) else {
+        return;
+    };
+    let text = doc.page(1).expect("page 1").text();
+
+    for expected in [
+        "الشركة عبر الوطنية",
+        "ترانس ناشيونال",
+        "الشركة متعددة الجنسيات",
+    ] {
+        assert!(text.contains(expected), "expected {expected:?} in: {text}");
+    }
+}
+
+#[test]
+fn letters_drawn_on_top_of_their_neighbour_land_in_the_right_place() {
+    // `3.pdf` draws the `ز` of `ميزات` and the `ر` of `المشروع` with **zero
+    // advance**, positioned inside the adjacent glyph's ink and nearly 4pt
+    // above the baseline. Ordered by their own coordinates they came out as
+    // `م زيات` and `المرشوع`, and one was thrown onto a line of its own:
+    //
+    //   before:  زر
+    //            الغرض من هذا المستند هو تحديد مي ات المشوع، …
+    //   after:   الغرض من هذا المستند هو تحديد ميزات المشروع، …
+    //
+    // A glyph that does not move the pen cannot be ordered by where its ink
+    // lands; it belongs with the glyph it was drawn over (PLAN.md §10.18).
+    let Some(doc) = open(OVERLAY_FIXTURE) else {
+        return;
+    };
+    let text = doc.page(3).expect("page 3").text();
+
+    for expected in ["ميزات", "المشروع"] {
+        assert!(text.contains(expected), "expected {expected:?} in: {text}");
+    }
+    for corrupted in ["مي ات", "المشوع", "م زيات", "المرشوع"] {
+        assert!(
+            !text.contains(corrupted),
+            "found the corrupted form {corrupted:?}"
+        );
+    }
+}
+
+#[test]
+fn glyphs_the_font_declares_meaningless_are_not_emitted() {
+    // `8.pdf` renders some Arabic letters in two pieces and maps the second to
+    // U+FFFD in its own `/ToUnicode`:
+    //
+    //     <B0> <0634>   ش
+    //     <FB> <FFFD>   the rest of it
+    //
+    // That is the producer stating the glyph carries no text — the opposite of
+    // *our* U+FFFD, which means we failed to read something. Emitting it broke
+    // words apart: `التشريعية` came out `الت�شريعية` (PLAN.md §10.20).
+    let Some(doc) = open(NO_TEXT_GLYPH_FIXTURE) else {
+        return;
+    };
+
+    let page5 = doc.page(5).expect("page 5").text();
+    for expected in ["التشريعية", "المستويات", "المرسوم", "السلطاني", "بإصدار"]
+    {
+        assert!(page5.contains(expected), "expected {expected:?} in page 5");
+    }
+
+    // The whole document should carry only a handful, where the font really
+    // does leave a letter unreadable rather than declaring it blank.
+    let remaining: usize = doc
+        .pages()
+        .iter()
+        .map(|p| p.text().matches(char::REPLACEMENT_CHARACTER).count())
+        .sum();
+    assert!(remaining < 20, "{remaining} replacement characters remain");
+}
+
+#[test]
+fn dropping_a_meaningless_glyph_also_repairs_the_order() {
+    // The same glyphs were breaking the *sequence*, not only inserting a
+    // character: `يؤكد` extracted as `ي�كؤد`, with the `ؤ` and `ك` swapped
+    // around the intruder. Removing it put them back.
+    let Some(doc) = open(NO_TEXT_GLYPH_FIXTURE) else {
+        return;
+    };
+    let text = doc.page(10).expect("page 10").text();
+
+    assert!(text.contains("يؤكد"), "expected `يؤكد` in page 10");
+    assert!(!text.contains("كؤد"), "the letters are still transposed");
+}
+
+#[test]
+fn a_hamza_painted_over_its_letter_is_not_a_second_letter() {
+    // `8.pdf` draws `إ` as a zero-advance overlay on the glyph carrying the
+    // alef — and sometimes on a `لإ` ligature that already includes it. Both
+    // carry Unicode, so emitting both doubled the hamza: `والإدارية` came out
+    // `والإإدارية`, 277 times across the document (PLAN.md §10.21).
+    let Some(doc) = open(NO_TEXT_GLYPH_FIXTURE) else {
+        return;
+    };
+
+    let doubled: usize = doc
+        .pages()
+        .iter()
+        .map(|p| {
+            let t = p.text();
+            ["أأ", "إإ", "آآ", "ؤؤ", "ئئ"]
+                .iter()
+                .map(|pair| t.matches(pair).count())
+                .sum::<usize>()
+        })
+        .sum();
+    assert_eq!(doubled, 0, "{doubled} doubled hamzas remain");
+
+    assert!(doc.page(5).expect("page 5").text().contains("والإدارية"));
+    assert!(doc.page(6).expect("page 6").text().contains("الأدبية"));
+}
+
+#[test]
+fn tight_tracking_does_not_split_every_letter() {
+    // `12.pdf` sets `-0.75 Tc` against a `Tf` of 1, compensating with large
+    // `TJ` kerns. The positions were right all along; the *reported* advance
+    // included `Tc` and so went negative, and the word-gap rule then fired
+    // between every pair of letters:
+    //
+    //   before:  ت ق ر ی ر ا ل م ر ا ج ع ا ل م س ت ق ل
+    //   after:   تقریر المراجع المستقل
+    //
+    // `Tc` is spacing between glyphs, not part of one (PLAN.md §10.22).
+    let Some(doc) = open(TIGHT_TRACKING_FIXTURE) else {
+        return;
+    };
+
+    for number in 4..=11 {
+        let text = doc.page(number).expect("page exists").text();
+        // A page split letter-by-letter is more than half spaces.
+        let spaces = text.chars().filter(|c| *c == ' ').count();
+        let total = text.chars().filter(|c| !c.is_whitespace()).count().max(1);
+        assert!(
+            spaces * 2 < total,
+            "page {number} is {spaces} spaces to {total} characters — still split"
+        );
+    }
+
+    assert!(doc
+        .page(5)
+        .expect("page 5")
+        .text()
+        .contains("تقریر المراجع المستقل"));
+}
+
+#[test]
+fn a_table_with_no_ruling_is_still_a_table() {
+    // Page 12 of `12.pdf` is a financial statement drawn with no lines at all:
+    // six columns held together by alignment alone. The XY-cut separated three
+    // of them and merged the rest, so `1,653,281 1,637,299 24` arrived as one
+    // line (PLAN.md §10.23).
+    let Some(doc) = open(TIGHT_TRACKING_FIXTURE) else {
+        return;
+    };
+    let page = doc.page(12).expect("page 12");
+
+    let table = page
+        .blocks
+        .iter()
+        .find_map(|b| match b {
+            qalam_core::Block::Table(t) => Some(&t.table),
+            _ => None,
+        })
+        .expect("page 12 has a table");
+
+    assert_eq!(table.column_count(), 6);
+    assert!(table.row_count() > 20);
+    // Inferred, so it must not claim a ruled grid's confidence.
+    assert!(table.confidence < 1.0);
+
+    // A data row, right to left: label, note, then two currencies of two years.
+    let row = table
+        .rows
+        .iter()
+        .find(|r| r.first().is_some_and(|c| c.text == "إيرادات"))
+        .expect("the revenue row");
+    let cells: Vec<&str> = row.iter().map(|c| c.text.as_str()).collect();
+    assert_eq!(
+        cells,
+        [
+            "إيرادات",
+            "24",
+            "1,637,299",
+            "1,653,281",
+            "436,613",
+            "440,875"
+        ]
+    );
+}
+
+#[test]
+fn the_same_table_is_found_with_and_without_ruling() {
+    // `21.pdf` and `22.pdf` are the same document twice: one draws its table
+    // borders, the other does not. The ruled one always worked; the borderless
+    // one produced nothing at all, because its row numbers sit about 3pt below
+    // the rest of their row and split every row in two (PLAN.md §10.24).
+    //
+    // No goldens for these two — they are large, and what matters is the
+    // structure rather than the exact bytes.
+    let count_tables = |path: &str| -> Option<(usize, usize, usize)> {
+        let doc = open(path)?;
+        let tables: Vec<&qalam_core::TableBlock> = doc
+            .pages()
+            .iter()
+            .flat_map(|p| &p.blocks)
+            .filter_map(|b| match b {
+                qalam_core::Block::Table(t) => Some(t),
+                _ => None,
+            })
+            .collect();
+        let widest = tables
+            .iter()
+            .map(|t| t.table.column_count())
+            .max()
+            .unwrap_or(0);
+        Some((doc.page_count(), tables.len(), widest))
+    };
+
+    if let Some((pages, tables, columns)) = count_tables("../../tests/fixtures/21.pdf") {
+        assert_eq!(tables, pages, "the ruled document: one table per page");
+        assert!(columns >= 8, "the ruled document lost columns");
+    }
+
+    if let Some((pages, tables, columns)) = count_tables("../../tests/fixtures/22.pdf") {
+        assert_eq!(tables, pages, "the borderless document: one table per page");
+        assert!(columns >= 8, "the borderless document lost columns");
+    }
 }

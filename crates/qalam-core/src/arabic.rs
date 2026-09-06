@@ -76,6 +76,14 @@ impl TextLine {
 struct Placed {
     glyph: Glyph,
     actual: Option<String>,
+    /// Where this glyph sits in the *sequence*, which is not always where it is
+    /// drawn — see [`anchor_zero_advance`].
+    anchor_along: f64,
+    /// Which line it belongs to, likewise.
+    anchor_across: f64,
+    /// Whether this glyph was found to be drawn *on top of* another — see
+    /// [`anchor_zero_advance`].
+    overlaid: bool,
 }
 
 /// Turn one page's glyphs into lines of correct, logical-order text.
@@ -121,10 +129,11 @@ pub fn reconstruct_regions(
     extra_boxes: &[Rect],
     order: Option<&ReadingOrder>,
 ) -> Vec<Region> {
-    let placed = apply_actual_text(page);
+    let mut placed = apply_actual_text(page);
     if placed.is_empty() && extra_boxes.is_empty() {
         return Vec::new();
     }
+    anchor_zero_advance(&mut placed, fonts);
 
     // A tagged document states its own reading order, and a statement beats an
     // inference. Fall through to geometry whenever there is no usable tree —
@@ -180,6 +189,43 @@ pub fn reconstruct_regions(
             })
         })
         .collect()
+}
+
+/// The text of the glyphs whose centres fall inside `bbox`.
+///
+/// Used for the cells of a **borderless** table, where the columns were
+/// inferred rather than drawn. A ruled table can be filled from the lines the
+/// pipeline already built ([`crate::tables::fill`]), because its cell walls
+/// also split those lines. An inferred grid has no such luck: the page-level
+/// cut never saw its column boundaries, so a single line runs straight across
+/// several cells — `1,653,281 1,637,299 24` is three of them.
+///
+/// So the cell is re-read from the glyphs. The full pipeline runs on the subset
+/// — overlays anchored, order resolved, marks placed, NFKC applied — which is
+/// what keeps a cell's Arabic as correct as a paragraph's.
+pub fn text_within(page: &PageGlyphs, fonts: &FontMap, bbox: Rect) -> String {
+    let mut placed = apply_actual_text(page);
+    anchor_zero_advance(&mut placed, fonts);
+
+    placed.retain(|p| {
+        let g = &p.glyph;
+        let cx = g.x + g.advance / 2.0;
+        let cy = g.y;
+        cx >= bbox.x0 && cx <= bbox.x1 && cy >= bbox.y0 && cy <= bbox.y1
+    });
+
+    let lines: Vec<TextLine> = group_into_lines(&placed)
+        .into_iter()
+        .filter_map(|line| build_line(&line, fonts))
+        .collect();
+
+    // A cell's own line breaks are the column's width talking, not the
+    // author's, so they are joined with a space.
+    lines
+        .iter()
+        .map(|l| l.text.as_str())
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// Build regions from a tagged document's structure tree.
@@ -256,7 +302,96 @@ fn region_bbox(lines: &[TextLine], extras: &[usize], extra_boxes: &[Rect]) -> Re
         .unwrap_or(Rect::new(0.0, 0.0, 0.0, 0.0))
 }
 
-/// The box a glyph occupies, for the layout pass.
+/// Give an overlay glyph the sequence position of the glyph painted before it.
+///
+/// # Why a position is not always a place in the sequence
+///
+/// Grouping and ordering by geometry rests on one assumption: that a glyph's
+/// coordinates say where it comes in the text. For a glyph that **advances the
+/// pen** that holds — it was placed after its predecessor and before its
+/// successor, and the arithmetic guarantees it.
+///
+/// A glyph with **zero advance** breaks the assumption. It moves nothing, so
+/// its coordinates say only where the ink lands, which can be anywhere: on top
+/// of its neighbour, above the line, inside the previous letter's box. Page 3
+/// of `3.pdf` draws the `ز` of `ميزات` and the `ر` of `المشروع` this way —
+/// zero advance, positioned inside the adjacent glyph and nearly 4pt above the
+/// baseline. Sorted by their own coordinates they became `م زيات` and
+/// `المرشوع`, and one of them was thrown onto a line of its own.
+///
+/// For such a glyph the only reliable signal is the glyph it was drawn **on
+/// top of**: it inherits that glyph's sequence position, and painting order
+/// breaks the tie, so the two stay together. Combining marks are the
+/// exception, and a zero-advance glyph that overlaps nothing keeps its own
+/// position — see the body.
+///
+/// The real coordinates are left untouched in the [`Glyph`], because bounding
+/// boxes should still describe where the ink actually is.
+fn anchor_zero_advance(placed: &mut [Placed], fonts: &FontMap) {
+    /// How far to look, in painting order, for the glyph an overlay sits on.
+    /// A producer draws the two together, so the base is a few glyphs away.
+    const WINDOW: usize = 8;
+
+    for i in 0..placed.len() {
+        let glyph = &placed[i].glyph;
+        if advances_pen(glyph) {
+            continue;
+        }
+
+        // A **combining mark** is excluded, and this is the whole subtlety.
+        // A mark is drawn over its base and belongs *after* it in logical
+        // order, which the existing mark handling arranges by reading the
+        // mark's own position (PLAN.md §10.5). Anchoring it would move it to
+        // the wrong side of that base — in `test_for_arabic_barser.pdf` it
+        // turned `تصورًا` into `تصوراً`.
+        let text = placed[i]
+            .actual
+            .clone()
+            .or_else(|| fonts.decode(&glyph.style.font, glyph.code))
+            .unwrap_or_default();
+        if is_mark_glyph(&text) {
+            continue;
+        }
+
+        let (along, across, size) = (
+            placed[i].anchor_along,
+            placed[i].anchor_across,
+            glyph.style.size,
+        );
+
+        // Find a glyph this one is drawn *on top of*. Containment is the test
+        // that matters: a zero-advance glyph inside another's ink cannot be
+        // ordered by its own coordinate, because that coordinate says where the
+        // ink landed rather than where the glyph belongs. One that sits clear
+        // of its neighbours is merely missing an advance, and its position is
+        // still meaningful — punctuation in `1.pdf` is exactly that, and
+        // anchoring it moved full stops to the front of their line.
+        let lo = i.saturating_sub(WINDOW);
+        let hi = (i + WINDOW + 1).min(placed.len());
+
+        // Copy the host's coordinates out before mutating, so the borrow of
+        // `placed` ends before the assignment begins.
+        let host = placed[lo..hi]
+            .iter()
+            .find(|other| {
+                advances_pen(&other.glyph)
+                    // On the same line, so an overlay cannot adopt a glyph
+                    // above it.
+                    && (other.anchor_across - across).abs() <= size
+                    && other.anchor_along < along
+                    && along < other.anchor_along + other.glyph.advance
+            })
+            .map(|other| (other.anchor_along, other.anchor_across));
+
+        if let Some((host_along, host_across)) = host {
+            placed[i].anchor_along = host_along;
+            placed[i].anchor_across = host_across;
+            placed[i].overlaid = true;
+        }
+    }
+}
+
+/// The box a glyph occupies, for the layout pass./// The box a glyph occupies, for the layout pass./// The box a glyph occupies, for the layout pass.
 ///
 /// Heights are approximated from the type size, the same way [`line_bbox`] does
 /// it — a glyph's true ink extent needs per-glyph bounding boxes from the font
@@ -307,6 +442,9 @@ fn apply_actual_text(page: &PageGlyphs) -> Vec<Placed> {
         .glyphs
         .iter()
         .map(|glyph| Placed {
+            anchor_along: glyph.along(),
+            anchor_across: glyph.across(),
+            overlaid: false,
             glyph: glyph.clone(),
             actual: None,
         })
@@ -355,18 +493,25 @@ fn group_into_lines(glyphs: &[Placed]) -> Vec<Vec<Placed>> {
     // Sort top-to-bottom. PDF's y grows upwards, so descending y is reading
     // order down the page.
     let mut sorted: Vec<Placed> = glyphs.to_vec();
+    // `f64` is only `PartialOrd` — NaN has no place in an ordering — so
+    // `sort_by` needs a total order. `total_cmp` provides one, and a NaN
+    // coordinate from a malformed file sorts to one end instead of corrupting
+    // the sort or panicking.
+    //
+    // The keys are the *anchors*, not the raw coordinates: a glyph that does
+    // not advance the pen sits wherever its ink lands, which need not be where
+    // it belongs in the text (see `anchor_zero_advance`). `sort_by` is stable,
+    // so equal anchors keep painting order — which is exactly what holds such a
+    // glyph beside the one it was drawn on top of.
     sorted.sort_by(|a, b| {
-        let (a, b) = (&a.glyph, &b.glyph);
-        // `f64` is only `PartialOrd` — NaN has no place in an ordering — so
-        // `sort_by` needs a total order. `total_cmp` provides one, and a NaN
-        // coordinate from a malformed file sorts to one end instead of
-        // corrupting the sort or panicking.
-        b.y.total_cmp(&a.y).then(a.x.total_cmp(&b.x))
+        b.anchor_across
+            .total_cmp(&a.anchor_across)
+            .then(a.anchor_along.total_cmp(&b.anchor_along))
     });
 
     let mut lines: Vec<Vec<Placed>> = Vec::new();
     let mut current: Vec<Placed> = Vec::new();
-    let mut current_across = sorted[0].glyph.across();
+    let mut current_across = sorted[0].anchor_across;
     let mut current_orientation = sorted[0].glyph.orientation;
 
     for placed in sorted {
@@ -377,11 +522,11 @@ fn group_into_lines(glyphs: &[Placed]) -> Vec<Vec<Placed>> {
 
         // Text running a different way is never the same line, however close.
         let turned = placed.glyph.orientation != current_orientation;
-        let moved = (placed.glyph.across() - current_across).abs() > tolerance;
+        let moved = (placed.anchor_across - current_across).abs() > tolerance;
 
         if (turned || moved) && !current.is_empty() {
             lines.push(std::mem::take(&mut current));
-            current_across = placed.glyph.across();
+            current_across = placed.anchor_across;
             current_orientation = placed.glyph.orientation;
         }
         current.push(placed);
@@ -403,13 +548,17 @@ fn build_line(placed: &[Placed], fonts: &FontMap) -> Option<TextLine> {
     // Left to right, which is the order the glyphs were painted in — the
     // *visual* order we are about to undo.
     let mut ordered: Vec<&Placed> = placed.iter().collect();
-    ordered.sort_by(|a, b| a.glyph.along().total_cmp(&b.glyph.along()));
+    // Stable, so glyphs sharing an anchor keep painting order.
+    ordered.sort_by(|a, b| a.anchor_along.total_cmp(&b.anchor_along));
 
     // Decode every glyph up front. The base direction decides how combining
     // marks are placed, and that cannot be known until the text exists.
-    let decoded: Vec<(&Placed, Option<Piece>)> = ordered
+    let decoded: Vec<(&Placed, Option<Piece>, bool)> = ordered
         .iter()
         .map(|item| {
+            // Whether a source answered at all, as opposed to answering with
+            // U+FFFD. The two are told apart where the pieces are consumed.
+            let mut decoded_ok = true;
             let piece = match &item.actual {
                 // Rung one of the chain: the writer told us outright what this
                 // run says, so nothing else is consulted.
@@ -421,18 +570,26 @@ fn build_line(placed: &[Placed], fonts: &FontMap) -> Option<TextLine> {
                         // Silently dropping it would turn "we cannot read this"
                         // into "there was nothing here" — the exact deception this
                         // project exists to avoid.
-                        None => Piece::Decoded(char::REPLACEMENT_CHARACTER.to_string()),
+                        //
+                        // Note the asymmetry with a font that *maps* a code to
+                        // U+FFFD itself, handled below: that is the producer
+                        // saying the glyph has no text, which is a statement,
+                        // not a failure.
+                        None => {
+                            decoded_ok = false;
+                            Piece::Decoded(char::REPLACEMENT_CHARACTER.to_string())
+                        }
                     },
                 ),
             };
-            (*item, piece)
+            (*item, piece, decoded_ok)
         })
         .collect();
 
     let direction = bidi::detect_direction(
         &decoded
             .iter()
-            .filter_map(|(_, p)| p.as_ref().map(piece_str))
+            .filter_map(|(_, p, _)| p.as_ref().map(piece_str))
             .collect::<String>(),
     );
 
@@ -449,22 +606,49 @@ fn build_line(placed: &[Placed], fonts: &FontMap) -> Option<TextLine> {
     // Where combining marks for the current base letter go. See below.
     let mut mark_slot: Option<usize> = None;
 
-    for (item, piece) in decoded {
+    // A hamza-style overlay waiting for the letter it modifies — see
+    // `merge_hamza`. Holds the piece's index, the composed character, and the
+    // base letter it is composed from.
+    let mut pending_hamza: Option<(usize, char, char)> = None;
+
+    for (item, piece, decoded_ok) in decoded {
         let glyph = &item.glyph;
         let Some(piece) = piece else { continue };
-        let text = piece_str(&piece);
+        let text = piece_str(&piece).to_string();
+
+        // Two glyphs can both come back as U+FFFD, and they mean opposite
+        // things.
+        //
+        // If **we** could not resolve the code, the character is lost and must
+        // be reported — that is `decoded_ok == false`, and the U+FFFD stays.
+        //
+        // If the **font's own `/ToUnicode`** maps the code to U+FFFD, the
+        // producer is stating that this glyph carries no text. Page 5 of
+        // `8.pdf` does exactly that for four codes, which draw the second half
+        // of a letter whose first half is mapped normally: `<B0> <0634>` is
+        // `ش` and `<FB> <FFFD>` is the rest of it. Keeping those turned
+        // `التشريعية` into `الت�شريعية` — a word broken by ink that was never
+        // text (PLAN.md §10.20).
+        if decoded_ok && text.chars().all(|c| c == char::REPLACEMENT_CHARACTER) {
+            // Still advances the pen, so `right_edge` is updated below; it just
+            // contributes no characters.
+            let end = glyph.along() + glyph.advance;
+            right_edge = Some(right_edge.map_or(end, |e| e.max(end)));
+            continue;
+        }
 
         if text == "\u{FFFD}" {
             unresolved += 1;
         }
 
-        let is_mark = is_mark_glyph(glyph, text);
+        let is_mark = is_mark_glyph(&text);
 
         // Some PDFs separate words by moving the pen rather than painting a
         // space glyph. Detect that as a gap wider than a fraction of the type
-        // size, and only when a space is not already there. A mark is drawn on
-        // top of the letter before it, so it can never open a word.
-        if !is_mark {
+        // size, and only when a space is not already there. A glyph that does
+        // not move the pen is drawn on top of its neighbour, so it can never
+        // open a word.
+        if advances_pen(glyph) {
             if let Some(edge) = right_edge {
                 let gap = glyph.along() - edge;
                 let already_spaced = matches!(pieces.last(), Some(Piece::Decoded(t)) if t == " ");
@@ -485,6 +669,42 @@ fn build_line(placed: &[Placed], fonts: &FontMap) -> Option<TextLine> {
             continue;
         }
 
+        // A space drawn *on top of* a letter separates nothing — it moves no
+        // pen and covers no ground. Page 3 of `3.pdf` paints one inside the
+        // word `ميزات`, and emitting it split the word in two.
+        //
+        // The containment test is what makes this safe: a narrow space that
+        // merely lacks an advance but stands clear of its neighbours is still a
+        // real gap between words, and dropping those cost `1.pdf` the space
+        // after a colon.
+        if item.overlaid && !text.is_empty() && text.chars().all(char::is_whitespace) {
+            continue;
+        }
+
+        // A hamza drawn over the letter it belongs to is one letter, not two.
+        let merged = pending_hamza
+            .take()
+            .filter(|_| advances_pen(glyph))
+            .and_then(|(slot, composed, base)| {
+                merge_hamza(&text, base, composed).map(|merged| (slot, merged))
+            });
+        if let Some((slot, merged)) = merged {
+            if std::env::var_os("QALAM_DBG").is_some() {
+                eprintln!(
+                    "MERGE slot={slot} at_slot={:?} host={:?} -> {:?} len={}",
+                    pieces.get(slot).map(piece_str),
+                    text,
+                    merged,
+                    pieces.len()
+                );
+            }
+            // The overlay is now inside this piece, so its own is dropped.
+            pieces.remove(slot);
+            pieces.push(Piece::Decoded(merged));
+            mark_slot = Some(pieces.len() - 1);
+            continue;
+        }
+
         match (is_mark, direction, mark_slot) {
             // An RTL mark is emitted *before* its base, so that the reorder
             // below — which reverses the whole run — lands it *after* the base,
@@ -501,6 +721,14 @@ fn build_line(placed: &[Placed], fonts: &FontMap) -> Option<TextLine> {
                 mark_slot = Some(pieces.len() - 1);
             }
         }
+
+        // Remember a hamza-style overlay so the next pen-advancing glyph can
+        // absorb it. Only zero-advance glyphs qualify: a hamza that occupies
+        // space of its own is a letter in its own right.
+        pending_hamza = (!advances_pen(glyph))
+            .then(|| decompose_composed(&text))
+            .flatten()
+            .map(|(composed, base)| (pieces.len() - 1, composed, base));
     }
 
     // ---- the order-of-operations rule -----------------------------------
@@ -526,6 +754,12 @@ fn build_line(placed: &[Placed], fonts: &FontMap) -> Option<TextLine> {
     // and that space would split a word in half. Observed on page 5 of the
     // fixture, where `تتضمّن` came out as `تتض َّمن`.
     let text = tidy_whitespace(&strip_mark_bases(&normalised));
+    if std::env::var_os("QALAM_DBG").is_some() && text.contains("\u{0625}\u{0625}") {
+        eprintln!(
+            "PIECES: {:?}",
+            pieces.iter().map(piece_str).collect::<Vec<_>>()
+        );
+    }
     if text.is_empty() {
         return None;
     }
@@ -729,6 +963,72 @@ fn unify_digit_runs(text: &str) -> String {
     out
 }
 
+/// Split a composed Arabic letter into itself and the base it is built on.
+///
+/// `إ` is canonically `ا` plus a hamza below, `ؤ` is `و` plus a hamza above,
+/// and so on. Returns `None` for anything that is a letter in its own right.
+///
+/// The decomposition is asked of Unicode rather than tabulated, so the set is
+/// whatever the standard says it is.
+fn decompose_composed(text: &str) -> Option<(char, char)> {
+    let mut chars = text.chars();
+    let composed = chars.next()?;
+    if chars.next().is_some() {
+        // More than one character is a ligature or an expansion, not a letter
+        // with a mark on it.
+        return None;
+    }
+
+    let mut parts = text.nfd();
+    let base = parts.next()?;
+    let mark = parts.next()?;
+
+    // Exactly one base and one combining mark, and the mark must really be one.
+    if parts.next().is_some() || !is_combining_mark(mark) || base == composed {
+        return None;
+    }
+    Some((composed, base))
+}
+
+/// Fold a hamza overlay into the glyph it was drawn over.
+///
+/// # Why the letter arrives twice
+///
+/// `8.pdf` renders `لإ` as two glyphs at the **same x**: a `لا` ligature that
+/// advances the pen, and a zero-advance `إ` painted on top of it. Both carry
+/// Unicode, so emitting both gives `لا` *and* `إ` — one alef too many, which
+/// is how `والإدارية` became `والإإدارية`.
+///
+/// The overlay is not an extra letter; it says the alef already in the host is
+/// really an alef-with-hamza. So the host's copy of that base letter is
+/// replaced by the composed character.
+///
+/// Returns `None` unless the host contains **exactly one** occurrence of the
+/// base letter. With two, there is no way to tell which the hamza belongs to,
+/// and guessing would move it onto the wrong letter. The host may instead
+/// already *contain* the composed letter, where the font supplied a ligature
+/// and painted the hamza over it anyway; then the overlay adds nothing.
+fn merge_hamza(host: &str, base: char, composed: char) -> Option<String> {
+    // The host already carries the composed letter — the font supplied a `لإ`
+    // ligature *and* painted a hamza over it. The overlay is then redundant,
+    // and the host stands as it is.
+    if host.contains(composed) {
+        return Some(host.to_string());
+    }
+
+    // Otherwise the host holds the bare letter and the overlay says which one
+    // wears the hamza. Exactly one occurrence, or there is no way to tell which
+    // it belongs to and guessing would put it on the wrong letter.
+    if host.chars().filter(|c| *c == base).count() != 1 {
+        return None;
+    }
+    Some(
+        host.chars()
+            .map(|c| if c == base { composed } else { c })
+            .collect(),
+    )
+}
+
 /// Remove the placeholder space that NFKC puts before an isolated mark.
 ///
 /// A space directly followed by a combining mark is not real text: it is the
@@ -769,10 +1069,9 @@ fn piece_str(piece: &Piece) -> &str {
 /// fires and splits a word in half. Observed on page 5 of the test fixture:
 /// `تتضمّن` came out as `تتض َّمن`.
 ///
-/// Two independent guards, either of which alone fixes it:
-/// the running maximum in `build_line`, and this test, which stops a mark from
-/// opening a word at all.
-fn is_mark_glyph(glyph: &Glyph, text: &str) -> bool {
+/// Two independent guards, either of which alone fixes it: the running maximum
+/// in `build_line`, and this test, which stops a mark from opening a word.
+fn is_mark_glyph(text: &str) -> bool {
     if text.is_empty() {
         // An `/ActualText` placeholder, not a mark.
         return false;
@@ -784,13 +1083,23 @@ fn is_mark_glyph(glyph: &Glyph, text: &str) -> bool {
     // decomposition's placeholder base (see `strip_mark_bases`).
     let normalised: String = text.nfkc().collect();
     let stripped = normalised.trim_start_matches(' ');
-    if !stripped.is_empty() && stripped.chars().all(is_combining_mark) {
-        return true;
-    }
+    !stripped.is_empty() && stripped.chars().all(is_combining_mark)
+}
 
-    // A glyph that does not move the pen cannot separate two words either.
-    const NEGLIGIBLE_ADVANCE: f64 = 0.05;
-    glyph.advance.abs() < glyph.style.size * NEGLIGIBLE_ADVANCE
+/// Does this glyph move the pen?
+///
+/// Kept separate from [`is_mark_glyph`] because the two questions only look
+/// alike. Every combining mark has a negligible advance, but **not every glyph
+/// with a negligible advance is a mark**: page 3 of `3.pdf` draws the `ز` of
+/// `ميزات` as a zero-advance overlay, and treating that letter as a mark moved
+/// it to the wrong side of its neighbour and produced `مياز ت`.
+///
+/// A glyph that does not move the pen cannot separate two words, which is all
+/// the word-gap rule needs to know.
+fn advances_pen(glyph: &Glyph) -> bool {
+    // Relative to the type size, so the threshold scales with the text.
+    const NEGLIGIBLE: f64 = 0.05;
+    glyph.advance.abs() >= glyph.style.size * NEGLIGIBLE
 }
 
 /// Is this character a combining mark that renders on top of another?
@@ -928,6 +1237,9 @@ mod tests {
         glyphs
             .into_iter()
             .map(|glyph| Placed {
+                anchor_along: glyph.along(),
+                anchor_across: glyph.across(),
+                overlaid: false,
                 glyph,
                 actual: None,
             })
@@ -1062,6 +1374,97 @@ mod tests {
         assert_eq!(lines.iter().map(|l| l.len()).sum::<usize>(), 2);
     }
 
+    // ---- hamza overlays --------------------------------------------------
+
+    #[test]
+    fn a_composed_letter_decomposes_to_its_base() {
+        // Asked of Unicode rather than tabulated, so the set is whatever the
+        // standard says it is.
+        assert_eq!(
+            decompose_composed("\u{0625}"),
+            Some(('\u{0625}', '\u{0627}'))
+        ); // إ → ا
+        assert_eq!(
+            decompose_composed("\u{0623}"),
+            Some(('\u{0623}', '\u{0627}'))
+        ); // أ → ا
+        assert_eq!(
+            decompose_composed("\u{0624}"),
+            Some(('\u{0624}', '\u{0648}'))
+        ); // ؤ → و
+        assert_eq!(
+            decompose_composed("\u{0626}"),
+            Some(('\u{0626}', '\u{064A}'))
+        ); // ئ → ي
+
+        // A plain letter is not composed of anything.
+        assert_eq!(decompose_composed("\u{0627}"), None);
+        // Nor is a ligature or an expansion.
+        assert_eq!(decompose_composed("\u{0644}\u{0627}"), None);
+        assert_eq!(decompose_composed(""), None);
+    }
+
+    #[test]
+    fn a_hamza_overlay_replaces_the_bare_letter_it_sits_on() {
+        // `8.pdf` paints a zero-advance `إ` on top of the glyph carrying the
+        // alef it belongs to. The overlay is not a second letter; it says the
+        // alef already there wears a hamza.
+        assert_eq!(
+            merge_hamza("\u{0644}\u{0627}", '\u{0627}', '\u{0625}').as_deref(),
+            Some("\u{0644}\u{0625}") // لا + إ overlay → لإ
+        );
+        assert_eq!(
+            merge_hamza("\u{0627}", '\u{0627}', '\u{0623}').as_deref(),
+            Some("\u{0623}") // ا + أ overlay → أ
+        );
+    }
+
+    #[test]
+    fn a_hamza_over_a_ligature_that_already_has_one_is_redundant() {
+        // The same font supplies a `لإ` ligature *and* paints the hamza over
+        // it. Keeping both gave `والإدارية` an extra hamza: `والإإدارية`.
+        assert_eq!(
+            merge_hamza("\u{0644}\u{0625}", '\u{0627}', '\u{0625}').as_deref(),
+            Some("\u{0644}\u{0625}")
+        );
+    }
+
+    #[test]
+    fn an_ambiguous_host_is_left_alone() {
+        // Two alefs and one hamza: nothing says which wears it, and putting it
+        // on the wrong one would be worse than leaving the overlay separate.
+        assert_eq!(
+            merge_hamza("\u{0627}\u{0644}\u{0627}", '\u{0627}', '\u{0625}'),
+            None
+        );
+        // A host with no alef at all is not the letter this hamza belongs to.
+        assert_eq!(merge_hamza("\u{0645}", '\u{0627}', '\u{0625}'), None);
+    }
+
+    #[test]
+    fn a_font_may_declare_a_glyph_to_carry_no_text() {
+        // `8.pdf` renders some letters in two pieces and maps the second to
+        // U+FFFD in its own `/ToUnicode`. That is a statement — "this glyph is
+        // ink, not text" — and the opposite of the U+FFFD we emit when a code
+        // defeats us.
+        let mut raw = crate::types::RawFont::new(crate::types::FontInfo {
+            resource_name: "T1_0".to_string(),
+            subtype: "Type1".to_string(),
+            base_font: None,
+            encoding: None,
+            code_to_unicode: crate::types::CodeToUnicode::ToUnicode,
+        });
+        raw.to_unicode = Some(b"2 beginbfchar\n<B0> <0634>\n<FB> <FFFD>\nendbfchar".to_vec());
+        let font = crate::font::Font::from_raw(raw);
+
+        // Both codes resolve; one resolves *to* the replacement character.
+        assert_eq!(font.decode(0xB0).as_deref(), Some("\u{0634}"));
+        assert_eq!(font.decode(0xFB).as_deref(), Some("\u{FFFD}"));
+        // A code the map does not mention resolves to nothing at all, which is
+        // the failure case and must stay distinguishable.
+        assert_eq!(font.decode(0x01), None);
+    }
+
     #[test]
     fn unresolved_glyphs_are_counted_for_the_detector() {
         let line = TextLine {
@@ -1116,7 +1519,7 @@ mod tests {
             let mut g = glyph(*x, 610.16, 11.0);
             g.advance = *adv;
             let piece = Piece::Decoded((*text).to_string());
-            if is_mark_glyph(&g, text) {
+            if is_mark_glyph(text) {
                 match slot {
                     Some(i) => pieces.insert(i, piece),
                     None => pieces.push(piece),
@@ -1143,35 +1546,25 @@ mod tests {
         // U+FC60 is a letter by category and has a non-zero advance, so neither
         // a raw character test nor an advance test alone would spot it. What
         // gives it away is that it *normalises* to nothing but marks.
-        let mut g = glyph(0.0, 0.0, 11.0);
-        g.advance = 1.353;
-        assert!(is_mark_glyph(&g, "\u{FC60}"));
+        assert!(is_mark_glyph("\u{FC60}"));
+        assert!(is_mark_glyph("\u{064B}"));
 
-        // A zero-advance mark in its base form.
-        let mut zero = glyph(0.0, 0.0, 11.0);
-        zero.advance = 0.0;
-        assert!(is_mark_glyph(&zero, "\u{064B}"));
-
-        // An ordinary letter is not a mark.
-        let mut letter = glyph(0.0, 0.0, 11.0);
-        letter.advance = 7.0;
-        assert!(!is_mark_glyph(&letter, "\u{FEE4}"));
+        // An ordinary letter is not a mark, whatever its advance.
+        assert!(!is_mark_glyph("\u{FEE4}"));
+        assert!(!is_mark_glyph("\u{0632}"));
     }
 
     #[test]
-    fn nfkc_supplies_a_space_base_that_we_remove() {
-        // The behaviour that caused the bug, asserted so the fix is not
-        // mistaken for arbitrary whitespace munging.
-        let expanded: String = "\u{FC60}".nfkc().collect();
-        assert!(
-            expanded.starts_with(' '),
-            "NFKC no longer prefixes a space; strip_mark_bases may be obsolete"
-        );
+    fn a_zero_advance_letter_is_not_a_mark() {
+        // Page 3 of `3.pdf` draws the `ز` of `ميزات` with zero advance, on top
+        // of its neighbour. Reading "does not move the pen" as "is a combining
+        // mark" moved it to the wrong side of that neighbour and produced
+        // `مياز ت`. The two questions are separate.
+        let mut zero = glyph(0.0, 0.0, 12.0);
+        zero.advance = 0.0;
 
-        assert_eq!(strip_mark_bases(" \u{064E}"), "\u{064E}");
-        // A space before an ordinary letter is real text and must survive.
-        assert_eq!(strip_mark_bases(" \u{0645}"), " \u{0645}");
-        assert_eq!(strip_mark_bases("a b"), "a b");
+        assert!(!advances_pen(&zero), "a zero advance does not move the pen");
+        assert!(!is_mark_glyph("\u{0632}"), "but `ز` is still a letter");
     }
 
     #[test]

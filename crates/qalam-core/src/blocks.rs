@@ -174,7 +174,29 @@ pub fn assemble(
     // Ruled tables, from the lines L1 saw painted. Detected before the blocks
     // are emitted so that a cell's text is claimed by its table rather than
     // being left in the ordinary flow as well.
-    let grids = tables::detect(&glyphs.ruled_lines);
+    let mut grids = tables::detect(&glyphs.ruled_lines);
+
+    // Then tables that were never ruled, inferred from alignment. Only where
+    // no ruled grid already covers the ground: a table that drew its lines has
+    // said what it is, and guessing over the top of that could only make it
+    // worse.
+    let items: Vec<crate::layout::Item> = glyphs
+        .glyphs
+        .iter()
+        .map(|g| crate::layout::Item {
+            x0: g.x,
+            x1: g.x + g.advance,
+            y0: g.y,
+            y1: g.y + g.style.size,
+            size: g.style.size,
+        })
+        .collect();
+
+    for inferred in tables::detect_borderless(&items) {
+        if !grids.iter().any(|g| overlaps(g.bbox, inferred.bbox)) {
+            grids.push(inferred);
+        }
+    }
 
     // Which positioned images a region claimed. The tagged path does not place
     // images at all, so anything left over is appended rather than lost.
@@ -207,7 +229,15 @@ pub fn assemble(
     let mut built: Vec<Option<Table>> = Vec::new();
 
     for grid in grids.iter() {
-        let (table, consumed) = tables::fill(grid, &all_lines, rtl);
+        // A ruled grid is filled from the lines the pipeline already built,
+        // because its cell walls also split those lines. An inferred grid has
+        // no walls, so a line can run across several of its cells and the text
+        // has to be re-read from the glyphs — see `arabic::text_within`.
+        let (table, consumed) = if grid.confidence >= 1.0 - f64::EPSILON || grid.was_ruled() {
+            tables::fill(grid, &all_lines, rtl)
+        } else {
+            fill_from_glyphs(grid, glyphs, fonts, &all_lines, rtl)
+        };
 
         // A grid with almost nothing in it is decoration, not a table — see
         // `Table::is_plausible`. Rejecting it here rather than in `detect`
@@ -298,6 +328,57 @@ pub fn assemble(
     }
 
     (blocks, all_lines)
+}
+
+/// Do two rectangles share any area?
+fn overlaps(a: Rect, b: Rect) -> bool {
+    a.x0 < b.x1 && b.x0 < a.x1 && a.y0 < b.y1 && b.y0 < a.y1
+}
+
+/// Fill an inferred grid by re-reading each cell from the page's glyphs.
+///
+/// Returns the table and the indices of the lines it covers, so those lines
+/// leave the ordinary flow exactly as a ruled table's do.
+fn fill_from_glyphs(
+    grid: &crate::tables::Grid,
+    glyphs: &PageGlyphs,
+    fonts: &FontMap,
+    lines: &[TextLine],
+    rtl: bool,
+) -> (crate::tables::Table, Vec<usize>) {
+    let mut rows = Vec::with_capacity(grid.row_count());
+    for row in 0..grid.row_count() {
+        let mut cells = Vec::with_capacity(grid.column_count());
+        for column in 0..grid.column_count() {
+            let Some(bbox) = grid.cell_box(row, column, rtl) else {
+                continue;
+            };
+            cells.push(crate::tables::Cell {
+                text: arabic::text_within(glyphs, fonts, bbox),
+                bbox,
+                row,
+                column,
+            });
+        }
+        rows.push(cells);
+    }
+
+    // Every line inside the grid belongs to it now.
+    let consumed = lines
+        .iter()
+        .enumerate()
+        .filter(|(_, l)| overlaps(l.bbox, grid.bbox))
+        .map(|(i, _)| i)
+        .collect();
+
+    (
+        crate::tables::Table {
+            rows,
+            bbox: grid.bbox,
+            confidence: grid.confidence,
+        },
+        consumed,
+    )
 }
 
 /// Build one image block.

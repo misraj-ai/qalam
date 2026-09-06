@@ -32,7 +32,7 @@
 use lopdf::content::{Content, Operation};
 use lopdf::Object;
 
-use crate::graphics::{ColorSpaceKind, GraphicsStack, Matrix};
+use crate::graphics::{ColorSpaceKind, GraphicsStack, Matrix, TextParams};
 use crate::types::{FontInfo, Glyph, RawForm, Style, TextOrientation, TextRenderMode};
 
 /// Supplies the advance width of a glyph, in fractions of an em.
@@ -204,31 +204,15 @@ pub struct PageGlyphs {
     pub ruled_lines: Vec<RuledLine>,
 }
 
-/// The text-object state, reset at every `BT`.
+/// The two text matrices, created by `BT` and dead at `ET`.
 ///
-/// PDF splits text state in two: *parameters* (font, spacing, mode) persist
-/// across `BT`/`ET` in the graphics state, while the two *matrices* are reset
-/// to identity by `BT`. We keep both here and only reset the matrices, which
-/// matches the spec and is a classic place to introduce a bug.
-#[derive(Debug, Clone)]
-struct TextState {
-    /// Resource name from `Tf`, e.g. `C2_0`.
-    font: String,
-    /// The `Tf` size operand — often a meaningless `1`, with the real scale in
-    /// the text matrix. Never report this as the font size (PLAN.md §10.1).
-    font_size: f64,
-    /// `Tc`, extra space after every glyph, in unscaled text units.
-    char_spacing: f64,
-    /// `Tw`, extra space after single-byte code 32 only.
-    word_spacing: f64,
-    /// `Tz` as a fraction: the operator takes a percentage, we store 1.0 for 100.
-    horizontal_scale: f64,
-    /// `TL`, the line height used by `T*`, `'` and `"`.
-    leading: f64,
-    /// `Ts`, superscript/subscript offset.
-    rise: f64,
-    /// `Tr`, how glyphs are painted — including mode 3, invisible.
-    render_mode: TextRenderMode,
+/// Everything *else* about text state — font, size, `Tc`, `Tw`, `Tz`, `TL`,
+/// `Tr`, `Ts` — lives in [`TextParams`] inside the graphics state, because
+/// ISO 32000 §8.4.1 puts it there and so `q`/`Q` must save and restore it.
+/// Only these two matrices are outside that, and they are outside it because
+/// they do not survive `ET` at all.
+#[derive(Debug, Clone, Default)]
+struct TextMatrices {
     /// `Tm`, the text matrix: where the next glyph goes.
     tm: Matrix,
     /// `Tlm`, the text *line* matrix: where the current line started, so `T*`
@@ -236,30 +220,12 @@ struct TextState {
     tlm: Matrix,
 }
 
-impl Default for TextState {
-    fn default() -> Self {
-        Self {
-            font: String::new(),
-            font_size: 0.0,
-            char_spacing: 0.0,
-            word_spacing: 0.0,
-            // 100%, stored as a fraction so it can be multiplied directly.
-            horizontal_scale: 1.0,
-            leading: 0.0,
-            rise: 0.0,
-            render_mode: TextRenderMode::Fill,
-            tm: Matrix::IDENTITY,
-            tlm: Matrix::IDENTITY,
-        }
-    }
-}
-
 /// Walks a page's operators and collects positioned, styled glyphs.
 struct Interpreter<'a> {
     /// Graphics state stack: transforms and colours (`q`, `Q`, `cm`, `rg`, ...).
     graphics: GraphicsStack,
-    /// Text state. Lives outside `BT`/`ET` because most of it persists.
-    text: TextState,
+    /// The text matrices. The rest of the text state is in the graphics stack.
+    text: TextMatrices,
     /// Fonts declared on this page, for deciding 1-byte vs 2-byte codes.
     fonts: &'a [FontInfo],
     /// The form XObjects this page can draw, by qualified name.
@@ -349,7 +315,7 @@ pub fn interpret_with_forms(
 
     let mut interp = Interpreter {
         graphics: GraphicsStack::new(),
-        text: TextState::default(),
+        text: TextMatrices::default(),
         fonts,
         widths,
         forms,
@@ -438,21 +404,24 @@ impl Interpreter<'_> {
                 if let Some(name) = op.operands.first().and_then(object_name) {
                     // Qualified, so a form's `C2_0` is not mistaken for the
                     // page's when the glyphs are decoded later.
-                    self.text.font = self.qualify(&name);
+                    let qualified = self.qualify(&name);
+                    self.params_mut().font = qualified;
                 }
                 if let Some(size) = nums.first() {
-                    self.text.font_size = *size;
+                    self.params_mut().font_size = *size;
                 }
             }
-            "Tc" => self.text.char_spacing = nums.first().copied().unwrap_or(0.0),
-            "Tw" => self.text.word_spacing = nums.first().copied().unwrap_or(0.0),
+            "Tc" => self.params_mut().char_spacing = nums.first().copied().unwrap_or(0.0),
+            "Tw" => self.params_mut().word_spacing = nums.first().copied().unwrap_or(0.0),
             // The operator's operand is a percentage; store it as a fraction.
-            "Tz" => self.text.horizontal_scale = nums.first().copied().unwrap_or(100.0) / 100.0,
-            "TL" => self.text.leading = nums.first().copied().unwrap_or(0.0),
-            "Ts" => self.text.rise = nums.first().copied().unwrap_or(0.0),
+            "Tz" => {
+                self.params_mut().horizontal_scale = nums.first().copied().unwrap_or(100.0) / 100.0
+            }
+            "TL" => self.params_mut().leading = nums.first().copied().unwrap_or(0.0),
+            "Ts" => self.params_mut().rise = nums.first().copied().unwrap_or(0.0),
             "Tr" => {
                 let mode = nums.first().copied().unwrap_or(0.0) as i64;
-                self.text.render_mode = TextRenderMode::from_operand(mode);
+                self.params_mut().render_mode = TextRenderMode::from_operand(mode);
             }
 
             // ---- text positioning ----------------------------------------
@@ -465,7 +434,7 @@ impl Interpreter<'_> {
                 if let [tx, ty] = nums[..] {
                     // `TD` is `Td` plus "set leading to -ty" — one operator
                     // doing two jobs, a common source of wrong line spacing.
-                    self.text.leading = -ty;
+                    self.params_mut().leading = -ty;
                     self.next_line(tx, ty);
                 }
             }
@@ -478,7 +447,7 @@ impl Interpreter<'_> {
                 }
             }
             "T*" => {
-                let leading = self.text.leading;
+                let leading = self.params().leading;
                 self.next_line(0.0, -leading);
             }
 
@@ -490,7 +459,7 @@ impl Interpreter<'_> {
             }
             "'" => {
                 // Move to the next line, then show.
-                let leading = self.text.leading;
+                let leading = self.params().leading;
                 self.next_line(0.0, -leading);
                 if let Some(bytes) = op.operands.first().and_then(object_string) {
                     self.show(bytes);
@@ -499,10 +468,10 @@ impl Interpreter<'_> {
             "\"" => {
                 // `aw ac string "` — set word and char spacing, then behave as `'`.
                 if let [aw, ac] = nums[..] {
-                    self.text.word_spacing = aw;
-                    self.text.char_spacing = ac;
+                    self.params_mut().word_spacing = aw;
+                    self.params_mut().char_spacing = ac;
                 }
-                let leading = self.text.leading;
+                let leading = self.params().leading;
                 self.next_line(0.0, -leading);
                 if let Some(bytes) = op.operands.get(2).and_then(object_string) {
                     self.show(bytes);
@@ -519,7 +488,9 @@ impl Interpreter<'_> {
                     } else if let Some(kern) = object_number(item) {
                         // A positive number moves *left* (closes up the text),
                         // hence the negation. Units are thousandths of an em.
-                        let tx = -kern / 1000.0 * self.text.font_size * self.text.horizontal_scale;
+                        let tx = -kern / 1000.0
+                            * self.params().font_size
+                            * self.params().horizontal_scale;
                         self.text.tm = Matrix::translation(tx, 0.0).then(self.text.tm);
                     }
                 }
@@ -790,7 +761,9 @@ impl Interpreter<'_> {
         self.graphics.current_mut().ctm =
             Matrix::new(m[0], m[1], m[2], m[3], m[4], m[5]).then(outer);
 
-        // The text object state does not survive into a form either.
+        // The text *matrices* do not survive into a form either. The text
+        // parameters are in the graphics state, so the `save` above already
+        // covers them.
         let saved_text = std::mem::take(&mut self.text);
         self.form_stack.push(
             qualified
@@ -809,6 +782,16 @@ impl Interpreter<'_> {
         self.form_stack.pop();
         self.text = saved_text;
         self.graphics.restore();
+    }
+
+    /// The text state parameters currently in force.
+    fn params(&self) -> &TextParams {
+        &self.graphics.current().text
+    }
+
+    /// The text state parameters, for modification.
+    fn params_mut(&mut self) -> &mut TextParams {
+        &mut self.graphics.current_mut().text
     }
 
     /// Set a fill or stroke colour from a `g`/`rg`/`k` family operator.
@@ -849,7 +832,7 @@ impl Interpreter<'_> {
         let two_byte = self
             .fonts
             .iter()
-            .find(|f| f.resource_name == self.text.font)
+            .find(|f| f.resource_name == self.params().font)
             .is_some_and(FontInfo::is_two_byte);
 
         if two_byte {
@@ -871,24 +854,23 @@ impl Interpreter<'_> {
 
     /// Emit one glyph at the current position and advance the text matrix.
     fn emit(&mut self, code: u32, is_space: bool) {
-        // Copy the scalars we need out of `self.text` first. Beyond avoiding
+        // Copy the parameters out of the graphics state first. Beyond avoiding
         // borrow-checker friction when we mutate `self.out` below, it keeps the
         // formula readable.
-        let font_size = self.text.font_size;
-        let h_scale = self.text.horizontal_scale;
+        let params = self.params();
+        let font_size = params.font_size;
+        let h_scale = params.horizontal_scale;
+        let rise = params.rise;
+        let render_mode = params.render_mode;
+        let char_spacing = params.char_spacing;
+        let word_spacing = params.word_spacing;
+        let font = params.font.clone();
         let ctm = self.graphics.current().ctm;
 
         // The text rendering matrix: font size and rise, then the text matrix,
         // then the page transform. This composition is what makes
         // `/C2_0 1 Tf` + `20.5559 ... Tm` come out as 20.56pt (PLAN.md §10.1).
-        let scaling = Matrix::new(
-            font_size * h_scale,
-            0.0,
-            0.0,
-            font_size,
-            0.0,
-            self.text.rise,
-        );
+        let scaling = Matrix::new(font_size * h_scale, 0.0, 0.0, font_size, 0.0, rise);
         let trm = scaling.then(self.text.tm).then(ctm);
 
         // The glyph origin is the transformed text-space origin, which for this
@@ -897,24 +879,33 @@ impl Interpreter<'_> {
 
         // Which colour a reader actually sees depends on the render mode.
         let state = self.graphics.current();
-        let color = if self.text.render_mode.paints_with_stroke_color() {
+        let color = if render_mode.paints_with_stroke_color() {
             state.stroke_color
         } else {
             state.fill_color
         };
 
-        // The advance, in unscaled text space. Word spacing applies to the
-        // single-byte code 32 only — never to a 2-byte code that equals 32.
-        let word = if is_space {
-            self.text.word_spacing
-        } else {
-            0.0
-        };
-        let width = self.widths.width(&self.text.font, code);
-        let tx = (width * font_size + self.text.char_spacing + word) * h_scale;
+        // The pen displacement, in unscaled text space. Word spacing applies
+        // to the single-byte code 32 only — never to a 2-byte code that equals
+        // 32.
+        let word = if is_space { word_spacing } else { 0.0 };
+        let width = self.widths.width(&font, code);
+        let tx = (width * font_size + char_spacing + word) * h_scale;
 
-        // Report the advance in device space, so it is directly comparable with
-        // the `x` above. `tm x ctm` (without the font-size scaling, which `tx`
+        // What we *report* is the glyph's own extent, without `Tc`/`Tw`.
+        //
+        // Those two are spacing *between* glyphs, not part of any glyph, and
+        // including them lets a large negative `Tc` produce a negative advance
+        // — which is meaningless as a width and corrupts everything built on
+        // it. `12.pdf` sets `-0.75 Tc` against a `Tf` of 1 and compensates with
+        // large `TJ` kerns: the positions come out right, but every reported
+        // advance was about -4pt, so the word-gap rule fired between every
+        // pair of letters and the page came back one character at a time
+        // (PLAN.md §10.22).
+        let ink = (width.max(0.0) * font_size * h_scale).abs();
+
+        // Report it in device space, so it is directly comparable with the `x`
+        // above. `tm x ctm` (without the font-size scaling, which `ink`
         // already includes) is what converts text space to device space.
         let to_device = self.text.tm.then(ctm);
 
@@ -925,13 +916,13 @@ impl Interpreter<'_> {
             // Where the matrix sends the unit x vector is the direction the
             // text advances, and so which way it is meant to be read.
             orientation: TextOrientation::from_advance(trm.a, trm.b),
-            advance: tx * to_device.horizontal_scale(),
+            advance: ink * to_device.horizontal_scale(),
             style: Style {
                 color,
-                font: self.text.font.clone(),
+                font,
                 // The *effective* size, not the `Tf` operand.
                 size: trm.vertical_scale(),
-                render_mode: self.text.render_mode,
+                render_mode,
             },
         });
 
@@ -1103,6 +1094,59 @@ mod tests {
     }
 
     #[test]
+    fn q_restores_the_character_spacing() {
+        // ISO 32000 §8.4.1: `Tc` is part of the *graphics* state, so `Q`
+        // restores it. Fixture `1.pdf` sets `-4.02 Tc` inside a `q … Q` block
+        // and relies on that; leaking it advanced every later glyph 4pt too
+        // little, so the computed positions collapsed together and text sorted
+        // by position came out shuffled (PLAN.md §10.17).
+        let out = run(
+            "q -4.02 Tc BT /F1 10 Tf (ab) Tj ET Q BT /F1 10 Tf (cd) Tj ET",
+            &[simple_font("F1")],
+        );
+        assert_eq!(out.glyphs.len(), 4);
+
+        // Inside the block the spacing applies: half an em at 10pt, less 4.02.
+        let inside = out.glyphs[1].x - out.glyphs[0].x;
+        assert!((inside - 0.98).abs() < 1e-6, "inside the block: {inside}");
+
+        // After `Q` it is gone, so the advance is the glyph width alone.
+        let after = out.glyphs[3].x - out.glyphs[2].x;
+        assert!((after - 5.0).abs() < 1e-6, "Tc leaked past `Q`: {after}");
+    }
+
+    #[test]
+    fn q_restores_every_text_parameter() {
+        // The whole set moves together, so a test for each would be six copies
+        // of the same thing. `Tz` stands in: it scales the advance, so a leak
+        // shows up as a position, which is what the pipeline actually consumes.
+        let out = run(
+            "q 50 Tz 4 Ts 2 Tr BT /F1 10 Tf (ab) Tj ET Q BT /F1 10 Tf (cd) Tj ET",
+            &[simple_font("F1")],
+        );
+        // Inside: 5pt of advance at 50% horizontal scale.
+        assert!((out.glyphs[1].x - out.glyphs[0].x - 2.5).abs() < 1e-6);
+        // After `Q`: full width, baseline back to 0, fill mode restored.
+        assert!((out.glyphs[3].x - out.glyphs[2].x - 5.0).abs() < 1e-6);
+        assert_eq!(out.glyphs[2].y, 0.0, "Ts leaked past `Q`");
+        assert_eq!(out.glyphs[2].style.render_mode, TextRenderMode::Fill);
+    }
+
+    #[test]
+    fn text_parameters_still_persist_across_bt_and_et() {
+        // `BT` resets the two matrices and nothing else. A font selected before
+        // one text object is still selected in the next.
+        let out = run(
+            "BT /F1 10 Tf 5 Tc (a) Tj ET BT (bc) Tj ET",
+            &[simple_font("F1")],
+        );
+        assert_eq!(out.glyphs.len(), 3);
+        assert_eq!(out.glyphs[1].style.font, "F1", "the font was reset by BT");
+        // And `Tc` is still in force: 5pt of width plus 5pt of spacing.
+        assert!((out.glyphs[2].x - out.glyphs[1].x - 10.0).abs() < 1e-6);
+    }
+
+    #[test]
     fn q_restores_the_colour_for_later_text() {
         let out = run(
             "1 0 0 rg q 0 0 1 rg BT /F1 12 Tf (a) Tj ET Q BT /F1 12 Tf (b) Tj ET",
@@ -1175,6 +1219,37 @@ mod tests {
         );
         // Render mode 1 outlines the glyph, so blue is what a reader sees.
         assert_eq!(out.glyphs[0].style.color, Color::Rgb(0.0, 0.0, 1.0));
+    }
+
+    #[test]
+    fn the_reported_advance_is_the_glyph_not_the_spacing() {
+        // `Tc` moves the pen between glyphs; it is not part of any glyph. A
+        // reported advance that includes it stops being a width — with a large
+        // negative `Tc` it goes negative, which is meaningless.
+        let plain = run("BT /F1 10 Tf (ab) Tj ET", &[simple_font("F1")]);
+        let tight = run("BT /F1 10 Tf -8 Tc (ab) Tj ET", &[simple_font("F1")]);
+
+        // The pen really does move less, so the second glyph sits further left.
+        assert!(tight.glyphs[1].x < plain.glyphs[1].x);
+
+        // But each glyph still occupies its own width, unchanged and positive.
+        assert_eq!(tight.glyphs[0].advance, plain.glyphs[0].advance);
+        assert!(tight.glyphs[0].advance > 0.0);
+    }
+
+    #[test]
+    fn a_negative_tc_never_yields_a_negative_advance() {
+        // `12.pdf` sets `-0.75 Tc` against a `Tf` of 1 and compensates with
+        // large `TJ` kerns. Positions come out right; the advance was about
+        // -4pt, so the word-gap rule fired between every pair of letters and
+        // the page came back one character at a time.
+        let out = run(
+            "BT /F1 1 Tf -0.75 Tc 0.75 Tw (abc) Tj ET",
+            &[simple_font("F1")],
+        );
+        for g in &out.glyphs {
+            assert!(g.advance >= 0.0, "negative advance: {}", g.advance);
+        }
     }
 
     #[test]

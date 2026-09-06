@@ -359,10 +359,11 @@ Rationale: `qalam-core` knows nothing about Python, so it stays independently us
   the interpreter now reports painted axis-aligned rules, `tables.rs` clusters them into a
   grid, and cells are filled with the text inside them, columns numbered right-to-left —
   see §10.11. 18 tables found in `bar_Persons.pdf`, none invented in the other fixture.
-  Rotated column headers read correctly (§10.14). **Still to do:** the tagged
-  `/Table`/`/TR`/`/TD` path — `bar_Persons.pdf` tags 21 tables and 1,709 cells, so the
-  information is sitting there — and borderless/alignment inference, which remains a
-  stretch and explicitly best-effort.
+  Rotated column headers read correctly (§10.14), and **borderless tables are inferred from
+  alignment** (§10.23) — 28 of them in `12.pdf`, none invented across the rest of the corpus.
+  **Still to do:** the tagged `/Table`/`/TR`/`/TD` path — `bar_Persons.pdf` tags 21 tables and
+  1,709 cells, so the information is sitting there — and column spans, which currently cut a
+  spanning header mid-word.
 - **M9 — HTML export (Tier D, stretch).** Render the block model to HTML: `dir="rtl"`,
   blocks in reading order, `Span` styling as inline CSS, extracted images inlined. Purely
   additive — it consumes the model, and needs no change to any layer below it.
@@ -508,6 +509,315 @@ The `/ToUnicode` stream is a PostScript-flavoured CMap. The parser only needs a 
 - Destinations are **UTF-16BE**, possibly multiple code units → decode to a `String`.
 It is NOT full PostScript; a small tokenizer over these keywords is enough. Do not pull in
 a PostScript interpreter.
+
+### 10.24 — A table row is a band, not a baseline
+
+`21.pdf` and `22.pdf` are the same document twice: one draws its table borders, the other does
+not. The ruled one gave a perfect 56x14 table on every page. The borderless one gave
+**nothing at all**, on any of its 41 pages — even after §10.23.
+
+The cause was two lines of arithmetic, not a missing idea. `22.pdf` sets its row numbers about
+**3pt below** the rest of their row, and the row grouping keys on the baseline. So every row
+split in two: a wide piece holding the record, and a 8pt-wide piece holding `55`. That halved
+nothing and doubled everything — 73 rows where there are 36 — and, worse, half of them now
+covered a sliver of the page, so no column boundary could gather the support §10.23 requires.
+
+**A table row is a horizontal band.** The cells in it need not share a baseline: a different
+font, a different script, or a smaller size shifts one by a point or two. The test that makes
+rejoining them safe is **horizontal disjointness** — two pieces of text at the same x cannot
+be one row however close their baselines, while two at different x, a fraction of a line
+apart, are one row in different columns. Consecutive lines of a paragraph overlap in x almost
+entirely, so they are never merged.
+
+A second correction fell out of the same file. A band reaches as far as the row spacing stays
+regular, which on a page whose table fills it is further than the table: `22.pdf` picked up the
+letterhead above and the notes below, and chopped them into cells that split words. Trimming
+the *ends* back to rows that honour the boundaries removes the notes, but not the letterhead —
+it sits in two corners with a wide gap between, so it honours every boundary while looking
+nothing like a row. What gives it away is **occupancy**: two columns out of eight. Only the
+ends are trimmed, because an interior row that spans — a section heading inside a financial
+statement — belongs to the table.
+
+Result: 41 tables across 41 pages of `22.pdf`, 10 across 10 of `21.pdf`, and the two files now
+agree. It also removed the mangled header from `12.pdf` noted in §10.23 — `ريا` / `ل سعودي`
+was a spanning row that the trim now excludes, so the currency labels come back as ordinary
+text instead of split cells.
+
+### 10.23 — A borderless table is one that no single projection can see
+
+`12.pdf` is a financial report whose tables are drawn with **no lines at all** — page 12 holds
+six columns held together by alignment alone. The page-level cut separated three of them and
+merged the rest, so a whole row of figures arrived as one line: `1,653,281 1,637,299 24`.
+
+Reconstruction reuses what the ruled path already has — `Grid`, `fill`, `is_plausible` — and
+adds two things.
+
+**The rows have to vote.** The obvious approach is the one `layout.rs` uses: project every
+item onto x and take the empty bands. It fails here, and not marginally. Page 12 carries a
+title above the table, a footer below it and section headings inside it, each spanning the
+full width; projected together with the body they leave **one** gap where there are five. So
+each row votes only over its own extent, and a position becomes a boundary when most of the
+rows crossing it leave it clear. One row that ignores the columns then cannot hide them.
+
+**A cell is re-read from the glyphs, not from the lines.** A ruled table can be filled from
+the lines the pipeline already built, because its cell walls also split those lines. An
+inferred grid has no walls: the page-level cut never saw its boundaries, so one line runs
+across several cells. `arabic::text_within` re-runs the full pipeline over each cell's glyphs
+— overlays anchored, order resolved, marks placed, NFKC applied — which is what keeps a cell's
+Arabic as correct as a paragraph's.
+
+**Where the line is drawn, and why there.** Page 8 of `test_for_arabic_barser.pdf` sets two
+columns of numbered cards. The badges form a third column between them, every row shares a
+baseline, and the cells are even about the right length. It is **geometrically
+indistinguishable** from a table; what separates them is that one is wrapped prose continuing
+from row to row, which is a fact about language and not about where the ink is. So the bar
+sits at **four** columns, where geometry can still carry it: each extra aligned column
+multiplies the improbability of coincidence, and four columns of prose is rare where a
+four-column table is ordinary.
+
+The cost is stated rather than hidden: a genuine three-column borderless table is missed. That
+is the same trade `is_plausible` makes for ruled grids (§10.11) — a false table destroys text,
+a missed one merely leaves it unstructured. Measured: 28 tables found in `12.pdf`, **none
+invented** in the other five documents.
+
+Known limitation: column spans are not modelled, here or for ruled tables. A spanning header
+row is trimmed off the table (§10.24) and emitted as ordinary text rather than split into
+cells, which loses the association but not the words.
+
+### 10.22 — `Tc` is spacing between glyphs, not part of one
+
+Pages 4–11 of `12.pdf` came back one character at a time:
+
+```
+  before:  ت ق ر ی ر ا ل م ر ا ج ع ا ل م س ت ق ل
+  after:   تقریر المراجع المستقل
+```
+
+The document sets `Tf 1` with **`Tc = -0.75`**, compensating with large `TJ` kerns. The
+positions were right all along — but the *reported* advance included `Tc`, so it came out at
+about **-4pt per glyph**. A negative advance made the running edge walk backwards, every next
+letter looked far away, and the word-gap rule fired between every pair.
+
+`Tc` and `Tw` move the pen *between* glyphs; they are not part of any glyph. An advance that
+includes them stops being a width — and a width that can go negative corrupts everything built
+on it: bounding boxes, layout items, table cell containment, overlay detection. `Glyph::advance`
+now reports the glyph's own ink extent, `width x Tfs x Th`, which cannot be negative. The full
+pen displacement stays inside the interpreter, where it is the right quantity.
+
+It repaired things elsewhere that had looked like separate faults: in `1.pdf`, `قيلل` became
+**`يقلل`** — the correct word — and two spaces lost to an earlier change came back.
+
+### 10.21 — A hamza painted over its letter is not a second letter
+
+`8.pdf` doubled every hamza: `والإدارية` came out `والإإدارية`, `الأدبية` as `الأأدبية` —
+**277 times** across the document.
+
+The font paints `إ` as a **zero-advance overlay at the same x** as the glyph carrying the
+letter it belongs to. Both carry Unicode, so both were emitted. The overlay is not an extra
+letter; it says the alef already there wears a hamza.
+
+Two shapes, and the second is what made the first fix look like it had failed:
+
+- **The host holds the bare letter.** A `لا` ligature with an `إ` painted on it means `لإ`.
+  The host's alef is replaced by the composed character.
+- **The host already holds the composed letter.** The same font *also* supplies a `لإ`
+  ligature and paints the hamza over that too. There the overlay adds nothing at all and only
+  the host survives. A first attempt handled only the first shape, and the doubling persisted
+  in exactly the places where the font had been most helpful.
+
+Which letters compose is asked of **Unicode**, not tabulated: `إ` is canonically `ا` plus a
+hamza below, `ؤ` is `و` plus a hamza above, and so the rule covers whatever the standard says
+without a table to fall out of date.
+
+**Where it declines to act.** If the host contains the base letter more than once — `الا` with
+one hamza — nothing says which wears it, and putting it on the wrong letter would be worse
+than leaving the overlay separate. That case returns `None` and the text keeps both, visibly
+odd rather than quietly wrong.
+
+This is the third distinct thing `8.pdf` does with zero-advance glyphs, after §10.18's overlay
+letters and §10.20's meaningless ones. The pattern is now hard to miss: **a glyph that does
+not move the pen is a modifier of its neighbour, and the only question is what kind.**
+
+### 10.20 — The same character can mean "no text" or "lost text"
+
+`8.pdf` produced hundreds of U+FFFD — 194 on page 5 alone — scattered inside otherwise
+perfect words: `التشريعية` came out `الت�شريعية`, `المرسوم` as `المر�سوم`.
+
+U+FFFD is *our* marker for a code we could not resolve, so the obvious reading was that we
+were failing. We were not. The font's own `/ToUnicode` says:
+
+```
+  <B0> <0634>     ش
+  <FB> <FFFD>     the rest of it
+```
+
+The document renders several Arabic letters in two pieces and **maps the second piece to the
+replacement character on purpose**. That is the producer stating the glyph carries no text —
+the exact opposite of what our own U+FFFD means, and we had been conflating the two.
+
+The distinction was already available and unused: `fonts.decode` returns `None` when nothing
+could resolve the code, and `Some("\u{FFFD}")` when a source resolved it *to* the replacement
+character. So:
+
+- **`None` — lost text.** Emit U+FFFD and count it. Dropping it would turn "we cannot read
+  this" into "there was nothing here", which is the deception the project exists to prevent.
+- **`Some(U+FFFD)` — ink, not text.** Drop it, and do not count it. The glyph still advances
+  the pen, so the running edge is updated; it simply contributes no characters.
+
+**Removing it also repaired the reading order**, which was the surprise. `يؤكد` had been
+extracting as `ي�كؤد`, with the `ؤ` and `ك` transposed around the intruder — so the stray
+character had looked like two separate faults. It was one.
+
+Result across the document: hundreds of replacement characters down to six, and pages that had
+been reported `degraded` are now `ok` — correctly, because the text really is complete. The
+six that remain are cases where the font leaves a letter genuinely unreadable, and those still
+carry the marker, which is what they should do.
+
+**The general rule.** "Always strip U+FFFD" would be wrong; it would hide real losses. What
+makes dropping safe here is not the character but *who wrote it*: a producer declaring a glyph
+meaningless is evidence, and evidence from the file always beats a rule of thumb applied to
+its output.
+
+### 10.19 — How wide a gutter must be depends on how tall it is
+
+Every two-column page of `9.pdf` — an 80-page magazine — merged its columns line by line, so
+each extracted line held half a sentence from each. The gutter measured **14pt** against 11pt
+type: 1.27 em, against the 1.5 em `MIN_GUTTER_EMS` demanded. Two and a half points.
+
+Raising the number would have been guessing. What the projection actually reports is stronger
+than a width: a gap in the x-projection means **no glyph anywhere in the region** occupies
+that band — so in a region of many lines it is not a word space that happened to be wide, it
+is a band every single line agreed to leave empty. The taller the region, the less plausible
+that is as coincidence, and the less the width has to prove alone. Above about five lines the
+requirement drops to 0.9 em; below it the strict width stands, because a short region really
+could align a few wide spaces by chance.
+
+That alone over-corrected. Page 14 of `test_for_arabic_barser.pdf` runs a ring of numbered
+badges down the inside edge of each column, and the projection sees a perfectly good gutter
+beside them — so every number was torn from the item it numbered. Hence a second rule:
+**both sides of a column cut must be wide enough to hold words** (5 em). A narrower strip is
+furniture — a badge, a bullet, a margin rule — not a column.
+
+Two things worth recording about the result:
+
+- **The relaxed threshold found real structure the old one had missed.** On page 14 the
+  lettered labels `أ ب ج د ه` had been emitted as a block of bare letters followed by a block
+  of unlabelled sentences; they now sit with their text. The page had been wrong in the golden
+  file all along, and looked plausible enough that nobody noticed.
+- **Dense newspaper pages remain mixed.** `6.pdf` sets columns with gutters of 0.9–1.3 em
+  interrupted by spanning headlines and images; its widest internal band is 1.3 em and the
+  layout is genuinely ambiguous from geometry. Checked and confirmed *not* a duplication bug:
+  11,295 glyphs, no form XObjects, three coincidental overlaps. This is the degradation
+  PLAN.md §8 predicts for sidebars and wrapped figures, and it is honest to leave it.
+
+### 10.18 — A position is not always a place in the sequence
+
+Page 3 of `3.pdf` draws the `ز` of `ميزات` and the `ر` of `المشروع` with **zero advance**,
+positioned inside the neighbouring glyph's ink and nearly 4pt above the baseline. Sorted by
+their own coordinates they became `م زيات` and `المرشوع`, and one was thrown onto a line of
+its own:
+
+```
+  before:  زر
+           الغرض من هذا المستند هو تحديد مي ات المشوع، …
+  after:   الغرض من هذا المستند هو تحديد ميزات المشروع، …
+```
+
+**The file is not corrupt, and this is worth stating because it looks like it is.** Reversing
+the painting order recovers `المشروع` and `ميزات` exactly; the information is all there. Even
+the producing viewer's own copy-and-paste gets it wrong, which is evidence about the viewer's
+heuristic rather than about the file.
+
+Ordering by geometry rests on an assumption that is usually invisible: *a glyph's coordinates
+say where it comes in the text*. That holds for a glyph which **advances the pen** — the
+arithmetic put it after its predecessor. A zero-advance glyph moves nothing, so its
+coordinates say only where the ink landed, which can be anywhere.
+
+The rule that came out of it — and three attempts before it, each rejected by a fixture:
+
+- **Anchor on containment, not on painting adjacency.** A zero-advance glyph drawn *inside*
+  another glyph's ink inherits that glyph's sequence position. Anchoring every zero-advance
+  glyph to its painting neighbour instead moved the full stops in `1.pdf` to the front of
+  their lines: punctuation that merely lacks an advance still sits where it belongs.
+- **Combining marks are excluded.** A mark is also zero-advance and also drawn over its base,
+  but the existing mark handling (§10.5) already places it by reading its own position.
+  Anchoring turned `تصورًا` into `تصوراً` — and painting order cannot separate the two cases,
+  because `test_for_arabic_barser.pdf` paints its marks *before* the letter they sit on while
+  `3.pdf` paints its overlays *after*. What the glyph **is** decides it, not where it came.
+- **"Does not move the pen" and "is a combining mark" are different questions.** They had been
+  one predicate, which is what made a zero-advance `ز` get treated as a mark and moved to the
+  wrong side of its neighbour.
+- **A space drawn on top of a letter is not a space.** It separates nothing. Gated on the same
+  containment test, because a narrow space that merely lacks an advance is still a real gap —
+  dropping those cost `1.pdf` the space after a colon.
+
+Net effect on `1.pdf`, which needed none of this to be readable: `ف( رنون` → `(فرنون`,
+`م / عدل التحويل` → `/ معدل التحويل`, `و تسويق` → `وتسويق`, `ب ها` → `بها`.
+
+### 10.17 — The text state belongs to the graphics state, and `Q` restores it
+
+Fixture `1.pdf` extracted its opening line as
+
+```
+  الشركةع البرو طةين– ات رنساشن وايلن        (ours)
+  الشركة عبر الوطنية – ترانس ناشيونال       (correct)
+```
+
+Every character present, every character correct, only the **order** wrong — and wrong in a
+way that reads as a hopeless extractor rather than a single bug. Some lines on the same page
+were perfect.
+
+The document sets `-4.02 Tc` inside a `q … Q` block, eleven times. ISO 32000 §8.4.1 puts the
+text state *parameters* — `Tc`, `Tw`, `Tz`, `TL`, `Tf`/`Tfs`, `Tr`, `Ts` — in the **graphics**
+state, so `q` saves them and `Q` restores them. We kept them in the text interpreter as
+globals that nothing restored, so a spacing set for one four-glyph run leaked over the rest of
+the page.
+
+Then: every subsequent glyph advanced 4pt too little, the computed x positions collapsed into
+each other, and the geometric sort that decides reading order shuffled the glyphs. The cause
+was in `graphics.rs`; the symptom appeared in `arabic.rs`, two layers away.
+
+Rules this produced:
+
+- **Where state lives is the spec's decision, not a convenience.** Grouping everything
+  text-related in the text interpreter was tidy and wrong. The text *matrices* really are
+  outside the graphics state — `BT` creates them and `ET` destroys them — and that is the only
+  part of the text state that is.
+- **A wrong advance is a wrong reading order.** Positions are ground truth for order (§3), so
+  anything that corrupts an advance corrupts the text itself, not merely its spacing. That
+  makes advance arithmetic worth the same care as the CMap.
+
+Diagnosing it took a detour worth recording: the glyph widths were the obvious suspect and
+were *correct* — `w_em = 0.451` for a letter whose emitted advance was 2.75 at 15pt. Solving
+`advance = 15·w_em + b` across several glyphs gave `b = -4.02` exactly, which named the
+operator. Fitting the observation rather than guessing at causes is what found it.
+
+### 10.16 — Form XObjects hide text, and their resources are scoped
+
+Page 1 of `test_for_arabic_barser.pdf` was missing its title. A form XObject is a page within
+a page: its own content stream, its own `/Resources`, its own fonts under its own names. Text
+inside one is invisible to an interpreter that does not descend into it, and **nothing in the
+outer stream hints that anything was missed** — the extraction simply looks complete.
+
+Two things the recursion needed beyond walking into the stream:
+
+- **Resource names are scoped.** A page and a form may both call a font `C2_0` and mean
+  different fonts, so names are qualified by nesting (`Fm1/C2_0`). A form that omits
+  `/Resources` inherits the enclosing ones, and following that inheritance is what makes its
+  text decode at all.
+- **The font *summary* list matters as much as the font map.** The interpreter consults
+  `&[FontInfo]` to decide 1-byte versus 2-byte codes. After the recursion worked, the title
+  still came out as replacement characters, because the summaries held only page-level names:
+  `Fm1/C2_0` was not found, defaulted to single-byte, and **split every 2-byte CID in half**.
+
+It also caused a regression the golden file caught. The forms drew one short decorative rule
+near the foot of a page that happened to overlap a table horizontally; `group_rows` chained on
+x-overlap alone, swallowed it, and stretched the group from 147pt tall to 463pt — after which
+no real column cleared the "at least half the table's height" filter and the table vanished.
+Row spacing is now judged against the **whole page's** median gap, because judging
+incrementally cannot work: the first two boundaries of a group have nothing to compare
+against. That turned out to improve detection as well as repair it — 21 tables found where
+there had been 18, and page 6's confidence rose from 0.79 to 0.96.
 
 ### 10.15 — Which of a PDF's own claims to believe
 
