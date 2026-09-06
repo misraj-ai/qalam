@@ -1,6 +1,6 @@
 <div align="center">
 
-<img src="docs/assets/img/logo.svg" alt="qalam" width="120">
+[//]: # (<img src="docs/assets/img/logo.svg" alt="qalam" width="120">)
 
 # qalam &nbsp;·&nbsp; <span dir="rtl">قلم</span>
 
