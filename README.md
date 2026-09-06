@@ -1,11 +1,11 @@
 # qalam
 
-**Correct, logical-order Arabic text extraction from digitally-born PDFs — without OCR.**
+**Correct, logical-order Arabic text extraction from digitally-born PDFs without OCR.**
 
 Most PDF extractors return Arabic that is reversed, made of presentation forms, or silently
 corrupted at every ligature. `qalam` fixes the reading order, folds shaped glyphs back to base
-letters, reconstructs multi-column reading order and ruled tables, and — when a page has no
-usable text layer — **says so** rather than returning plausible-looking garbage.
+letters, reconstructs multi-column reading order and ruled tables, and when a page has no
+usable text layer **says so** rather than returning plausible-looking garbage.
 
 ```python
 import qalam
@@ -42,9 +42,16 @@ while ligatures are still single glyphs, then normalises.
 
 ### Python
 
+## using pip 
+
+```sh
+pip install qalam
+```
+if you have some problem build from the project
+
+## Build from project
 Requires **Python ≥ 3.9** and a **Rust toolchain** (stable) to build from source. Wheels are
 `abi3`, so one build serves every Python from 3.9 up.
-
 ```sh
 git clone <repo-url> && cd qalam
 python -m venv .venv && . .venv/bin/activate
