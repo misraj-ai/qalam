@@ -344,10 +344,6 @@ document taught us — including several bugs that produced correct-looking, wro
 
 ## Status
 
-Tier A (correct linear text) and most of Tier B (reading order, images) are done; Tier C
-(tables) covers ruled grids. 206 tests, including golden-file comparison over the whole
-corpus.
-
 This is young software validated against a small corpus. **More Arabic PDFs is the single
 most valuable contribution** — see `CONTRIBUTING.md`.
 
