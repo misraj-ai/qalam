@@ -346,7 +346,3 @@ document taught us — including several bugs that produced correct-looking, wro
 
 This is young software validated against a small corpus. **More Arabic PDFs is the single
 most valuable contribution** — see `CONTRIBUTING.md`.
-
-## Licence
-
-MIT.
