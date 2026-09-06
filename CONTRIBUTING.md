@@ -1,7 +1,7 @@
 # Contributing to qalam
 
 Thank you for looking. This document covers getting set up, the conventions the codebase
-follows, and — most importantly — the one principle everything else follows from.
+follows, and most importantly the one principle everything else follows from.
 
 ---
 
@@ -10,7 +10,7 @@ follows, and — most importantly — the one principle everything else follows 
 **Never invent text.**
 
 Every other rule here is a consequence. When a glyph cannot be resolved, we emit `U+FFFD`, not
-nothing — because "we cannot read this" and "there was nothing here" are different facts, and
+nothing because "we cannot read this" and "there was nothing here" are different facts, and
 collapsing them is the exact deception this project exists to prevent. When a page has no
 usable text layer, we say `needs_ocr` rather than returning a plausible fragment. When an
 image uses a colour space we do not model, it comes back with a *reason*, not silently
@@ -22,7 +22,7 @@ findings log were of exactly that kind, and they are why the tests are as fussy 
 
 If you find yourself writing "this is probably a comma", stop and ask what evidence you have.
 If the answer is "it usually is", the honest move is to report the ambiguity rather than
-resolve it. See `PLAN.md` §10.15 for a worked example of when guessing *is* justified — and
+resolve it. See `PLAN.md` §10.15 for a worked example of when guessing *is* justified and
 what made it so.
 
 ---
@@ -77,14 +77,14 @@ UPDATE_GOLDEN=1 cargo test -p qalam-core --test golden
 git diff tests/expected
 ```
 
-A golden diff says *something* changed. The named regressions beside it say *what* broke —
+A golden diff says *something* changed. The named regressions beside it say *what* broke
 `ligatures_survive_the_reorder`, `columns_are_not_interleaved`,
 `no_table_is_invented_in_the_untagged_corpus`, and so on. Each is a bug that actually
 happened. Add one whenever you fix a bug that the golden file alone would only report as
 "line 47 changed".
 
-**Synthetic-PDF tests** (`crates/qalam-core/tests/tagged.rs`) build real PDFs — real objects,
-a real xref table — so features can be exercised on inputs the corpus lacks. Note the limit
+**Synthetic-PDF tests** (`crates/qalam-core/tests/tagged.rs`) build real PDFs real objects,
+a real xref table so features can be exercised on inputs the corpus lacks. Note the limit
 honestly: a fixture you write yourself can only test behaviour you already thought of. That
 is not hypothetical; see `PLAN.md` §10.12.
 
@@ -107,7 +107,7 @@ Particularly wanted:
 
 - Arabic PDFs from producers other than InDesign and Adobe Distiller
 - **Tagged** PDFs (`/StructTreeRoot`) from Word or an accessibility workflow
-- Documents with `/ActualText` — implemented, but exercised only against synthetic streams
+- Documents with `/ActualText` implemented, but exercised only against synthetic streams
 - Borderless tables, RTL forms, mixed Arabic/Latin/numeric lines
 - Anything where our output is worse than PyMuPDF's
 
@@ -116,7 +116,7 @@ To add one:
 1. Put the file in `tests/fixtures/`.
 2. Add it to the `CORPUS` array in `crates/qalam-core/tests/golden.rs`.
 3. `UPDATE_GOLDEN=1 cargo test -p qalam-core --test golden`
-4. **Read the generated golden file.** Compare against the rendered page — `PLAN.md` §10 has
+4. **Read the generated golden file.** Compare against the rendered page `PLAN.md` §10 has
    several examples of doing this with PyMuPDF's rasteriser. If anything is wrong, that is a
    bug worth a named test, not a golden file to accept.
 
@@ -148,7 +148,7 @@ Modules map onto the pipeline (see `README.md`), and the dependencies run one wa
 in particular:
 
 - **Only `parser.rs` knows `lopdf` exists.** It turns the object graph into the plain types in
-  `types.rs`. If lopdf ever has to go, one file changes — and, just as usefully, the CMap
+  `types.rs`. If lopdf ever has to go, one file changes and, just as usefully, the CMap
   parser can be tested on a byte string with no PDF in sight.
 - **Layers take plain data, not the layer above's types.** `arabic.rs` accepts image
   placements as bare `Rect`s: reading order is a property of *where things are*, so L3 needs
@@ -175,7 +175,7 @@ artifact: comments explain *why*, and Rust idioms are explained where they first
   `Option::None`, so a caller can say *why*.
 - **Bounds-check everything read from a file.** A font program is arbitrary bytes we did not
   write; a panic in a library is a denial of service for whoever embedded it.
-- **Never compare floats with `==`**, and use `total_cmp` where a sort needs a total order —
+- **Never compare floats with `==`**, and use `total_cmp` where a sort needs a total order
   a NaN coordinate from a malformed file must not corrupt a sort or panic.
 
 `cargo fmt` and `cargo clippy --all-targets` must both be clean. `#![warn(missing_docs)]` is
@@ -191,7 +191,7 @@ wrong* output.
 
 If you fix a bug that a reasonable person would have shipped, add an entry. State what the
 document did, what we did wrong, and what rule came out of it. When a later finding
-contradicts an earlier one, **mark the old entry superseded rather than editing it** — a log
+contradicts an earlier one, **mark the old entry superseded rather than editing it** a log
 that silently rewrites itself teaches nothing.
 
 ---
