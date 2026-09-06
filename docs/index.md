@@ -292,8 +292,6 @@ for page in doc:
 <figure>
   <div class="placeholder">
     <img src="assets/img/inspect-verdict.png" alt="sid-by-side image of full output">
-    IMAGE: terminal screenshot of `qalam inspect` on a mixed document — a table of pages
-    with verdicts and confidence scores, the needs_ocr rows visibly flagged
   </div>
   <figcaption><code>qalam inspect</code> on a document that is part born-digital and part
   scanned. The pages that need OCR are named, not silently skipped.</figcaption>
