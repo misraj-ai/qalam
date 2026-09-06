@@ -6,7 +6,7 @@
 # secrets, so there is nothing to leak or rotate.
 #
 # On PyPI, configure the publisher as:
-#   owner:              <your GitHub user or org>
+#   owner:              misraj-ai
 #   repository:         qalam
 #   workflow filename:  release.yml      <- this file; the name is load-bearing
 #   environment:        pypi             <- must match `environment:` below

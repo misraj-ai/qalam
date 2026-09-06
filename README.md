@@ -1,11 +1,64 @@
-# qalam
+<div align="center">
 
-**Correct, logical-order Arabic text extraction from digitally-born PDFs without OCR.**
+<img src="docs/assets/img/logo.svg" alt="qalam" width="120">
+
+# qalam &nbsp;·&nbsp; <span dir="rtl">قلم</span>
+
+**Correct, logical-order Arabic text extraction from digitally-born PDFs — without OCR.**
+
+<!-- Badges. Each is a live link, not decoration: click-through matters more than colour. -->
+
+[![PyPI](https://img.shields.io/pypi/v/qalam?logo=pypi&logoColor=white&label=PyPI&color=3775A9)](https://pypi.org/project/qalam/)
+[![Rust](https://img.shields.io/badge/Rust-stable-000000?logo=rust&logoColor=white)](https://www.rust-lang.org/)
+[![License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
+[![Release](https://img.shields.io/github/actions/workflow/status/misraj-ai/qalam/release.yml?logo=githubactions&logoColor=white&label=release)](https://github.com/misraj-ai/qalam/actions/workflows/release.yml)
+
+
+### [📖 Read the article](https://misraj-ai.github.io/qalam/) &nbsp;·&nbsp; [🚀 Quick start](#quick-start) &nbsp;·&nbsp; [📚 API](#using-the-python-api) &nbsp;·&nbsp; [🤝 Contributing](CONTRIBUTING.md) &nbsp;·&nbsp; [💬 Discussions](https://github.com/misraj-ai/qalam/discussions)
+
+</div>
+
+---
 
 Most PDF extractors return Arabic that is reversed, made of presentation forms, or silently
 corrupted at every ligature. `qalam` fixes the reading order, folds shaped glyphs back to base
 letters, reconstructs multi-column reading order and ruled tables, and when a page has no
 usable text layer **says so** rather than returning plausible-looking garbage.
+
+<table>
+<tr>
+<th align="center" width="50%">Other extractors</th>
+<th align="center" width="50%">qalam</th>
+</tr>
+<tr>
+<td align="center"><p dir="rtl" lang="ar">إلى الرجوع عن يغني ولا إرشادي الدليل هذا</p><sub>every word reversed — unrecoverable downstream</sub></td>
+<td align="center"><p dir="rtl" lang="ar">هذا الدليل إرشادي ولا يغني عن الرجوع إلى</p><sub>logical order, base letters, ligature intact</sub></td>
+</tr>
+<tr>
+<td align="center"><p dir="rtl" lang="ar">ﺍﻟﺪﻟﻴﻞ ﺍﻹﺭﺷﺎﺩﻱ</p><sub>presentation forms — shares no codepoint with the real text</sub></td>
+<td align="center"><p dir="rtl" lang="ar">الدليل الإرشادي</p><sub>base letters</sub></td>
+</tr>
+<tr>
+<td align="center"><p dir="rtl" lang="ar">تتضم َّن</p><sub>a space in the middle of the word</sub></td>
+<td align="center"><p dir="rtl" lang="ar">تتضمَّن</p><sub>marks attached to their base</sub></td>
+</tr>
+<tr>
+<td align="center"><code>""</code><sub><br>a scanned page and a blank page, indistinguishable</sub></td>
+<td align="center"><code>page.verdict == "needs_ocr"</code><sub><br>says what it could not read</sub></td>
+</tr>
+</table>
+
+> **Why these examples matter:** every string above is real output from a real government PDF,
+> reproducible with `python scripts/compare.py`. The story behind each one is in
+> **[the article](https://misraj-ai.github.io/qalam/)**.
+
+---
+
+## Quick start
+
+```sh
+pip install qalam
+```
 
 ```python
 import qalam
@@ -352,4 +405,65 @@ document taught us — including several bugs that produced correct-looking, wro
 ## Status
 
 This is young software validated against a small corpus. **More Arabic PDFs is the single
-most valuable contribution** — see `CONTRIBUTING.md`.
+most valuable contribution** — especially ones that break something. Every rule in the
+pipeline exists because a real document proved the previous rule wrong.
+
+---
+
+## Community
+
+<table>
+<tr>
+<td width="33%" valign="top">
+
+### 🐛 Found a bad extraction?
+
+[**Open an issue**](https://github.com/misraj-ai/qalam/issues/new) — and attach the PDF if you
+can share it. A file that breaks something is worth more than a bug report about it.
+
+</td>
+<td width="33%" valign="top">
+
+### 💬 Have a question?
+
+[**Start a discussion**](https://github.com/misraj-ai/qalam/discussions). Questions about
+whether qalam fits your pipeline are welcome; the answer is sometimes no.
+
+</td>
+<td width="33%" valign="top">
+
+### 🤝 Want to contribute?
+
+Read [**CONTRIBUTING.md**](CONTRIBUTING.md). `PLAN.md` §10 carries the findings log — what each
+real document taught us, including the bugs that produced correct-looking, wrong output.
+
+</td>
+</tr>
+</table>
+
+**The highest-value contribution is a PDF.** Arabic documents that extract badly are the
+bottleneck on this project — every correctness rule described in the article came from one.
+Government publications, financial reports, theses, anything with tables. If you cannot share
+the file, the output of `qalam inspect yourfile.pdf` is still useful.
+
+---
+
+## Learn more
+
+| | |
+|---|---|
+| 📖 **[The article](https://misraj-ai.github.io/qalam/)** | Why every Arabic PDF extractor is quietly wrong, and what it takes to fix it. Start here. |
+| 📐 **[`PLAN.md`](PLAN.md)** | The full design, plus a findings log recording what each real document taught us. |
+| 🤝 **[`CONTRIBUTING.md`](CONTRIBUTING.md)** | How to build, test, and what kind of help is most useful. |
+| 📄 **[`paper/`](paper/)** | An academic write-up of the same material, for citation. |
+
+---
+
+## Licence
+
+MIT — see [`LICENSE`](LICENSE). Copyright © 2026 Misraj AI.
+
+<div align="center">
+<br>
+<sub>Built with 🦀 Rust and a great deal of patience for the PDF specification.</sub>
+</div>

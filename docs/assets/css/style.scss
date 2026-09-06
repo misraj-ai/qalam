@@ -95,19 +95,3 @@ figcaption {
   margin-top: 0.5rem;
   line-height: 1.5;
 }
-
-/* A slot with no image in it yet, so the layout is reviewable before the
-   screenshots exist. Delete this rule once assets/img/ is populated. */
-.placeholder {
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  min-height: 200px;
-  padding: 2rem 1rem;
-  border: 2px dashed #ccc;
-  border-radius: 6px;
-  background: #fbfbfb;
-  color: #999;
-  font-size: 0.85rem;
-  text-align: center;
-}

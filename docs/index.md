@@ -32,11 +32,13 @@ that I think is genuinely dangerous: the failure that returns no text at all and
 mention it.
 
 <figure>
-  <div class="placeholder">
-    <img src="assets/img/hero-side-by-side.png" alt="sid-by-side image of full output">
-  </div>
-  <figcaption>What extraction should look like: the page on the left, the text on the right,
-  and nothing lost in between.</figcaption>
+  <img src="assets/img/hero-side-by-side.png"
+       alt="A magazine spread from the original PDF on the left; qalam's HTML export of the same page on the right, in the same reading order.">
+  <figcaption>The original page on the left, <code>doc.to_html()</code> on the right. Photo
+  captions, body text and pull quotes all land in the order a reader would take them, and the
+  right-to-left flow survives into the rendered output. The one broken image is honest rather
+  than hidden: it is JPEG 2000, which qalam does not decode, so it is reported through
+  <code>unsupported_reason</code> instead of being silently dropped.</figcaption>
 </figure>
 
 ---
@@ -210,13 +212,14 @@ interleave three unrelated paragraphs into nonsense. Every character decoded per
 result is unreadable.
 
 <figure>
-  <div class="placeholder">
-    <img src="assets/img/columns-xy-cut.png.jpg" alt="sid-by-side image of full output">
-  </div>
-  <figcaption>The recursion is the point. This page has no page-wide vertical gutter at all —
-  the full-width intro paragraph crosses all three columns — so a single global column pass
-  finds zero columns. Only after the intro is cut away on the horizontal gap do the gutters
-  underneath become visible.</figcaption>
+  <img src="assets/img/columns-xy-cut.png.jpg"
+       alt="The original page shows a heading, an intro paragraph, and three side-by-side cards; qalam's extraction keeps each card whole and in right-to-left order.">
+  <figcaption>The page that forced this whole stage to exist. A full-width intro paragraph sits
+  above three side-by-side cards, so an x-projection over the <em>whole</em> page finds no
+  vertical gutter at all and a single global column pass detects zero columns. Only the
+  recursion — having first cut the intro away on the horizontal gap — exposes the gutters
+  underneath. Each card comes out whole, right to left. Grouping by baseline instead would have
+  interleaved all three into nonsense.</figcaption>
 </figure>
 
 The fix is a recursive XY-cut: find the widest empty band on the page, split there, and
@@ -290,13 +293,12 @@ for page in doc:
 ```
 
 <figure>
-  <div class="placeholder">
-    <img src="assets/img/inspect-verdict.png" alt="sid-by-side image of full output">
-    IMAGE: terminal screenshot of `qalam inspect` on a mixed document — a table of pages
-    with verdicts and confidence scores, the needs_ocr rows visibly flagged
-  </div>
-  <figcaption><code>qalam inspect</code> on a document that is part born-digital and part
-  scanned. The pages that need OCR are named, not silently skipped.</figcaption>
+  <img src="assets/img/inspect-verdict.png"
+       alt="Extracted output in which pages 2 and 3 are replaced by a note reading: No text layer on this page, it needs OCR.">
+  <figcaption>Pages 2 and 3 of this document have no text layer. Every other extractor returns
+  <code>""</code> for them — identical to what it returns for a blank page. qalam names them
+  instead: <em>"no text layer: the page paints no glyphs at all."</em> That sentence is the
+  difference between a corpus with a known gap and a corpus with an invisible one.</figcaption>
 </figure>
 
 Two decisions inside that scoring are worth stating, because both are the opposite of what
@@ -320,11 +322,12 @@ statistical yearbooks, financial statements — are mostly tables, and a table f
 line of text has lost the thing that made it a table.
 
 <figure>
-  <div class="placeholder">
-    <img src="assets/img/table-to-csv.png" alt="sid-by-side image of full output">
-  </div>
-  <figcaption>Columns are numbered in reading order, so on an Arabic page
-  <code>rows[0][0]</code> is the <em>rightmost</em> cell.</figcaption>
+  <img src="assets/img/table-to-csv.png"
+       alt="A ruled Arabic statistics table in the original PDF, and the same table reconstructed by qalam with its rows and columns intact.">
+  <figcaption>A governorate statistics table, original on the left and reconstructed on the
+  right: fourteen rows and seven columns survive as a grid rather than as a stream of loose
+  numbers. Column 0 is the <em>rightmost</em> one, because that is where an Arabic reader
+  starts — so <code>table.to_rows()</code> goes straight to <code>csv.writer</code>.</figcaption>
 </figure>
 
 Two findings here were worth the trouble.
