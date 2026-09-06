@@ -1,5 +1,8 @@
+
 # qalam
 
+<a href="https://docs.pytorch.org/executorch/main/index.html"><img src="https://misraj-ai.github.io/qalam/" alt="Article"></a>
+</div>
 **Correct, logical-order Arabic text extraction from digitally-born PDFs without OCR.**
 
 Most PDF extractors return Arabic that is reversed, made of presentation forms, or silently
