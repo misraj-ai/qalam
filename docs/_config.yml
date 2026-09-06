@@ -1,0 +1,25 @@
+# Configuration for the GitHub Pages site served from this folder.
+#
+# GitHub runs Jekyll on `docs/` automatically once Pages is pointed at it
+# (Settings -> Pages -> Deploy from a branch -> main / docs). There is no build
+# step to run locally and no Actions workflow to maintain.
+
+title: Qalam
+description: >-
+  Correct, logical-order Arabic text extraction from digitally-born PDFs —
+  without OCR.
+
+# `remote_theme` pulls a theme straight from GitHub, so no theme gem has to be
+# vendored into the repo. Swap the value to change the whole look; anything on
+# GitHub that is a Jekyll theme will work.
+remote_theme: pages-themes/minimal@v0.2.0
+plugins:
+  - jekyll-remote-theme
+  - jekyll-seo-tag
+
+# Shown in the sidebar by the `minimal` theme.
+show_downloads: false
+
+# Files in docs/ that are inputs to the site, not pages of it.
+exclude:
+  - assets/img/README.md

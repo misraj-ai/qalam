@@ -1,0 +1,113 @@
+---
+# The two lines of empty front matter are required and are not a mistake:
+# Jekyll only processes a file that has them. Without these, `@import` below is
+# served to the browser verbatim and the page loads with no styling at all.
+---
+
+@import "{{ site.theme }}";
+
+/* ---------------------------------------------------------------------------
+   Arabic.
+
+   An article arguing that everyone renders Arabic badly should not render it
+   badly. Three things go wrong with a default theme:
+
+     - direction. Latin-first CSS left-aligns Arabic, so a right-to-left line
+       ends up ragged on the wrong edge.
+     - size. At an identical point size Arabic reads noticeably smaller than
+       Latin, because its letterforms sit lower relative to the em box.
+     - leading. Tashkeel (the vowel marks) are drawn above and below the
+       letters, and a normal line-height clips them or crowds the line above.
+   --------------------------------------------------------------------------- */
+
+:lang(ar),
+[dir="rtl"] {
+  direction: rtl;
+  text-align: right;
+  unicode-bidi: isolate;
+  font-family: "Noto Naskh Arabic", "Amiri", "Scheherazade New", serif;
+  font-size: 1.15em;
+  line-height: 2;
+}
+
+/* Inline Arabic inside an English sentence: keep it on the baseline and stop
+   it from inheriting the block alignment above. */
+span:lang(ar) {
+  display: inline-block;
+  text-align: right;
+  line-height: 1.6;
+}
+
+/* ---------------------------------------------------------------------------
+   Comparison blocks — the good/bad pairs that carry the article.
+   --------------------------------------------------------------------------- */
+
+.compare {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+  gap: 1rem;
+  margin: 1.5rem 0;
+}
+
+.compare > div {
+  border: 1px solid #ddd;
+  border-radius: 6px;
+  padding: 0.75rem 1rem;
+  background: #fafafa;
+}
+
+.compare .label {
+  display: block;
+  font-size: 0.75rem;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: #777;
+  margin-bottom: 0.5rem;
+}
+
+.compare .bad {
+  border-color: #e5b3b3;
+  background: #fdf6f6;
+}
+
+.compare .good {
+  border-color: #b3d6b3;
+  background: #f6fdf7;
+}
+
+/* ---------------------------------------------------------------------------
+   Figures. Every screenshot in the article is wrapped in one of these.
+   --------------------------------------------------------------------------- */
+
+figure {
+  margin: 2rem 0;
+}
+
+figure img {
+  max-width: 100%;
+  border: 1px solid #e0e0e0;
+  border-radius: 6px;
+}
+
+figcaption {
+  font-size: 0.85rem;
+  color: #666;
+  margin-top: 0.5rem;
+  line-height: 1.5;
+}
+
+/* A slot with no image in it yet, so the layout is reviewable before the
+   screenshots exist. Delete this rule once assets/img/ is populated. */
+.placeholder {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 200px;
+  padding: 2rem 1rem;
+  border: 2px dashed #ccc;
+  border-radius: 6px;
+  background: #fbfbfb;
+  color: #999;
+  font-size: 0.85rem;
+  text-align: center;
+}
