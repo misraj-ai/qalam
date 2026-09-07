@@ -10,7 +10,7 @@
 
 [![PyPI](https://img.shields.io/pypi/v/qalam?logo=pypi&logoColor=white&label=PyPI&color=3775A9)](https://pypi.org/project/qalam/)
 [![Rust](https://img.shields.io/badge/Rust-stable-000000?logo=rust&logoColor=white)](https://www.rust-lang.org/)
-[![License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
+[![License](https://img.shields.io/badge/License-GNU-green.svg)](LICENSE)
 [![Release](https://img.shields.io/github/actions/workflow/status/misraj-ai/qalam/release.yml?logo=githubactions&logoColor=white&label=release)](https://github.com/misraj-ai/qalam/actions/workflows/release.yml)
 
 
