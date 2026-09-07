@@ -461,7 +461,7 @@ the file, the output of `qalam inspect yourfile.pdf` is still useful.
 
 ## Licence
 
-MIT — see [`LICENSE`](LICENSE). Copyright © 2026 Misraj AI.
+GNU — see [`LICENSE`](LICENSE). Copyright © 2026 Misraj AI.
 
 <div align="center">
 <br>
