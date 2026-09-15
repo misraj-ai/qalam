@@ -26,6 +26,7 @@
 //! `pages` property can be read a hundred times without rebuilding anything.
 
 use pyo3::create_exception;
+use pyo3::exceptions::PyValueError;
 use pyo3::exceptions::{PyException, PyIndexError, PyOSError, PyPermissionError};
 use pyo3::prelude::*;
 
@@ -543,6 +544,15 @@ impl Document {
     fn heading_sizes(&self) -> (f64, Vec<(f64, u8)>) {
         let headings = qalam_core::Headings::analyse(&self.document);
         (headings.body_size(), headings.inferred())
+    }
+
+    /// Serialize the extracted document as pretty-printed JSON.
+    ///
+    /// This is a presentation layer over the existing extraction model and
+    /// does not rerun extraction or modify the extracted document.
+    fn to_json(&self, py: Python<'_>) -> PyResult<String> {
+        py.detach(|| qalam_core::to_json(&self.document))
+            .map_err(|err| PyValueError::new_err(err.to_string()))
     }
 
     /// Every page, in document order.
