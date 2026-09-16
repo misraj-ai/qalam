@@ -62,6 +62,7 @@ pub mod layout;
 pub mod parser;
 pub mod structure;
 pub mod tables;
+pub mod ttf;
 pub mod types;
 
 // Re-export the handful of names most callers need, so they can write

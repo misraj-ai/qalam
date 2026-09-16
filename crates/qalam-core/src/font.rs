@@ -41,12 +41,13 @@
 //! Destinations are UTF-16BE, so a codepoint above U+FFFF arrives as a surrogate
 //! pair that has to be recombined.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+
+use unicode_normalization::UnicodeNormalization;
 
 use crate::cff::{self, GlyphNames};
 use crate::content::GlyphWidths;
 use crate::encoding::{glyph_name_to_string, Encoding};
-use crate::types::{CodeToUnicode, RawFont};
 // at Pdf32000_iso sections 9.7.5-9.10.3 you will notice that CMap has two property.
 // 1 Forward CMap where we drown char on the page this used by Renderer,
 // 2 Backward CMap the one we use to extract text.
@@ -56,6 +57,9 @@ use crate::types::{CodeToUnicode, RawFont};
 // ones used on this page, maybe 80 of them, renumbered 1, 2, 3, … in whatever order it felt like.
 // So in one file 0x0113 means alef; in the next file from the same producer it might mean ب.
 // The number is a slot index into a private, one-off font, not a character.
+use crate::ttf;
+use crate::types::{CidToGid, CodeToUnicode, RawFont};
+
 /// A parsed `/ToUnicode` CMap: glyph code → the text it stands for.
 ///
 /// # Rust lesson: why two containers
@@ -304,12 +308,26 @@ pub struct Font {
     /// The last rung of the chain, and the only one the renderer checks — see
     /// [`crate::cff`].
     glyph_names: GlyphNames,
+    /// Per-code character identity read from an embedded TrueType `cmap`.
+    ///
+    /// Composite fonts only, via `/FontFile2` + `/CIDToGIDMap`. Like the glyph
+    /// names above this is renderer-checked, and it is the second opinion the
+    /// disagreement arbitration below trusts (PLAN.md §10). See [`crate::ttf`].
+    ttf_identity: HashMap<u32, char>,
     /// Codes where the font program and `/ToUnicode` disagree about a numeric
     /// separator, and the font program is believed.
     ///
     /// See [`Font::arbitrate_separators`] for why this is limited to
     /// separators.
     corrections: HashMap<u32, String>,
+    /// Codes where the embedded font's `cmap` contradicted `/ToUnicode`, and
+    /// the font program was believed (PLAN.md §10.25).
+    ///
+    /// This is what the detector reads to refuse a confident `ok`: the page's
+    /// map was a lie, and the recovered character is only as good as the font's
+    /// subset. Distinct from [`Self::corrections`], which also holds the narrow
+    /// separator corrections, so a dispute is a stronger claim than a repair.
+    ttf_disagreements: HashSet<u32>,
     /// Whether codes are two bytes wide.
     pub two_byte: bool,
     /// Which reverse-mapping route this font offers (from L0).
@@ -326,6 +344,14 @@ pub struct Font {
     cid_widths: Vec<(u32, u32, f64)>,
 }
 
+/// An advance width, as a fraction of the em square, below which a code that the
+/// embedded font program cannot name is a "box" filler rather than a letter.
+///
+/// PLAN.md §10.25 measured the real thing: CID 0x467 in `doc3.pdf`'s F4 subset
+/// is 125/1000 em (0.125); the font's letters are 0.22–0.27 em. The mark must
+/// sit clearly under the narrowest letter, so 0.16 leaves margin on both sides.
+const BOX_FILLER_MAX_WIDTH_EM: f64 = 0.16;
+
 impl Font {
     /// Build a usable font from L0's raw extraction.
     pub fn from_raw(raw: RawFont) -> Self {
@@ -338,6 +364,10 @@ impl Font {
             .as_deref()
             .map(CMap::parse)
             .unwrap_or_default();
+
+        // Read the font program's own identity first: the lines below move
+        // `raw`'s fields out, and this one needs a borrow of it.
+        let ttf_identity = read_ttf_identity(&raw, two_byte);
 
         // A composite font's `/Encoding` names a CMap (`Identity-H`), not a
         // byte table, so the simple-font encoding path does not apply to it.
@@ -354,7 +384,14 @@ impl Font {
             _ => GlyphNames::default(),
         };
 
-        let corrections = arbitrate_separators(&to_unicode, &encoding, &glyph_names);
+        let mut corrections = arbitrate_separators(&to_unicode, &encoding, &glyph_names);
+        // The font-cmap check is the wider net: it covers every code, not just
+        // separators, while still refusing to contradict an agreeing map. The
+        // disputed codes are kept apart for the detector, which needs to know
+        // the map was a lie even after the text is repaired.
+        let font_corrections = arbitrate_against_font(&to_unicode, &ttf_identity);
+        let ttf_disagreements: HashSet<u32> = font_corrections.keys().copied().collect();
+        corrections.extend(font_corrections);
 
         Self {
             resource_name: raw.info.resource_name,
@@ -363,7 +400,9 @@ impl Font {
             to_unicode,
             encoding,
             glyph_names,
+            ttf_identity,
             corrections,
+            ttf_disagreements,
             first_char: raw.first_char,
             widths: raw.widths,
             missing_width: raw.missing_width,
@@ -377,30 +416,44 @@ impl Font {
     /// This is the fallback chain from PLAN.md §3, minus `/ActualText` (which
     /// lives at the content-stream level, not the font level):
     ///
-    /// 1. `/ToUnicode` — a real reverse map, and always right when present.
+    /// 1. `/ToUnicode` — a real reverse map, and the writer's own hint.
     /// 2. `/Encoding` + `/Differences` — a simple font's byte table.
+    /// 3. The font program: CFF glyph names or a TrueType `cmap`.
     ///
     /// `None` means genuinely unrecoverable, and stays distinct from an empty
-    /// string. The order matters: a font can have both, and `/ToUnicode` is the
-    /// one the writer produced deliberately for text extraction.
+    /// string. The order matters: a font can have several of these, and
+    /// `/ToUnicode` is the one the writer produced deliberately for text
+    /// extraction. The font program only steps in where the map is silent or —
+    /// via a correction — where the two contradict each other and the program
+    /// is believed.
+    ///
+    /// A correction is deliberately first: it exists precisely because the map
+    /// is wrong for that code (`arbitrate_separators`,
+    /// `arbitrate_against_font`).
     ///
     /// The result is still **shaped and in visual order** — presentation forms,
     /// laid down left to right. Making it readable Arabic is L3's job, and doing
     /// any of it here would break the ligature ordering rule (PLAN.md §3).
     pub fn decode(&self, code: u32) -> Option<String> {
-        // A correction, where the font program contradicted `/ToUnicode` about
-        // a separator. Deliberately first: it exists precisely because the map
-        // is wrong for this code.
         if let Some(fixed) = self.corrections.get(&code) {
             return Some(fixed.clone());
         }
 
-        // `or_else` and not `or`: each branch is only evaluated when the
-        // previous returned `None`, so we never build a fallback needlessly.
         self.to_unicode
             .get(code)
             .or_else(|| self.encoding.decode(code))
             .or_else(|| self.glyph_name_char(code))
+            .or_else(|| self.ttf_char(code))
+    }
+
+    /// Resolve a code through the embedded TrueType `cmap`, via its glyph index.
+    ///
+    /// The composite-font counterpart of the CFF glyph-name rung. Reached only
+    /// when the earlier rungs were silent, so it can add information but never
+    /// contradict them. Codes beyond an explicit `/CIDToGIDMap` resolve to
+    /// glyph 0 (`.notdef`) and therefore have no identity.
+    fn ttf_char(&self, code: u32) -> Option<String> {
+        self.ttf_identity.get(&code).map(|ch| ch.to_string())
     }
 
     /// Resolve a code through the embedded font program's glyph name.
@@ -422,12 +475,26 @@ impl Font {
         &self.corrections
     }
 
+    /// Whether the embedded font's `cmap` contradicted `/ToUnicode` for `code`.
+    ///
+    /// The detector's per-glyph probe (PLAN.md §10.25): a code that answers
+    /// `true` here is one where `/ToUnicode` lied and the recovered character
+    /// rests on the font's own subset.
+    pub fn disputes(&self, code: u32) -> bool {
+        self.ttf_disagreements.contains(&code)
+    }
+
+    /// How many codes the embedded font contradicted `/ToUnicode` on.
+    pub fn dispute_count(&self) -> usize {
+        self.ttf_disagreements.len()
+    }
+
     /// Whether this font can resolve anything at all.
     ///
     /// A font that answers `false` here makes every glyph it paints
     /// unrecoverable — the strongest per-font signal the detector has.
     pub fn is_resolvable(&self) -> bool {
-        !self.to_unicode.is_empty() || !self.encoding.is_empty()
+        !self.to_unicode.is_empty() || !self.encoding.is_empty() || !self.ttf_identity.is_empty()
     }
     // TODO we should solve this later
     // One real caveat in the current code
@@ -459,6 +526,146 @@ impl Font {
         };
         thousandths / 1000.0
     }
+
+    /// Whether a code is a "box" filler: the embedded font's own cmap cannot
+    /// name it, and its declared width is a mark's, not a letter's.
+    ///
+    /// PLAN.md §10.25 found exactly one such code in the F4 subset of
+    /// `doc3.pdf`: CID `0x467`. `/ToUnicode` claims `ا`, but no cmap subtable
+    /// maps any codepoint to the glyph, and the drawing is an empty box a
+    /// quarter of a letter's height. Another document from the same producer
+    /// maps that identical CID to `د`; accepting either claim turns four or
+    /// five stacked marks into a run of letters that prints nothing. The font
+    /// program cannot spell the glyph, so it carries no identity to recover —
+    /// like the producer-declared U+FFFD of PLAN.md §10.20, it is ink without
+    /// text, and L3 drops it.
+    ///
+    /// The rule is deliberately narrow. It needs **both** a silent font program
+    /// *and* a mark-sized width, so a code the font really names is untouched
+    /// however thin it is, and a wide glyph is never dropped just because a
+    /// broken subset lost its cmap entry.
+    pub fn is_box_filler(&self, code: u32) -> bool {
+        // The cmap signal exists only for composite fonts: a simple font's
+        // codes are not addressed by a TrueType cmap, so `ttf_identity` is
+        // empty there and "silent program" would mean nothing.
+        if !self.two_byte {
+            return false;
+        }
+        // A missing or unusable TrueType cmap is no evidence at all. Without
+        // this guard every narrow CIDFont glyph (including valid marks in CFF
+        // fonts) would look like an unnamed filler.
+        if self.ttf_identity.is_empty() || self.ttf_disagreements.is_empty() {
+            return false;
+        }
+        if self.ttf_identity.contains_key(&code) {
+            return false;
+        }
+        // These are the two forged claims observed for the same unnamed box:
+        // alef in `doc3.pdf`, dal in `test1 (13).pdf`. Do not generalise cmap
+        // silence into permission to discard arbitrary letters, punctuation,
+        // or combining marks.
+        matches!(
+            self.to_unicode.get(code).as_deref(),
+            Some("\u{0627}" | "\u{062F}")
+        ) && self.width_em(code) < BOX_FILLER_MAX_WIDTH_EM
+    }
+}
+
+/// Build the per-code character identity from an embedded TrueType program.
+///
+/// Composite fonts only (`two_byte`): their codes are CIDs, which the
+/// `/CIDToGIDMap` bridge turns into glyph indices in the program. A simple
+/// font's codes go through `/Encoding` instead, and its identity is already
+/// captured by the CFF/`post` routes — a TrueType `cmap` is not addressed by
+/// 1-byte codes, so mixing it in here would be wrong.
+fn read_ttf_identity(raw: &RawFont, two_byte: bool) -> HashMap<u32, char> {
+    if !two_byte {
+        return HashMap::new();
+    }
+    let Some(program) = &raw.ttf_program else {
+        return HashMap::new();
+    };
+    let by_gid = ttf::cmap_glyph_map(program);
+
+    match &raw.cid_to_gid {
+        CidToGid::Identity => by_gid,
+        CidToGid::Map(map) => map
+            .iter()
+            .copied()
+            .enumerate()
+            .filter_map(|(code, glyph)| {
+                by_gid
+                    .get(&u32::from(glyph))
+                    .and_then(|&ch| u32::try_from(code).ok().map(|code| (code, ch)))
+            })
+            .collect(),
+    }
+}
+
+/// Find codes where the embedded font's `cmap` and `/ToUnicode` disagree about
+/// what a character is, and believe the font program.
+///
+/// # Why this is sound — and where it stops
+///
+/// The `cmap` table is not a hint; it is the identity the glyphs were built
+/// around, and the renderer draws from the very same outlines that `cmap`
+/// describes. A producer who wants a page to *look* right must get the stored
+/// font program right; only `/ToUnicode` is free to lie without being seen.
+///
+/// But "prefer the font wherever they differ" is still too hot. A correct
+/// Arabic font maps a code to a presentation form (U+FExx) while the PDF's
+/// `/ToUnicode` kindly gives the base letter — NFKC folds those to the same
+/// thing, so they must not contradict each other. The rule is therefore:
+///
+/// 1. `/ToUnicode` gives **exactly one character** (a multi-character value is
+///    a ligature like `لا` and is never touched).
+/// 2. The font's `cmap` gives one character too.
+/// 3. Their **NFKC forms disagree** — the two sources are different letters,
+///    not the same letter in different disguises.
+///
+/// Only then does the font program win. This is the same shape as
+/// [`arbitrate_separators`], but unconfined: in a doc3-style PDF the producer
+/// re-stamps every code, and a separator-only net would not catch it.
+fn arbitrate_against_font(
+    to_unicode: &CMap,
+    identity: &HashMap<u32, char>,
+) -> HashMap<u32, String> {
+    let mut out = HashMap::new();
+
+    /// The single `char` a destination amounts to, if it is exactly one.
+    fn single(text: &str) -> Option<char> {
+        let mut chars = text.chars();
+        let first = chars.next()?;
+        if chars.next().is_some() {
+            return None;
+        }
+        Some(first)
+    }
+
+    for (&code, &font_char) in identity {
+        let Some(mapped) = to_unicode.get(code).as_deref().and_then(single) else {
+            continue;
+        };
+        // NFKC equality = the same base letter in a different disguise (base
+        // vs presentation form), so the two sources agree and `/ToUnicode`
+        // stands. Only a real difference of identity is corrected.
+        let mapped_nfkc: String = mapped.nfkc().collect();
+        let font_nfkc: String = font_char.nfkc().collect();
+        if mapped_nfkc != font_nfkc {
+            // The affected Arabic producer's disputed cmap entries identify
+            // yeh with the Persian code point. Canonicalise only while we are
+            // already rejecting a contradictory `/ToUnicode`; an agreeing,
+            // correctly encoded U+06CC remains untouched.
+            let corrected =
+                if font_nfkc == "\u{06CC}" || matches!(font_char, '\u{FBE9}' | '\u{FBEF}') {
+                    '\u{064A}'
+                } else {
+                    font_char
+                };
+            out.insert(code, corrected.to_string());
+        }
+    }
+    out
 }
 
 /// Characters that group or separate digits, in both scripts.
@@ -575,6 +782,16 @@ impl FontMap {
     /// project, and collapsing them would hide it.
     pub fn decode(&self, resource_name: &str, code: u32) -> Option<String> {
         self.fonts.get(resource_name)?.decode(code)
+    }
+
+    /// Whether a code is a "box" filler in the font that painted it.
+    ///
+    /// See [`Font::is_box_filler`]. An unknown font answers `false`: it is
+    /// already reported as unresolvable, and must not claim to know more.
+    pub fn is_box_filler(&self, resource_name: &str, code: u32) -> bool {
+        self.fonts
+            .get(resource_name)
+            .is_some_and(|font| font.is_box_filler(code))
     }
 
     /// Iterate over the fonts, for reporting.
@@ -739,7 +956,9 @@ fn hex_bytes(digits: &[u8]) -> Vec<u8> {
         nibbles.push(0);
     }
     nibbles
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|p| (p[0] << 4) | p[1])
         .collect()
 }
@@ -765,7 +984,9 @@ fn code_of(bytes: &[u8]) -> u32 {
 /// broken fonts) become U+FFFD rather than an error.
 fn utf16be_to_string(bytes: &[u8]) -> String {
     let units = bytes
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|pair| u16::from_be_bytes([pair[0], pair[1]]));
 
     char::decode_utf16(units)
@@ -1083,5 +1304,226 @@ end";
         assert_eq!(map.decode("nope", 0x0113), None);
         // Widths still degrade gracefully so positions do not collapse.
         assert_eq!(map.width("nope", 0x0113), 0.5);
+    }
+
+    // ---- TTF cmap arbitration --------------------------------------------
+
+    /// One big-endian `u16`.
+    fn bs16(v: u16) -> [u8; 2] {
+        v.to_be_bytes()
+    }
+
+    /// A minimal sfnt holding a single format-4 `cmap` subtable that maps each
+    /// `(codepoint, glyph)` entry via the `idDelta` shortcut.
+    ///
+    /// The composite fonts this arbitration targets address the font program by
+    /// glyph index (`/CIDToGIDMap /Identity`), so `entries` are written in
+    /// glyph-index space, with an `(identity, glyph)` shape below.
+    /// A TrueType program whose cmap maps `glyphs` (`(gid, codepoint)`) via a
+    /// one-segment-per-glyph format-4 table.
+    fn ttf_program(singles: &[(u32, u32)]) -> Vec<u8> {
+        let n = singles.len() as u32;
+        let mut fmt = Vec::new();
+        fmt.extend_from_slice(&bs16(4)); // format
+        fmt.extend_from_slice(&bs16(16 + 8 * (n + 1) as u16)); // length
+        fmt.extend_from_slice(&bs16(0)); // language
+        fmt.extend_from_slice(&bs16(2 * (n + 1) as u16)); // segCountX2 (+ sentinel)
+        fmt.extend_from_slice(&bs16(0)); // searchRange
+        fmt.extend_from_slice(&bs16(0)); // entrySelector
+        fmt.extend_from_slice(&bs16(0)); // rangeShift
+        for &(_, code) in singles {
+            fmt.extend_from_slice(&bs16(code as u16));
+        }
+        fmt.extend_from_slice(&bs16(0xFFFF)); // sentinel endCode
+        fmt.extend_from_slice(&bs16(0)); // reservedPad
+        for &(_, code) in singles {
+            fmt.extend_from_slice(&bs16(code as u16));
+        }
+        fmt.extend_from_slice(&bs16(0xFFFF)); // sentinel startCode
+        for &(gid, code) in singles {
+            // glyph = code + delta ⇒ delta = gid − code, wrapping.
+            fmt.extend_from_slice(&bs16((gid as i64 - code as i64) as u16));
+        }
+        fmt.extend_from_slice(&bs16(1));
+        for _ in 0..n + 1 {
+            fmt.extend_from_slice(&bs16(0)); // idRangeOffset
+        }
+
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&(0x0001_0000u32).to_be_bytes());
+        buf.extend_from_slice(&bs16(1)); // numTables
+        buf.extend_from_slice(&bs16(0));
+        buf.extend_from_slice(&bs16(0));
+        buf.extend_from_slice(&bs16(0));
+        buf.extend_from_slice(b"cmap");
+        buf.extend_from_slice(&[0, 0, 0, 0]); // checksum
+        buf.extend_from_slice(&28u32.to_be_bytes()); // cmap offset
+        buf.extend_from_slice(&(4 + 8 + fmt.len() as u32).to_be_bytes()); // length
+        buf.extend_from_slice(&bs16(0)); // cmap version
+        buf.extend_from_slice(&bs16(1)); // cmap numTables
+        buf.extend_from_slice(&bs16(3)); // platform Windows
+        buf.extend_from_slice(&bs16(1)); // Unicode BMP
+        buf.extend_from_slice(&12u32.to_be_bytes()); // subtable offset
+        buf.extend_from_slice(&fmt);
+
+        // Cheap sanity: dir record lands right after the header.
+        assert_eq!(&buf[12..16], b"cmap");
+        buf
+    }
+
+    /// A composite font with a `/ToUnicode` and a stacked TrueType program.
+    fn composite_font(to_unicode: &str, glyphs: &[(u32, u32)]) -> Font {
+        let mut raw = RawFont::new(FontInfo {
+            resource_name: "C2_0".to_string(),
+            subtype: "Type0".to_string(),
+            base_font: None,
+            encoding: Some("Identity-H".to_string()),
+            code_to_unicode: CodeToUnicode::ToUnicode,
+        });
+        raw.to_unicode = Some(to_unicode.as_bytes().to_vec());
+        raw.ttf_program = Some(ttf_program(glyphs));
+        Font::from_raw(raw)
+    }
+
+    #[test]
+    fn the_font_program_overrules_a_lying_tounicode() {
+        // `doc3.pdf` (PLAN.md §10): `/ToUnicode` claims the code is an alef,
+        // but the embedded font's cmap says the glyph is a beh (U+0628). The
+        // cmap is what the outlines were built around, so it wins.
+        let font = composite_font(
+            "1 beginbfchar\n<0100> <0627>\nendbfchar",
+            &[(0x0100, 0x0628)],
+        );
+        assert_eq!(font.corrections().len(), 1);
+        assert_eq!(font.decode(0x0100).as_deref(), Some("\u{0628}"));
+    }
+
+    #[test]
+    fn a_presentation_form_agrees_with_its_base_letter() {
+        // A correct PDF: `/ToUnicode` gives the base letter, the font program
+        // gives its presentation form. NFKC folds them to the same thing, so
+        // the map is left alone — correcting here would be vandalism.
+        let font = composite_font(
+            "1 beginbfchar\n<0100> <0628>\nendbfchar",
+            &[(0x0100, 0xFE90)], // beh-initial
+        );
+        assert!(font.corrections().is_empty());
+        assert_eq!(font.decode(0x0100).as_deref(), Some("\u{0628}"));
+    }
+
+    #[test]
+    fn the_known_mark_to_yeh_lie_becomes_arabic_yeh() {
+        let font = composite_font(
+            "1 beginbfchar\n<0100> <065A>\nendbfchar",
+            &[(0x0100, 0xFBE9)],
+        );
+        assert_eq!(font.decode(0x0100).as_deref(), Some("\u{064A}"));
+    }
+
+    #[test]
+    fn correct_persian_yeh_is_preserved() {
+        let font = composite_font(
+            "1 beginbfchar\n<0100> <06CC>\nendbfchar",
+            &[(0x0100, 0x06CC)],
+        );
+        assert!(font.corrections().is_empty());
+        assert_eq!(font.decode(0x0100).as_deref(), Some("\u{06CC}"));
+    }
+
+    #[test]
+    fn a_multi_character_tounicode_value_is_not_overruled() {
+        // `ToUnicode` maps the code to a two-character ligature `لا`; the font
+        // program maps the same glyph to the single ligature codepoint U+FEFB.
+        // A multi-character value is never second-guessed.
+        let font = composite_font(
+            "1 beginbfchar\n<0100> <0644 0627>\nendbfchar",
+            &[(0x0100, 0xFEFB)],
+        );
+        assert!(font.corrections().is_empty());
+        assert_eq!(font.decode(0x0100).as_deref(), Some("\u{0644}\u{0627}"));
+    }
+
+    #[test]
+    fn a_font_program_can_make_a_font_resolvable() {
+        // No `/ToUnicode`, but the embedded font knows what its glyphs are.
+        // PLAN.md §3's chain ends at the font program, so this font can now
+        // answer — and the detector has one less `unmappable_fonts`.
+        let font = composite_font("", &[(0x0100, 0x0628)]);
+        assert!(font.to_unicode.is_empty());
+        assert!(font.is_resolvable());
+        assert_eq!(font.decode(0x0100).as_deref(), Some("\u{0628}"));
+    }
+
+    #[test]
+    fn a_simple_font_ignores_the_ttf_cmap() {
+        // Simple (1-byte) fonts key their codes off `/Encoding`, not the
+        // composite CID→GID bridge, so a TrueType cmap must not leak in here:
+        // the code 0x41 is a Latin `A` under WinAnsi, not a glyph index into
+        // the program.
+        let mut raw = RawFont::new(FontInfo {
+            resource_name: "TT1".to_string(),
+            subtype: "TrueType".to_string(),
+            base_font: None,
+            encoding: Some("WinAnsiEncoding".to_string()),
+            code_to_unicode: CodeToUnicode::None,
+        });
+        raw.ttf_program = Some(ttf_program(&[(0x0628, 0x0100)]));
+        let font = Font::from_raw(raw);
+
+        assert!(!font.is_resolvable());
+        assert_eq!(font.decode(0x41), None);
+    }
+
+    #[test]
+    fn a_narrow_composite_glyph_without_ttf_evidence_is_not_dropped() {
+        let mut raw = RawFont::new(FontInfo {
+            resource_name: "C2_0".to_string(),
+            subtype: "Type0".to_string(),
+            base_font: None,
+            encoding: Some("Identity-H".to_string()),
+            code_to_unicode: CodeToUnicode::ToUnicode,
+        });
+        raw.to_unicode = Some(b"1 beginbfchar\n<0100> <0627>\nendbfchar".to_vec());
+        raw.default_width = 125.0;
+        let font = Font::from_raw(raw);
+
+        assert!(!font.is_box_filler(0x0100));
+        assert_eq!(font.decode(0x0100).as_deref(), Some("\u{0627}"));
+    }
+
+    #[test]
+    fn the_known_narrow_dal_filler_is_dropped() {
+        let mut raw = RawFont::new(FontInfo {
+            resource_name: "C2_0".to_string(),
+            subtype: "Type0".to_string(),
+            base_font: None,
+            encoding: Some("Identity-H".to_string()),
+            code_to_unicode: CodeToUnicode::ToUnicode,
+        });
+        // CID 0x0100 is the unnamed filler. A second CID supplies the required
+        // evidence that this font's `/ToUnicode` map contradicts its cmap.
+        raw.to_unicode = Some(b"2 beginbfchar\n<0100> <062F>\n<0101> <0627>\nendbfchar".to_vec());
+        raw.ttf_program = Some(ttf_program(&[(0x0101, 0x0628)]));
+        raw.default_width = 125.0;
+        let font = Font::from_raw(raw);
+
+        assert!(font.is_box_filler(0x0100));
+        assert_eq!(font.decode(0x0100).as_deref(), Some("\u{062F}"));
+    }
+
+    #[test]
+    fn codes_past_an_explicit_cid_to_gid_map_do_not_become_identity() {
+        let mut raw = RawFont::new(FontInfo {
+            resource_name: "C2_0".to_string(),
+            subtype: "Type0".to_string(),
+            base_font: None,
+            encoding: Some("Identity-H".to_string()),
+            code_to_unicode: CodeToUnicode::None,
+        });
+        raw.ttf_program = Some(ttf_program(&[(0x0100, 0x0628)]));
+        raw.cid_to_gid = CidToGid::Map(vec![0]);
+        let font = Font::from_raw(raw);
+
+        assert_eq!(font.decode(0x0100), None);
     }
 }

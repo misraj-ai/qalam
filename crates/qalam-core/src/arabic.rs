@@ -637,6 +637,22 @@ fn build_line(placed: &[Placed], fonts: &FontMap) -> Option<TextLine> {
             continue;
         }
 
+        // A "box" glyph — a code the embedded font's own cmap cannot name,
+        // drawn at mark width — is ink without text (PLAN.md §10.25). Its
+        // `/ToUnicode` claim (`ا`) is the producer's guess at an identity the
+        // font itself never had; accepting it as a real letter doubled those
+        // marks into the `اااا` runs that print nothing. Drop the claim but
+        // keep the pen movement, exactly as the producer-declared U+FFFD above
+        // does.
+        //
+        // Only when we did resolve the code: an unresolvable `decoded_ok ==
+        // false` glyph is *lost* text and must keep counting as unresolved.
+        if decoded_ok && fonts.is_box_filler(&glyph.style.font, glyph.code) {
+            let end = glyph.along() + glyph.advance;
+            right_edge = Some(right_edge.map_or(end, |e| e.max(end)));
+            continue;
+        }
+
         if text == "\u{FFFD}" {
             unresolved += 1;
         }
@@ -689,15 +705,6 @@ fn build_line(placed: &[Placed], fonts: &FontMap) -> Option<TextLine> {
                 merge_hamza(&text, base, composed).map(|merged| (slot, merged))
             });
         if let Some((slot, merged)) = merged {
-            if std::env::var_os("QALAM_DBG").is_some() {
-                eprintln!(
-                    "MERGE slot={slot} at_slot={:?} host={:?} -> {:?} len={}",
-                    pieces.get(slot).map(piece_str),
-                    text,
-                    merged,
-                    pieces.len()
-                );
-            }
             // The overlay is now inside this piece, so its own is dropped.
             pieces.remove(slot);
             pieces.push(Piece::Decoded(merged));
@@ -754,12 +761,6 @@ fn build_line(placed: &[Placed], fonts: &FontMap) -> Option<TextLine> {
     // and that space would split a word in half. Observed on page 5 of the
     // fixture, where `تتضمّن` came out as `تتض َّمن`.
     let text = tidy_whitespace(&strip_mark_bases(&normalised));
-    if std::env::var_os("QALAM_DBG").is_some() && text.contains("\u{0625}\u{0625}") {
-        eprintln!(
-            "PIECES: {:?}",
-            pieces.iter().map(piece_str).collect::<Vec<_>>()
-        );
-    }
     if text.is_empty() {
         return None;
     }
@@ -1322,6 +1323,11 @@ mod tests {
                 0xFB50..=0xFDFF | 0xFE70..=0xFEFF)),
             "presentation forms survived: {mixed:?}"
         );
+    }
+
+    #[test]
+    fn genuine_persian_yeh_is_not_rewritten() {
+        assert_eq!(visual_to_text("\u{06CC}"), "\u{06CC}");
     }
 
     #[test]

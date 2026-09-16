@@ -2,6 +2,11 @@
 /target/
 **/target/
 
+# Project-local Rust toolchain (installed so it stays off C: and out of the
+# rest of the system; see AGENTS.md / .cargo/activate)
+/.cargo/
+/.rustup/
+
 # Python virtualenvs (the PyO3/maturin side of the project)
 .venv/
 __pycache__/
@@ -18,3 +23,9 @@ __pycache__/
 # Built Python wheels / sdists
 /dist/
 /paper/
+
+# Golden corpus: fixtures and expected output are large and local-only, and a
+# document may only be redistributed with confirmation (AGENTS.md). The tests
+# skip when they are absent, so a checkout without them still passes.
+/tests/fixtures/
+/tests/expected/

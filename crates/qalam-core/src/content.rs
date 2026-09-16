@@ -855,7 +855,7 @@ impl Interpreter<'_> {
         if two_byte {
             // `chunks_exact(2)` yields only whole pairs, dropping a trailing odd
             // byte — which would be a malformed string anyway.
-            for pair in bytes.chunks_exact(2) {
+            for pair in bytes.as_chunks::<2>().0 {
                 // Big-endian: PDF writes the high byte first.
                 let code = u32::from(pair[0]) << 8 | u32::from(pair[1]);
                 self.emit(code, false);
@@ -1003,7 +1003,9 @@ fn object_name(obj: &Object) -> Option<String> {
 fn pdf_text_string(bytes: &[u8]) -> String {
     if bytes.starts_with(&[0xFE, 0xFF]) {
         let units = bytes[2..]
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|pair| u16::from_be_bytes([pair[0], pair[1]]));
         return char::decode_utf16(units)
             .map(|r| r.unwrap_or(char::REPLACEMENT_CHARACTER))

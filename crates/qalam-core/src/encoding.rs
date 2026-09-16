@@ -381,7 +381,9 @@ fn component_to_string(component: &str) -> Option<String> {
         if !rest.is_empty() && rest.len() % 4 == 0 && rest.chars().all(|c| c.is_ascii_hexdigit()) {
             let units: Vec<u16> = rest
                 .as_bytes()
-                .chunks_exact(4)
+                .as_chunks::<4>()
+                .0
+                .iter()
                 .filter_map(|chunk| {
                     // `from_utf8` cannot fail here: we checked every byte is a
                     // hex digit, which is ASCII.

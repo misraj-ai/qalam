@@ -517,6 +517,22 @@ impl Glyph {
         }
     }
 }
+/// How a composite font's CIDs become glyph indices in the embedded font program.
+///
+/// The content stream addresses a composite font by **CID**; the embedded
+/// TrueType program is indexed by **glyph number (GID)**. This is the bridge
+/// between the two, and without it a font program can say nothing about the
+/// codes a page actually uses.
+#[derive(Debug, Clone)]
+pub enum CidToGid {
+    /// `/CIDToGIDMap /Identity` (or absent, which defaults to it for a
+    /// `CIDFontType2`): code and glyph index are the same number.
+    Identity,
+    /// `/CIDToGIDMap` is a stream: code → glyph index, one big-endian `u16` per
+    /// entry. Codes past the end of the table map to glyph 0 (`.notdef`).
+    Map(Vec<u16>),
+}
+
 // To know more about this object read section 9.7.3 Pdf32000_Iso The name for RawFont is CIDFont
 /// A font's data pulled out of the PDF object graph, in plain Rust form.
 ///
@@ -557,6 +573,16 @@ pub struct RawFont {
     /// The only source of glyph identity that the *renderer* checks, and so the
     /// only one a producer cannot get wrong unnoticed. See [`crate::cff`].
     pub font_program: Option<Vec<u8>>,
+    /// The embedded TrueType program (`/FontFile2`), if there is one.
+    ///
+    /// Like the CFF program, this is renderer-checked. Its `cmap` table records
+    /// what each glyph stands for, so it is the right second opinion when a
+    /// `/ToUnicode` map lies (PLAN.md §10). See [`crate::ttf`]. For a composite
+    /// font this is read from the descendant CIDFont's `/FontDescriptor`, which
+    /// is where the spec puts it.
+    pub ttf_program: Option<Vec<u8>>,
+    /// How composite-font CIDs map to glyph indices in `ttf_program`.
+    pub cid_to_gid: CidToGid,
 }
 
 impl RawFont {
@@ -574,6 +600,8 @@ impl RawFont {
             base_encoding: None,
             differences: Vec::new(),
             font_program: None,
+            ttf_program: None,
+            cid_to_gid: CidToGid::Identity,
         }
     }
 }

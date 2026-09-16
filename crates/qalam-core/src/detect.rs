@@ -23,6 +23,7 @@
 //! | Presentation forms surviving normalisation | NFKC did not do its job |
 //! | Share of glyphs painted invisibly (`Tr 3`) | Someone else's OCR layer |
 //! | Replacement characters in the output | Corruption that reached the text |
+//! | A font contradicting its own `cmap` over `/ToUnicode` | A lying map (§10.25) |
 //!
 //! A page is only called `Ok` when every one of them is clean.
 
@@ -75,6 +76,13 @@ pub struct Signals {
     pub residual_presentation_forms: usize,
     /// U+FFFD characters in the final text.
     pub replacement_chars: usize,
+    /// Glyphs whose code the embedded font's `cmap` contradicts `/ToUnicode`
+    /// on (PLAN.md §10.25).
+    ///
+    /// The text was recovered by believing the outlines, but the map itself was
+    /// a lie — every such character is only as good as the font's subset, so a
+    /// page full of them must not claim a clean `ok`.
+    pub disputed_glyphs: usize,
     /// Characters of text produced.
     pub text_len: usize,
     /// `true` when the page groups digits with both `,` and `.`.
@@ -103,6 +111,15 @@ impl Signals {
             return 0.0;
         }
         self.invisible_glyphs as f64 / self.glyph_count as f64
+    }
+
+    /// Share of glyphs whose font contradicted its own `cmap` against
+    /// `/ToUnicode`.
+    pub fn disputed_rate(&self) -> f64 {
+        if self.glyph_count == 0 {
+            return 0.0;
+        }
+        self.disputed_glyphs as f64 / self.glyph_count as f64
     }
 }
 
@@ -136,6 +153,14 @@ const NEEDS_OCR_RESOLUTION: f64 = 0.5;
 /// resolved. A tolerance here would let real losses pass as clean, which is the
 /// failure this project exists to prevent.
 const DEGRADED_RESOLUTION: f64 = 1.0;
+/// Above this share of glyphs, the font's `cmap` contradicts `/ToUnicode` on
+/// so many codes that the page's map is a lie.
+///
+/// Not 1.0: a page is *built* on this disagreement — the re-stamped filler
+/// documents of §10.25 dispute well over half their glyphs. A single dispute
+/// could be a quirky code; a page mostly made of disputed glyphs is a page
+/// whose word is the font's, not the document's.
+const DISPUTED_MAP_SHARE: f64 = 0.3;
 /// Above this share of invisible glyphs, the text layer is somebody's OCR.
 const OCR_LAYER_INVISIBLE_RATE: f64 = 0.9;
 /// Fewer characters than this on a page with glyphs suggests a stray label
@@ -185,6 +210,11 @@ fn measure(glyphs: &PageGlyphs, fonts: &FontMap, lines: &[TextLine]) -> Signals 
         replacement_chars: text
             .chars()
             .filter(|c| *c == char::REPLACEMENT_CHARACTER)
+            .count(),
+        disputed_glyphs: glyphs
+            .glyphs
+            .iter()
+            .filter(|g| fonts.get(&g.style.font).is_some_and(|f| f.disputes(g.code)))
             .count(),
         text_len: text.chars().count(),
         mixed_digit_separators: has_mixed_separators(&text),
@@ -298,6 +328,24 @@ fn judge(s: &Signals) -> (Recoverability, Vec<String>) {
         );
     }
 
+    if s.disputed_rate() > DISPUTED_MAP_SHARE {
+        // §10.25: the font's own `cmap` disagrees with `/ToUnicode` on most of
+        // its codes. The text was recovered from the outlines, but the page's
+        // identity map is a lie — the word on the page is the font subset's,
+        // which can still mislead (e.g. the box glyph has no map entry at all).
+        fail(
+            Recoverability::Degraded,
+            format!(
+                "{} of {} glyphs ({:.0}%) were resolved by rejecting the page's own \
+                 /ToUnicode map — it contradicts the embedded font",
+                s.disputed_glyphs,
+                s.glyph_count,
+                s.disputed_rate() * 100.0
+            ),
+            &mut verdict,
+        );
+    }
+
     if s.invisible_rate() > OCR_LAYER_INVISIBLE_RATE {
         // Not a failure of ours: the text is readable. But it is somebody
         // else's OCR output, so its accuracy is theirs, not the document's.
@@ -355,6 +403,10 @@ fn confidence(s: &Signals, verdict: Recoverability) -> f64 {
     if s.font_count > 0 {
         score -= 0.2 * (s.unmappable_fonts as f64 / s.font_count as f64);
     }
+    // A contradictory map is repaired text, not trusted text: the character
+    // rests on the font subset, which proved fickle. Proportional to the share
+    // of the page it touches, capped so one signal never zeroes the score.
+    score -= (0.5 * s.disputed_rate()).min(0.4);
     if s.invisible_rate() > OCR_LAYER_INVISIBLE_RATE {
         score -= 0.1;
     }
@@ -404,6 +456,7 @@ mod tests {
             invisible_glyphs: 0,
             residual_presentation_forms: 0,
             replacement_chars: 0,
+            disputed_glyphs: 0,
             text_len: 480,
             mixed_digit_separators: false,
         }
@@ -511,6 +564,48 @@ mod tests {
     }
 
     #[test]
+    fn a_page_whose_font_contradicts_tounicode_is_degraded() {
+        // PLAN.md §10.25: the re-stamped filler documents dispute well over
+        // half their glyphs. Repaired text is not trusted text.
+        let s = Signals {
+            disputed_glyphs: 300,
+            ..healthy()
+        };
+        assert_eq!(s.disputed_rate(), 0.6);
+        let (verdict, reasons) = judge(&s);
+        assert_eq!(verdict, Recoverability::Degraded);
+        assert!(reasons
+            .iter()
+            .any(|r| r.contains("contradicts the embedded font")));
+        assert!(
+            confidence(&s, verdict) < 1.0,
+            "a lying map must cost confidence"
+        );
+    }
+
+    #[test]
+    fn a_lone_dispute_is_a_quirky_code_not_a_lying_map() {
+        // A single disputed code on a clean page is below the share threshold:
+        // it is a quirky mapping, not a page built on /ToUnicode's lie.
+        let s = Signals {
+            disputed_glyphs: 1,
+            ..healthy()
+        };
+        assert_eq!(judge(&s).0, Recoverability::Ok);
+    }
+
+    #[test]
+    fn disputed_glyphs_do_not_need_ocr() {
+        // The text came out and is mostly trustworthy — the verdict is
+        // Degraded, never NeedsOcr, for a contradictory but readable map.
+        let s = Signals {
+            disputed_glyphs: 490,
+            ..healthy()
+        };
+        assert_eq!(judge(&s).0, Recoverability::Degraded);
+    }
+
+    #[test]
     fn glyphs_that_produce_no_text_need_ocr() {
         // Every code resolved, but to nothing usable — a font whose CMap maps
         // everything to a blank.
@@ -588,6 +683,7 @@ mod tests {
             invisible_glyphs: 10,
             residual_presentation_forms: 50,
             replacement_chars: 50,
+            disputed_glyphs: 9,
             text_len: 10,
             mixed_digit_separators: true,
         };

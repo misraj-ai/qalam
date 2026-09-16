@@ -19,8 +19,8 @@ use lopdf::{Dictionary, Document, Object, ObjectId};
 
 use crate::error::{Error, Result};
 use crate::types::{
-    CodeToUnicode, FontInfo, ImageColorSpace, PageInfo, Palette, RawFont, RawForm, RawImage,
-    RawStructure, Rect, Rotation, StructElement,
+    CidToGid, CodeToUnicode, FontInfo, ImageColorSpace, PageInfo, Palette, RawFont, RawForm,
+    RawImage, RawStructure, Rect, Rotation, StructElement,
 };
 
 /// An opened PDF document.
@@ -625,6 +625,7 @@ impl Pdf {
             self.read_simple_widths(dict, &mut raw);
             self.read_encoding(dict, &mut raw);
             raw.font_program = self.read_font_program(dict);
+            raw.ttf_program = self.read_ttf_program(dict);
         }
         raw
     }
@@ -646,6 +647,52 @@ impl Pdf {
 
         // Font programs are almost always Flate-compressed.
         stream.decompressed_content().ok()
+    }
+
+    /// Pull the embedded TrueType program out of the font descriptor.
+    ///
+    /// `/FontFile2` is the TTF counterpart of `/FontFile3`. Its `cmap` table
+    /// maps glyphs back to the characters they stand for — the renderer-checked
+    /// identity that nothing downstream can fake (PLAN.md §10).
+    fn read_ttf_program(&self, dict: &Dictionary) -> Option<Vec<u8>> {
+        let descriptor = self
+            .lookup(dict, b"FontDescriptor")
+            .and_then(|o| o.as_dict().ok())?;
+
+        let stream = self
+            .lookup(descriptor, b"FontFile2")
+            .and_then(|o| o.as_stream().ok())?;
+
+        stream.decompressed_content().ok()
+    }
+
+    /// Read a composite font's `/CIDToGIDMap`.
+    ///
+    /// It is either the name `/Identity` (code == glyph index) or a stream of
+    /// big-endian `u16` entries. A name that is not `/Identity` is the malformed
+    /// case and degrades to `/Identity`, which is also the spec's default.
+    fn read_cid_to_gid(&self, descendant: &Dictionary) -> CidToGid {
+        let Some(map) = self.lookup(descendant, b"CIDToGIDMap") else {
+            return CidToGid::Identity;
+        };
+
+        if map.as_name().is_ok_and(|name| name == b"Identity") {
+            return CidToGid::Identity;
+        }
+
+        map.as_stream()
+            .ok()
+            .and_then(|stream| stream.decompressed_content().ok())
+            .map(|bytes| {
+                bytes
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
+                    .map(|pair| u16::from_be_bytes([pair[0], pair[1]]))
+                    .collect::<Vec<u16>>()
+            })
+            .map(CidToGid::Map)
+            .unwrap_or(CidToGid::Identity)
     }
 
     /// Read `/Encoding` in either of its two forms.
@@ -706,7 +753,9 @@ impl Pdf {
     /// Read `/DW` and `/W` from a composite font's descendant.
     ///
     /// A `Type0` font is a shell: the widths live in `/DescendantFonts[0]`,
-    /// which is the actual CIDFont (PLAN.md §10.1).
+    /// which is the actual CIDFont (PLAN.md §10.1). The `/FontDescriptor`
+    /// lives there too, so the TrueType program and the CID→GID bridge are
+    /// read from the same place.
     fn read_cid_widths(&self, dict: &Dictionary, raw: &mut RawFont) {
         let Some(descendant) = self
             .lookup(dict, b"DescendantFonts")
@@ -717,6 +766,9 @@ impl Pdf {
         else {
             return;
         };
+
+        raw.ttf_program = self.read_ttf_program(descendant);
+        raw.cid_to_gid = self.read_cid_to_gid(descendant);
 
         if let Some(dw) = self.lookup(descendant, b"DW").and_then(|o| self.number(o)) {
             raw.default_width = dw;

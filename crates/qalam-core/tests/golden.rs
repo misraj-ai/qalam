@@ -60,6 +60,10 @@ const CORPUS: &[(&str, &str)] = &[
     ("../../tests/fixtures/3.pdf", "../../tests/expected/3.txt"),
     ("../../tests/fixtures/8.pdf", "../../tests/expected/8.txt"),
     ("../../tests/fixtures/12.pdf", "../../tests/expected/12.txt"),
+    (
+        "../../tests/fixtures/doc3.pdf",
+        "../../tests/expected/doc3.txt",
+    ),
 ];
 
 /// The first fixture, which most of the named regressions below refer to.
@@ -80,6 +84,13 @@ const NO_TEXT_GLYPH_FIXTURE: &str = CORPUS[4].0;
 
 /// A document that tightens its tracking with a large negative `Tc`.
 const TIGHT_TRACKING_FIXTURE: &str = CORPUS[5].0;
+
+/// A document whose producer re-stamped most codes, over a filler box glyph,
+/// and whose `/ToUnicode` map is a fabricated word for them (PLAN.md §10.25).
+const DOC3_FIXTURE: &str = CORPUS[6].0;
+
+/// The same producer's filler CID, mapped to dal instead of alef.
+const DAL_FILLER_FIXTURE: &str = "../../tests/fixtures/test1 (13).pdf";
 
 /// Open a document, or `None` when the fixture is absent.
 ///
@@ -691,4 +702,94 @@ fn the_same_table_is_found_with_and_without_ruling() {
         assert_eq!(tables, pages, "the borderless document: one table per page");
         assert!(columns >= 8, "the borderless document lost columns");
     }
+}
+
+#[test]
+fn the_font_program_overrules_a_lying_tounicode() {
+    // PLAN.md §10.25 — `doc3.pdf`'s producer re-stamped most codes over a
+    // filler box glyph whose outline is an empty rectangle, then wrote a
+    // fabricated word for them in `/ToUnicode`. Before the font-program rung,
+    // the decree's own title came back as glyph-shaped garbage. Believing the
+    // embedded font's `cmap` over the lying map must recover it.
+    //
+    // The golden file also catches this, but only as "line 47 changed"; this
+    // test says exactly which invariant broke.
+    let Some(doc) = open(DOC3_FIXTURE) else {
+        return;
+    };
+    let text = doc.page(1).expect("page 1").text();
+
+    assert!(
+        text.contains("قرار بالموافقة على اعتبار صالات رجال الأعمال والمسافرين"),
+        "the recovered decree title should read clean, not as the box-glyph map: {text}"
+    );
+    assert!(
+        text.contains("قرر مجلس الوزراء في جلست"),
+        "the decree's decree line should survive the re-stamping: {text}"
+    );
+}
+
+#[test]
+fn the_box_filler_glyph_is_ink_without_text() {
+    // PLAN.md §10.25 — the filler box CID 0x467 has no entry in any of the
+    // font's cmap subtables, so neither map can say what it is; `/ToUnicode`
+    // guesses `ا`. Believing that guess doubled every vocalisation mark into a
+    // run of alefs: `استعرض` came out as `اسااااتعرض`. The glyph is the
+    // producer's empty box, ink without text, and must be dropped — not read
+    // as a letter.
+    let Some(doc) = open(DOC3_FIXTURE) else {
+        return;
+    };
+    let text = doc.page(1).expect("page 1").text();
+
+    assert!(
+        text.contains("استعرض مجلس الوزراء قراره"),
+        "the decree line should read as one clean sentence: {text}"
+    );
+    assert!(
+        !text.contains("اااا"),
+        "no doubled alef runs may survive: {text}"
+    );
+}
+
+#[test]
+fn the_dal_mapped_box_filler_is_ink_without_text() {
+    // The same unnamed, mark-width CID 0x467 used by `doc3.pdf` is mapped to
+    // dal in this document. It is still the producer's empty filler box, not
+    // text: keeping it turns `بناء على توصية` into runs such as
+    // `بنددددداء علدددددى توصدددددية`.
+    let Some(doc) = open(DAL_FILLER_FIXTURE) else {
+        return;
+    };
+    let text = doc.page(1).expect("page 1").text();
+
+    assert!(
+        text.contains("بناء على توصية لجنة التحديث الاقتصادي والتنمية"),
+        "the recommendation line should not contain dal filler runs: {text}"
+    );
+    assert!(
+        !text.contains("دددد"),
+        "no repeated dal filler run may survive: {text}"
+    );
+}
+
+#[test]
+fn a_persian_yeh_becomes_an_arabic_one() {
+    // `doc3.pdf`'s producer fonts carry U+06CC (Persian yeh) in their cmaps for
+    // glyphs an Arabic document renders as ي (PLAN.md §10.26). The two survive
+    // NFKC apart, so without the canonicalisation every `ي` in the document
+    // came out as `ی`.
+    let Some(doc) = open(DOC3_FIXTURE) else {
+        return;
+    };
+    let text = doc.page(1).expect("page 1").text();
+
+    assert!(
+        text.contains("الجريدة الرسمية"),
+        "the masthead should be in Arabic yeh: {text}"
+    );
+    assert!(
+        !text.contains('\u{06CC}'),
+        "no Persian yeh may survive in an Arabic document: {text}"
+    );
 }

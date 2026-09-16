@@ -345,7 +345,7 @@ fn encode_cmyk(raw: &RawImage) -> std::result::Result<ExtractedImage, String> {
     }
 
     let mut rgb = Vec::with_capacity(pixels * 3);
-    for chunk in raw.data[..expected].chunks_exact(4) {
+    for chunk in raw.data[..expected].as_chunks::<4>().0 {
         // Samples are ink coverage, 0 = none. `255 - v` gives the light that
         // survives, and the product of the two is the channel's value.
         let k = 255 - chunk[3] as u32;
