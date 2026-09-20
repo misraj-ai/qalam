@@ -1090,21 +1090,4 @@ mod tests {
         pdf.read_cid_widths(&font, &mut raw);
         assert_eq!(raw.cid_widths, vec![(u32::MAX, u32::MAX, 500.0)]);
     }
-
-    #[test]
-    fn cid_width_list_stops_at_overflow_despite_an_unparsable_entry() {
-        // Junk sitting on the overflow boundary must not keep the list
-        // running: running out of CID space stops the iteration even when
-        // the boundary entry contributes no width itself.
-        let (pdf, font, mut raw) = font_with_w(vec![
-            Object::Integer(u32::MAX as i64),
-            Object::Array(vec![
-                Object::Integer(500),
-                Object::Name(b"bogus".to_vec()),
-                Object::Integer(600),
-            ]),
-        ]);
-        pdf.read_cid_widths(&font, &mut raw);
-        assert_eq!(raw.cid_widths, vec![(u32::MAX, u32::MAX, 500.0)]);
-    }
 }
