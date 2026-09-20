@@ -429,7 +429,18 @@ impl Font {
     pub fn is_resolvable(&self) -> bool {
         !self.to_unicode.is_empty() || !self.encoding.is_empty()
     }
-
+    // TODO we should solve this later
+    // One real caveat in the current code
+    // /W is indexed by CID, not by the code in the content stream. The proper chain is:
+    // 2-byte code → (the /Encoding CMap) → CID → /W lookup
+    // width_em skips the middle step and matches the raw code against cid_widths directly.
+    // For Identity-H that is correct, the whole point of Identity-H is that code == CID
+    // and types.rs:180 treats every Type0 as 2-byte on that assumption.
+    // So a Type0 font using a non-Identity CMap
+    // (e.g. a legacy Adobe-Arabic-1 ordering, or a one-byte-codespace Type0) would get
+    // wrong widths here, because the code→CID translation never happens.
+    // Rare in practice for modern Arabic PDFs, which are almost
+    // universally Identity-H, but it's the known gap.
     /// Advance width of a code, as a fraction of the em square.
     fn width_em(&self, code: u32) -> f64 {
         let thousandths = if self.two_byte {
