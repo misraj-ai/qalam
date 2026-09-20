@@ -203,7 +203,9 @@ pub struct PageGlyphs {
     /// around every page: our own corpus opens each page with a full-page clip.
     pub ruled_lines: Vec<RuledLine>,
 }
-
+// You can read more at section 9.4 from PDF32000_Iso
+// The operands shall all be numbers, and the initial value for Tm and Tlm
+// shall be the identity matrix, [ 1 0 0 1 0 0 ].
 /// The two text matrices, created by `BT` and dead at `ET`.
 ///
 /// Everything *else* about text state — font, size, `Tc`, `Tw`, `Tz`, `TL`,
@@ -230,6 +232,7 @@ struct Interpreter<'a> {
     fonts: &'a [FontInfo],
     /// The form XObjects this page can draw, by qualified name.
     forms: &'a [RawForm],
+    // The form Xobject is descripes in 8.10 section
     /// The forms we are currently inside, innermost last.
     ///
     /// Joined with `/` it is the prefix that qualifies a resource name, so a
@@ -394,12 +397,14 @@ impl Interpreter<'_> {
             // ---- text objects --------------------------------------------
             "BT" => {
                 // Only the matrices reset; font, spacing and mode persist.
+                // Begin a text object, initializing the text matrix, Tm , and the text line matrix,
+                // Tlm , to the identity matrix. looks at PDF32000_Iso 9.4 section.
                 self.text.tm = Matrix::IDENTITY;
                 self.text.tlm = Matrix::IDENTITY;
             }
             "ET" => {}
 
-            // ---- text state ----------------------------------------------
+            // ---- text state section 9.3----------------------------------------------
             "Tf" => {
                 if let Some(name) = op.operands.first().and_then(object_name) {
                     // Qualified, so a form's `C2_0` is not mistaken for the
@@ -424,7 +429,7 @@ impl Interpreter<'_> {
                 self.params_mut().render_mode = TextRenderMode::from_operand(mode);
             }
 
-            // ---- text positioning ----------------------------------------
+            // ---- text positioning section 9.4.2----------------------------------------
             "Td" => {
                 if let [tx, ty] = nums[..] {
                     self.next_line(tx, ty);
@@ -441,6 +446,8 @@ impl Interpreter<'_> {
             "Tm" => {
                 if let [a, b, c, d, e, f] = nums[..] {
                     // `Tm` *replaces* both matrices; it does not compose.
+                    // The matrix specified by the operands shall not be concatenated onto the
+                    // current text matrix, but shall replace it. See 9.4.2
                     let m = Matrix::new(a, b, c, d, e, f);
                     self.text.tm = m;
                     self.text.tlm = m;
@@ -451,7 +458,7 @@ impl Interpreter<'_> {
                 self.next_line(0.0, -leading);
             }
 
-            // ---- showing text --------------------------------------------
+            // ---- showing text section 9.4.3 --------------------------------------------
             "Tj" => {
                 if let Some(bytes) = op.operands.first().and_then(object_string) {
                     self.show(bytes);
@@ -496,7 +503,7 @@ impl Interpreter<'_> {
                 }
             }
 
-            // ---- path construction ---------------------------------------
+            // ---- path construction section 8.5.2 ---------------------------------------
             // These build a path; nothing is drawn until a painting operator
             // says so. Coordinates are transformed by the CTM as they arrive,
             // so a later `Q` cannot change where an already-built segment is.
@@ -659,6 +666,13 @@ impl Interpreter<'_> {
         // A filled rectangle thinner than this reads as a line rather than a
         // block of colour. Table rules are hairlines to a couple of points;
         // anything thicker is a band or a background.
+        // TODO These value are heuristic and should be tuned, these parameters should be in one file
+        // The unit is the key. PDF's default user space is 1/72 inch, so 3.0 is "about a millimetre." Word processors and typesetters
+        //   draw table rules in a well-known range: a hairline is 0.5pt or less, LaTeX's \arrayrulewidth defaults to 0.4pt, Word's
+        //   thinnest table border is 0.25pt and its common ones are 0.5–1.5pt, and a heavy emphasis rule tops out around 2.25–3pt.
+        //   Above 3pt you're into decorative bands and shaded backgrounds. So the constant sits just above the fattest thing anyone
+        //   calls a border — deliberately generous, because the alternative failure (a real 2pt border discarded, table lost) is worse
+        //   than the cheap one (a 3pt band kept, then rejected later by Table::is_plausible).
         const MAX_RULE_THICKNESS: f64 = 3.0;
         // Shorter than this and it is a tick, a bullet or a dash, not a border.
         const MIN_RULE_LENGTH: f64 = 4.0;
@@ -821,12 +835,15 @@ impl Interpreter<'_> {
     /// The offset is from `tlm`, not `tm` — otherwise each line would drift by
     /// the width of the previous one.
     fn next_line(&mut self, tx: f64, ty: f64) {
+        // see 9.4.2 PDF32000_ISo
         self.text.tlm = Matrix::translation(tx, ty).then(self.text.tlm);
         self.text.tm = self.text.tlm;
     }
 
     /// Paint one string: split it into glyph codes and emit each one.
     fn show(&mut self, bytes: &[u8]) {
+        // The job of this function is to work with on string and split it into Glyphs.
+        // Then each glyph would be processed with emit function which answer Four question.
         // How wide is a code in this font? `Identity-H` composite fonts use two
         // bytes, simple fonts one. Guessing wrong turns text into noise.
         let two_byte = self
@@ -854,6 +871,10 @@ impl Interpreter<'_> {
 
     /// Emit one glyph at the current position and advance the text matrix.
     fn emit(&mut self, code: u32, is_space: bool) {
+        // For each glyph we answer four question.
+        // 1- where is the glyph land on the page?.
+        // 2- What color is it (for the glyph)?
+        // 3- How Far should we move afterword ?
         // Copy the parameters out of the graphics state first. Beyond avoiding
         // borrow-checker friction when we mutate `self.out` below, it keeps the
         // formula readable.
@@ -867,10 +888,16 @@ impl Interpreter<'_> {
         let font = params.font.clone();
         let ctm = self.graphics.current().ctm;
 
+        // For more information read 9.4.4 from PDF32000_Iso
+        // The next three steps answer where the glyph is land on the page.
+        // Text is laid out in "text space", positioned by the text matrix Tm, which itself sits in
+        // user space transformed by the CTM
         // The text rendering matrix: font size and rise, then the text matrix,
         // then the page transform. This composition is what makes
         // `/C2_0 1 Tf` + `20.5559 ... Tm` come out as 20.56pt (PLAN.md §10.1).
         let scaling = Matrix::new(font_size * h_scale, 0.0, 0.0, font_size, 0.0, rise);
+        // Trm is a temporary matrix; conceptually,
+        // it is recomputed before each glyph is painted during a text-showing operation.
         let trm = scaling.then(self.text.tm).then(ctm);
 
         // The glyph origin is the transformed text-space origin, which for this
@@ -878,6 +905,7 @@ impl Interpreter<'_> {
         let (x, y) = trm.apply(0.0, 0.0);
 
         // Which colour a reader actually sees depends on the render mode.
+        // The following line answer the second question what color is it?
         let state = self.graphics.current();
         let color = if render_mode.paints_with_stroke_color() {
             state.stroke_color
@@ -888,6 +916,7 @@ impl Interpreter<'_> {
         // The pen displacement, in unscaled text space. Word spacing applies
         // to the single-byte code 32 only — never to a 2-byte code that equals
         // 32.
+        // The answer for the third question, How far should we move afterword?
         let word = if is_space { word_spacing } else { 0.0 };
         let width = self.widths.width(&font, code);
         let tx = (width * font_size + char_spacing + word) * h_scale;
@@ -925,7 +954,8 @@ impl Interpreter<'_> {
                 render_mode,
             },
         });
-
+        // When we've done from the computation for one glyph we update the text matrix,
+        // to move to tx point, which is the moving step on the page lock at page 252 at PDF32000_Iso.
         self.text.tm = Matrix::translation(tx, 0.0).then(self.text.tm);
     }
 }

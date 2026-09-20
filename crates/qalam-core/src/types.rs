@@ -110,7 +110,7 @@ impl Rotation {
         }
     }
 }
-
+// The Full Entries list in Page object can be read at 7.7.3.3 Pdf32000_ISO
 /// Everything we know about one page *before* looking at its content stream.
 #[derive(Debug, Clone)]
 pub struct PageInfo {
@@ -140,7 +140,11 @@ pub enum CodeToUnicode {
     /// cmap, or the page is simply not recoverable by parsing.
     None,
 }
-
+// In PDF, the term font refers to a font dictionary, a PDF object that identifies the font program and contains
+// additional information about it. There are several different font types, identified by the Subtype entry of the font
+// dictionary.
+// For more info about Font read section 9.5 Pdf32000_Iso
+// For Type0 the one that most used for Arabic can be read at 9.7 section
 /// A summary of one font resource on a page.
 ///
 /// Deliberately *not* the font itself — parsing CMaps and font programs is L2's
@@ -284,7 +288,8 @@ impl Default for Color {
         Color::BLACK
     }
 }
-
+// To read more about Text rendering mode and see what exactly
+// each mode does read section 9.3.6
 /// How glyphs are painted, from the `Tr` (text rendering mode) operator.
 ///
 /// This matters twice over. It decides *which* colour paints a glyph — fill or
@@ -452,7 +457,10 @@ impl TextOrientation {
         matches!(self, TextOrientation::Upward | TextOrientation::Downward)
     }
 }
-
+//A glyph is a graphical shape and is subject to all graphical manipulations, such as
+// coordinate transformation. Because of the importance of text in most page descriptions, PDF provides higher-
+// level facilities to describe, select, and render glyphs conveniently and efficiently.
+// You can read more about Text in Pdf at section 9.1 from Pdf32000_Iso
 /// One glyph as the content stream painted it: a font code at a position.
 ///
 /// This is L1's output and the pipeline's atom. Note what it is **not**: there
@@ -509,7 +517,7 @@ impl Glyph {
         }
     }
 }
-
+// To know more about this object read section 9.7.3 Pdf32000_Iso The name for RawFont is CIDFont
 /// A font's data pulled out of the PDF object graph, in plain Rust form.
 ///
 /// This is the hand-off from L0 to L2. `parser.rs` knows how to walk `/ToUnicode`
