@@ -746,8 +746,10 @@ impl Pdf {
                 Some(next) if next.as_array().is_ok() => {
                     let list = next.as_array().expect("checked just above");
                     for (offset, item) in list.iter().enumerate() {
+                        let Some(cid) = first.checked_add(offset as u32) else {
+                            break;
+                        };
                         if let Some(width) = self.number(item) {
-                            let cid = first + offset as u32;
                             raw.cid_widths.push((cid, cid, width));
                         }
                     }
@@ -1039,5 +1041,53 @@ mod tests {
         assert_eq!(r.x0, 0.0);
         assert_eq!(r.width(), 10.0);
         assert_eq!(r.height(), 20.0);
+    }
+
+    /// A font dict whose descendant carries the given `/W` array, with an
+    /// empty document behind it. The `/W` entries under test are direct
+    /// objects, so nothing needs resolving through the document.
+    fn font_with_w(w: Vec<Object>) -> (Pdf, Dictionary, RawFont) {
+        let pdf = Pdf {
+            doc: Document::with_version("1.7"),
+        };
+        let mut descendant = Dictionary::new();
+        descendant.set("W", Object::Array(w));
+        let mut font = Dictionary::new();
+        font.set(
+            "DescendantFonts",
+            Object::Array(vec![Object::Dictionary(descendant)]),
+        );
+        let raw = RawFont::new(FontInfo {
+            resource_name: "F1".to_string(),
+            subtype: "Type0".to_string(),
+            base_font: None,
+            encoding: None,
+            code_to_unicode: CodeToUnicode::None,
+        });
+        (pdf, font, raw)
+    }
+
+    #[test]
+    fn cid_width_list_assigns_consecutive_cids() {
+        // The ordinary list form: `c [w1 w2]` widths c and c + 1.
+        let (pdf, font, mut raw) = font_with_w(vec![
+            Object::Integer(10),
+            Object::Array(vec![Object::Integer(500), Object::Integer(600)]),
+        ]);
+        pdf.read_cid_widths(&font, &mut raw);
+        assert_eq!(raw.cid_widths, vec![(10, 10, 500.0), (11, 11, 600.0)]);
+    }
+
+    #[test]
+    fn cid_width_list_stops_at_u32_overflow() {
+        // A start CID that saturates to u32::MAX: the first entry still fits,
+        // but the next CID cannot be represented, so the list stops instead
+        // of panicking (debug) or wrapping to CID 0 (release).
+        let (pdf, font, mut raw) = font_with_w(vec![
+            Object::Integer(u32::MAX as i64),
+            Object::Array(vec![Object::Integer(500), Object::Integer(600)]),
+        ]);
+        pdf.read_cid_widths(&font, &mut raw);
+        assert_eq!(raw.cid_widths, vec![(u32::MAX, u32::MAX, 500.0)]);
     }
 }
