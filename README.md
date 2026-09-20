@@ -173,6 +173,33 @@ for page in doc:          # a Document iterates its pages
 
 `doc.page(4)` looks a page up by number and raises `IndexError` if it does not exist.
 
+### Structured JSON output
+
+`Document.to_json()` serializes the existing extraction result as pretty-printed JSON. It is a presentation view of the same pages and blocks exposed by the Python API; it does not rerun extraction or change reading order.
+
+```python
+import json
+import qalam
+
+doc = qalam.Document("guide.pdf")
+data = json.loads(doc.to_json())
+
+data["page_count"]   # number of pages
+
+page = data["pages"][0]
+page["number"]
+page["width"], page["height"]
+page["rotation"]
+page["verdict"]      # "ok" | "degraded" | "needs_ocr"
+page["confidence"]
+page["reasons"]
+page["tagged"]
+page["blocks"]
+```
+
+Each block includes a `type` field. Paragraphs contain their text, bounding box, font information, direction, confidence, and individual lines. Tables contain their bounding box, confidence, dimensions, and cells in reading order. Images contain their bounding box and available image metadata; unsupported images retain the reason they could not be decoded.
+
+For Arabic content, `direction` is serialized as `"rtl"` and table columns remain in reading order, so the first cell is the rightmost cell on an RTL table.
 ### Blocks: structure, not just a string
 
 A page is an ordered list of typed blocks. Each has a `kind`, so you can branch without

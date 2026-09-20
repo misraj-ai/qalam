@@ -1,0 +1,51 @@
+# Enforce the contribution workflow in CONTRIBUTING.md on every pull request:
+#
+#   - the branch is named <type>/<number>-<short-description>
+#   - the description links an issue or discussion in this repository
+#   - the branch number and the link agree
+#   - the linked issue or discussion carries the `approved` label
+#
+# The rules themselves are in .github/scripts/pr-policy.js, with tests beside it.
+#
+# Why `pull_request_target` and not `pull_request`: with `pull_request`, the
+# workflow and script run from the pull request's own branch, so a contributor
+# could relax the rules in the same PR that breaks them. `pull_request_target`
+# runs the copy on the default branch instead. That trigger is dangerous only
+# when it checks out and executes code from the PR, which this job never does —
+# it checks out the default branch and reads the PR's metadata through the API.
+#
+# To make this block merging, mark `pr-policy` as a required status check on
+# main (see .github/REPO_SETTINGS.md).
+
+name: pr-policy
+
+on:
+  pull_request_target:
+    types: [opened, edited, reopened, synchronize]
+
+# Read-only: the job inspects the PR, the linked issue and discussion, and
+# nothing else. It cannot comment, label, or push.
+permissions:
+  contents: read
+  issues: read
+  pull-requests: read
+  discussions: read
+
+jobs:
+  pr-policy:
+    name: pr-policy
+    runs-on: ubuntu-latest
+    steps:
+      # The default branch — never the pull request's head. See the note above.
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          sparse-checkout: .github/scripts
+          persist-credentials: false
+
+      - name: Check branch name, linked issue and approval
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const policy = require(`${process.env.GITHUB_WORKSPACE}/.github/scripts/pr-policy.js`);
+            await policy.run({ github, context, core });

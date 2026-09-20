@@ -1,0 +1,10 @@
+# Blank issues are off, so every issue arrives with what triage needs.
+# Questions and early ideas belong in Discussions, linked below.
+blank_issues_enabled: false
+contact_links:
+  - name: Question or idea
+    url: https://github.com/misraj-ai/qalam/discussions
+    about: Not sure it is a bug, or want to talk a design through first? Start a discussion.
+  - name: How contributions work
+    url: https://github.com/misraj-ai/qalam/blob/main/CONTRIBUTING.md#how-a-change-gets-in
+    about: Read this before opening a pull request — every PR needs an approved issue or discussion.

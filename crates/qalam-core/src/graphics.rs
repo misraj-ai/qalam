@@ -1,5 +1,5 @@
 //! **L1 (part 1) — the graphics state.**
-//!
+//! For more information read section 8. Graphics from Pdf32000 Iso
 //! A PDF content stream is a little stack machine. Operators do not carry their
 //! own context: `Tj` paints text using whatever font, colour and transform were
 //! set by *earlier* operators, and `q` / `Q` push and pop that whole context.
@@ -130,6 +130,9 @@ impl Default for Matrix {
     }
 }
 
+//The device colour spaces enable a page description to specify colour values that are directly related to their
+// representation on an output device. Colour values in these spaces map directly (or by simple conversions) to
+// the application of device colorants, such as quantities of ink or intensities of display phosphors.
 /// Which colour space is currently selected, remembered only so that the
 /// component-taking operators (`sc` / `scn`) know how to read their operands.
 ///
@@ -187,7 +190,8 @@ impl ColorSpaceKind {
         }
     }
 }
-
+//To read more about Text parameters and Operator you can read
+// section 9.3 from Pdf32000_Iso
 /// The text state *parameters*, which live in the graphics state.
 ///
 /// # Rust lesson: the spec decides where state belongs
@@ -235,8 +239,12 @@ impl Default for TextParams {
             char_spacing: 0.0,
             word_spacing: 0.0,
             // 100%, stored as a fraction so it can be multiplied directly.
+            // The horizontal scaling parameter, Th , adjusts the width of glyphs by stretching or compressing them in the
+            // horizontal direction. Its value shall be specified as a percentage of the normal width of the glyphs, with 100
+            // being the normal width
             horizontal_scale: 1.0,
             leading: 0.0,
+            // read the 9.3.7 Text rise
             rise: 0.0,
             render_mode: TextRenderMode::Fill,
         }
@@ -244,7 +252,7 @@ impl Default for TextParams {
 }
 
 /// The graphics state saved by `q` and restored by `Q`.
-///
+/// You can read the full list of Graphics state operator at 8.4.4 from Pdf 32000 Iso
 /// Every field here has a spec-defined initial value, which is what
 /// [`Default`] produces: identity transform, black fill and stroke, grey space.
 #[derive(Debug, Clone, PartialEq)]
@@ -276,8 +284,15 @@ impl Default for GraphicsState {
     }
 }
 
-/// The `q` / `Q` stack: a current state plus the ones saved beneath it.
-///
+// The `q` / `Q` stack: a current state plus the ones saved beneath it.
+// # Read section 8.4.2 from the Pdf3200Iso book
+// A PDF document typically contains many graphical elements that are independent of each other and nested to
+// multiple levels. The graphics state stack allows these elements to make local changes to the graphics state
+// without disturbing the graphics state of the surrounding environment. The stack is a LIFO (last in, first out) data
+// structure in which the contents of the graphics state may be saved and later restored using the following
+// operators:
+// •The q operator shall push a copy of the entire graphics state onto the stack.
+// •The Q operator shall restore the entire graphics state to its former value by popping it from the stack.
 /// # Rust lesson: invariants enforced by construction
 ///
 /// `current` is a separate field rather than the top of `saved`, so there is

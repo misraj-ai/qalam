@@ -545,6 +545,14 @@ impl Document {
         (headings.body_size(), headings.inferred())
     }
 
+    /// Serialize the extracted document as pretty-printed JSON.
+    ///
+    /// This is a presentation layer over the existing extraction model and
+    /// does not rerun extraction or modify the extracted document.
+    fn to_json(&self, py: Python<'_>) -> PyResult<String> {
+        Ok(py.detach(|| qalam_core::to_json(&self.document)))
+    }
+
     /// Every page, in document order.
     #[getter]
     fn pages(&self, py: Python<'_>) -> Vec<Py<Page>> {

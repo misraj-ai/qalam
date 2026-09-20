@@ -1,0 +1,55 @@
+name: Feature request
+description: Propose new functionality.
+title: "[Feature]: "
+labels: ["enhancement", "needs-triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Please describe the **problem** before the solution — a problem can often be solved
+        in a way nobody has proposed yet. A maintainer will triage this and add the `approved`
+        label before any pull request is accepted. Still shaping the idea? A
+        [discussion](https://github.com/misraj-ai/qalam/discussions) may suit it better.
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: The problem
+      description: What can you not do today, and why does it matter?
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+      description: What you would like qalam to do. API sketches are welcome.
+    validations:
+      required: true
+
+  - type: textarea
+    id: evidence
+    attributes:
+      label: Example documents
+      description: |
+        PDFs or pages where this would help. Real documents are how this project decides
+        anything — see PLAN.md §10.
+    validations:
+      required: false
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+    validations:
+      required: false
+
+  - type: dropdown
+    id: implement
+    attributes:
+      label: Would you like to implement it yourself?
+      options:
+        - "No — proposing only"
+        - "Yes — once approved"
+    validations:
+      required: true

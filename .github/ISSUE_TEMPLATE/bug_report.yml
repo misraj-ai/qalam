@@ -1,0 +1,78 @@
+name: Bug report
+description: Wrong, missing, garbled or misordered output from a PDF.
+title: "[Bug]: "
+labels: ["bug", "needs-triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thank you. For this project a bug is almost always **a document and a page**, so
+        those two fields matter most. A maintainer will triage this and add the `approved`
+        label before any pull request is accepted — please do not start a PR until then.
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What is wrong
+      description: Describe the problem in a sentence or two.
+    validations:
+      required: true
+
+  - type: textarea
+    id: document
+    attributes:
+      label: The document
+      description: |
+        Attach the PDF (drag it here) or link to it, and give the **page number(s)**.
+        Only attach documents you have the right to share publicly.
+      placeholder: "12.pdf, pages 4–11"
+    validations:
+      required: true
+
+  - type: textarea
+    id: actual
+    attributes:
+      label: What qalam produced
+      description: Paste the output. It is pasted as text, so Arabic survives.
+      render: text
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: What it should be
+      description: The correct text, or a description of the correct structure.
+      render: text
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: How you ran it
+      description: The CLI command or the Python snippet.
+      placeholder: |
+        qalam extract document.pdf 5
+        # or
+        import qalam; print(qalam.Document("document.pdf").pages[4].text)
+    validations:
+      required: true
+
+  - type: input
+    id: version
+    attributes:
+      label: qalam version
+      description: "`pip show qalam`, or the commit hash if built from source."
+    validations:
+      required: true
+
+  - type: dropdown
+    id: implement
+    attributes:
+      label: Would you like to fix it yourself?
+      options:
+        - "No — reporting only"
+        - "Yes — once approved"
+    validations:
+      required: true

@@ -27,15 +27,16 @@
 //! name that follows takes the next code up. So the example above means
 //! 65→`alpha`, 66→`beta`, 200→`gamma`.
 //!
-//! # Where this stops
+//! # Resolving glyph names
 //!
-//! Glyph names are resolved through the algorithmic `uniXXXX` forms plus a
-//! table of the common Latin names. The full Adobe Glyph List runs to several
-//! thousand entries and is not vendored here; an unrecognised name returns
-//! `None` — unresolvable — rather than a guess. That is the whole ethic of the
-//! project applied one level down.
+//! A glyph name is resolved the way the Adobe Glyph List specification says:
+//! through the **full Adobe Glyph List** (4,281 names, embedded from
+//! `resources/glyphlist.txt`), then the algorithmic `uniXXXX` and `uXXXX`
+//! forms. A name nothing resolves returns `None` — unresolvable — rather than a
+//! guess. That is the whole ethic of the project applied one level down.
 
 use std::collections::HashMap;
+use std::sync::OnceLock;
 
 /// One of PDF's predefined simple-font encodings.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -334,21 +335,43 @@ impl Encoding {
 
 /// Resolve a PostScript glyph name to the text it denotes.
 ///
-/// Three cases, in the order the Adobe spec gives them:
+/// Follows the Adobe Glyph List specification:
 ///
-/// 1. `uniXXXX` — one or more 4-digit hex UTF-16 code units, so `uni0627` is
-///    alef and `uni0644uni0627` is lam followed by alef.
-/// 2. `uXXXX` to `uXXXXXX` — a single hex scalar value, 4 to 6 digits.
-/// 3. A name from the Adobe Glyph List, e.g. `space`, `period`, `Aacute`.
+/// 1. Drop any suffix after the first dot: `one.oldstyle` means `one`.
+/// 2. Split the rest on underscores into components, so a ligature named
+///    `f_i` means `f` followed by `i`.
+/// 3. Resolve each component, trying in order:
+///    - the Adobe Glyph List, e.g. `space`, `Aacute`, `afii57415` (alef);
+///    - `uniXXXX`: groups of four hex UTF-16 code units, so `uni0627` is alef
+///      and `uni06440627` is lam followed by alef;
+///    - `uXXXX` to `uXXXXXX`: a single hex scalar value.
 ///
-/// Anything else — `g42`, `cid1234`, a subsetter's invention — is genuinely
-/// unresolvable and returns `None`.
+/// **If any component cannot be resolved, the whole name returns `None`.** The
+/// specification would map that component to nothing and keep the rest, but
+/// that silently drops a character: `f_g42` would read as `f`. Anything
+/// unresolvable — `g42`, `cid1234`, a subsetter's invention — is reported, not
+/// guessed.
 pub fn glyph_name_to_string(name: &str) -> Option<String> {
-    // A name may carry a suffix like `a.sc` or `one.oldstyle`; the base name
-    // before the first dot is what identifies the character.
-    let name = name.split('.').next().unwrap_or(name);
+    let base = name.split('.').next().unwrap_or(name);
 
-    if let Some(rest) = name.strip_prefix("uni") {
+    let mut text = String::new();
+    for component in base.split('_') {
+        text.push_str(&component_to_string(component)?);
+    }
+    (!text.is_empty()).then_some(text)
+}
+
+/// Resolve one underscore-separated component of a glyph name.
+fn component_to_string(component: &str) -> Option<String> {
+    if component.is_empty() {
+        return None;
+    }
+
+    if let Some(text) = agl_lookup(component) {
+        return Some(text);
+    }
+
+    if let Some(rest) = component.strip_prefix("uni") {
         // The AGL spells several units as one run of hex digits —
         // `uni06440627` is lam followed by alef. Some tools instead repeat the
         // prefix, `uni0644uni0627`, so strip any further occurrences and accept
@@ -375,7 +398,7 @@ pub fn glyph_name_to_string(name: &str) -> Option<String> {
         }
     }
 
-    if let Some(rest) = name.strip_prefix('u') {
+    if let Some(rest) = component.strip_prefix('u') {
         if (4..=6).contains(&rest.len()) && rest.chars().all(|c| c.is_ascii_hexdigit()) {
             return u32::from_str_radix(rest, 16)
                 .ok()
@@ -384,92 +407,86 @@ pub fn glyph_name_to_string(name: &str) -> Option<String> {
         }
     }
 
-    agl_lookup(name).map(String::from)
+    None
 }
 
-/// A subset of the Adobe Glyph List: the names that actually appear.
+/// The Adobe Glyph List, embedded in the library when it is compiled.
 ///
-/// Deliberately partial. The full AGL is several thousand entries, and vendoring
-/// it would be a lot of table for names our corpus never produces. Everything
-/// here is the ASCII repertoire plus the handful of Latin names common in real
-/// `/Differences` arrays. An unknown name resolves to `None`, which the detector
-/// counts as unrecoverable — the honest answer.
-fn agl_lookup(name: &str) -> Option<char> {
-    let c = match name {
-        "space" => ' ',
-        "exclam" => '!',
-        "quotedbl" => '"',
-        "numbersign" => '#',
-        "dollar" => '$',
-        "percent" => '%',
-        "ampersand" => '&',
-        "quotesingle" => '\'',
-        "quoteright" => '\u{2019}',
-        "quoteleft" => '\u{2018}',
-        "quotedblleft" => '\u{201C}',
-        "quotedblright" => '\u{201D}',
-        "parenleft" => '(',
-        "parenright" => ')',
-        "asterisk" => '*',
-        "plus" => '+',
-        "comma" => ',',
-        "hyphen" | "hyphenminus" => '-',
-        "period" => '.',
-        "slash" => '/',
-        "zero" => '0',
-        "one" => '1',
-        "two" => '2',
-        "three" => '3',
-        "four" => '4',
-        "five" => '5',
-        "six" => '6',
-        "seven" => '7',
-        "eight" => '8',
-        "nine" => '9',
-        "colon" => ':',
-        "semicolon" => ';',
-        "less" => '<',
-        "equal" => '=',
-        "greater" => '>',
-        "question" => '?',
-        "at" => '@',
-        "bracketleft" => '[',
-        "backslash" => '\\',
-        "bracketright" => ']',
-        "asciicircum" => '^',
-        "underscore" => '_',
-        "grave" => '`',
-        "braceleft" => '{',
-        "bar" => '|',
-        "braceright" => '}',
-        "asciitilde" => '~',
-        "bullet" => '\u{2022}',
-        "endash" => '\u{2013}',
-        "emdash" => '\u{2014}',
-        "ellipsis" => '\u{2026}',
-        "quotesinglbase" => '\u{201A}',
-        "quotedblbase" => '\u{201E}',
-        "dagger" => '\u{2020}',
-        "daggerdbl" => '\u{2021}',
-        "perthousand" => '\u{2030}',
-        "trademark" => '\u{2122}',
-        "guilsinglleft" => '\u{2039}',
-        "guilsinglright" => '\u{203A}',
-        "guillemotleft" => '\u{00AB}',
-        "guillemotright" => '\u{00BB}',
-        "nbspace" | "uni00A0" => '\u{00A0}',
-        // A single-letter name is that letter: `A`, `b`, ...
-        _ => {
-            let mut chars = name.chars();
-            let first = chars.next()?;
-            if chars.next().is_none() && first.is_ascii_alphabetic() {
-                first
-            } else {
-                return None;
-            }
-        }
-    };
-    Some(c)
+/// # Rust lesson: `include_str!`
+///
+/// `include_str!` reads a file **at compile time** and bakes its contents into
+/// the binary as a `&'static str`. Nothing is read from disk when the program
+/// runs, so the list travels inside the library — into the CLI and every Python
+/// wheel — with no path to get wrong and no file to lose.
+///
+/// The path is relative to this source file. That is why the list lives inside
+/// the `qalam-core` crate: when a crate is packaged, only files inside its own
+/// directory go with it, and a file elsewhere in the repository would be
+/// missing from a build made from that package.
+///
+/// The list is © Adobe, under the BSD-style licence reproduced at the top of
+/// the file, which must stay with it.
+const GLYPH_LIST: &str = include_str!("../resources/glyphlist.txt");
+
+/// Names some producers use that the Adobe Glyph List does not define.
+///
+/// Kept deliberately tiny, and only for names seen in real fonts. `hyphenminus`
+/// was already resolved before the full list was embedded, so dropping it
+/// would have made those PDFs worse.
+const EXTRA_NAMES: &[(&str, &str)] = &[("hyphenminus", "-")];
+
+/// Look a name up in the Adobe Glyph List, or the few extra names above.
+fn agl_lookup(name: &str) -> Option<String> {
+    glyph_list().get(name).cloned().or_else(|| {
+        EXTRA_NAMES
+            .iter()
+            .find(|(extra, _)| *extra == name)
+            .map(|(_, text)| (*text).to_string())
+    })
+}
+
+/// The parsed glyph list, built the first time it is needed.
+///
+/// # Rust lesson: `OnceLock`
+///
+/// Parsing 4,281 lines on every lookup would waste time, and parsing them when
+/// the program starts would slow down programs that never read a glyph name.
+/// `OnceLock` runs the closure passed to `get_or_init` exactly once, the first
+/// time anyone asks, and every later call gets the same table. It is safe to
+/// share between threads, which matters because the Python binding extracts
+/// with the GIL released.
+///
+/// The keys are `&'static str` slices of `GLYPH_LIST` itself, so the names are
+/// never copied.
+fn glyph_list() -> &'static HashMap<&'static str, String> {
+    static TABLE: OnceLock<HashMap<&'static str, String>> = OnceLock::new();
+    TABLE.get_or_init(|| parse_glyph_list(GLYPH_LIST))
+}
+
+/// Parse the `name;XXXX` lines of a glyph list.
+///
+/// A value may hold several code points separated by spaces
+/// (`name;05D3 05B2`), so it becomes a `String`, not a `char`. Comment lines
+/// start with `#`. A malformed line is skipped rather than half-read; the test
+/// `the_embedded_glyph_list_parses_completely` makes sure the real file has
+/// none.
+fn parse_glyph_list(source: &str) -> HashMap<&str, String> {
+    source
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .filter_map(|line| {
+            let (name, codes) = line.split_once(';')?;
+            // `collect` into `Option<String>` stops at the first code point
+            // that fails to parse, so a bad value never yields partial text.
+            let text: Option<String> = codes
+                .split_whitespace()
+                .map(|hex| u32::from_str_radix(hex, 16).ok().and_then(char::from_u32))
+                .collect();
+            let text = text.filter(|t| !t.is_empty())?;
+            Some((name, text))
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -522,16 +539,22 @@ mod tests {
     fn differences_override_the_base_table() {
         let enc = Encoding::new(
             Some("WinAnsiEncoding"),
-            vec![(65, "alpha".to_string()), (66, "uni0627".to_string())],
+            vec![
+                (65, "alpha".to_string()),
+                (66, "uni0627".to_string()),
+                (68, "g42".to_string()),
+            ],
         );
-        // 65 would be 'A' in WinAnsi, but /Differences renamed it. `alpha` is
-        // not in our AGL subset, so it is honestly unresolvable — and must NOT
-        // silently fall back to 'A'.
-        assert_eq!(enc.decode(65), None);
+        // 65 would be 'A' in WinAnsi, but /Differences renamed it to `alpha`,
+        // which the Adobe Glyph List resolves to Greek alpha.
+        assert_eq!(enc.decode(65).as_deref(), Some("\u{03B1}"));
         // 66 resolves through the algorithmic uniXXXX form.
         assert_eq!(enc.decode(66).as_deref(), Some("\u{0627}"));
         // Untouched codes still come from the base table.
         assert_eq!(enc.decode(67).as_deref(), Some("C"));
+        // A renamed code whose name resolves to nothing is unresolvable, and
+        // must NOT silently fall back to the base table's 'D'.
+        assert_eq!(enc.decode(68), None);
     }
 
     #[test]
@@ -572,6 +595,90 @@ mod tests {
         assert_eq!(glyph_name_to_string("cid1234"), None);
         assert_eq!(glyph_name_to_string("uni06"), None);
         assert_eq!(glyph_name_to_string(""), None);
+    }
+
+    #[test]
+    fn the_embedded_glyph_list_parses_completely() {
+        // Every non-comment line of the file must become an entry. A mismatch
+        // means the file was truncated or corrupted, or the parser skipped
+        // lines it should have read.
+        let data_lines = GLYPH_LIST
+            .lines()
+            .filter(|l| !l.trim().is_empty() && !l.starts_with('#'))
+            .count();
+        assert_eq!(data_lines, 4281, "Adobe Glyph List 2.0 has 4,281 names");
+        assert_eq!(glyph_list().len(), data_lines);
+    }
+
+    #[test]
+    fn the_full_list_resolves_names_the_old_subset_could_not() {
+        assert_eq!(glyph_name_to_string("alpha").as_deref(), Some("\u{03B1}"));
+        assert_eq!(glyph_name_to_string("Aacute").as_deref(), Some("\u{00C1}"));
+        // Arabic, under both of the AGL's naming schemes.
+        assert_eq!(
+            glyph_name_to_string("afii57415").as_deref(),
+            Some("\u{0627}")
+        );
+        assert_eq!(
+            glyph_name_to_string("alefarabic").as_deref(),
+            Some("\u{0627}")
+        );
+        assert_eq!(
+            glyph_name_to_string("lamarabic").as_deref(),
+            Some("\u{0644}")
+        );
+    }
+
+    #[test]
+    fn a_list_entry_may_hold_several_code_points() {
+        assert_eq!(
+            glyph_name_to_string("hamzadammaarabic").as_deref(),
+            Some("\u{0621}\u{064F}")
+        );
+    }
+
+    #[test]
+    fn names_the_old_subset_resolved_still_resolve() {
+        assert_eq!(glyph_name_to_string("space").as_deref(), Some(" "));
+        assert_eq!(
+            glyph_name_to_string("quoteright").as_deref(),
+            Some("\u{2019}")
+        );
+        assert_eq!(glyph_name_to_string("nbspace").as_deref(), Some("\u{00A0}"));
+        // Not an AGL name, but resolved before the full list, so kept.
+        assert_eq!(glyph_name_to_string("hyphenminus").as_deref(), Some("-"));
+    }
+
+    #[test]
+    fn a_ligature_name_resolves_each_component() {
+        assert_eq!(glyph_name_to_string("f_i").as_deref(), Some("fi"));
+        assert_eq!(
+            glyph_name_to_string("uni0644_uni0627").as_deref(),
+            Some("\u{0644}\u{0627}")
+        );
+        assert_eq!(glyph_name_to_string("f_f_i.alt").as_deref(), Some("ffi"));
+    }
+
+    #[test]
+    fn one_unresolvable_component_makes_the_whole_name_unresolvable() {
+        // The spec would keep the `f` and drop `g42`, silently losing a
+        // character. Reporting the name as unresolvable is the honest answer.
+        assert_eq!(glyph_name_to_string("f_g42"), None);
+        assert_eq!(glyph_name_to_string("f__i"), None);
+        assert_eq!(glyph_name_to_string("_"), None);
+    }
+
+    #[test]
+    fn a_malformed_glyph_list_line_is_skipped_not_half_read() {
+        let table =
+            parse_glyph_list("# comment\nA;0041\nbroken\nX;ZZZZ\nY;0059 QQ\nBC;0042 0043\n");
+        assert_eq!(table.len(), 2);
+        assert_eq!(table.get("A").map(String::as_str), Some("A"));
+        assert_eq!(table.get("BC").map(String::as_str), Some("BC"));
+        assert!(
+            !table.contains_key("Y"),
+            "a partly valid value must not be kept"
+        );
     }
 
     #[test]

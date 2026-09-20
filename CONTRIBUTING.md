@@ -196,9 +196,103 @@ that silently rewrites itself teaches nothing.
 
 ---
 
-## Submitting a change
+## How a change gets in
 
-Before opening a pull request:
+Every change follows the same four steps, in order. The order is the point: agreeing on
+*whether* something should change is cheaper before anyone writes code than after.
+
+```
+1. Issue or discussion  ->  2. Approved  ->  3. Branch  ->  4. Pull request
+```
+
+### 1. Open an issue or a discussion first
+
+**No pull request without a prior issue or discussion.** A PR that arrives unannounced will be
+closed with a pointer back here, however good the code is. This is not bureaucracy for its own
+sake: several "obvious" fixes in `PLAN.md` §10 turned out to break a different document, and
+the cheapest place to find that out is a conversation.
+
+| You have… | Open a… |
+|---|---|
+| Wrong, missing or garbled output from a PDF | **Bug report** issue — attach the PDF if you can share it, and give the page |
+| A concrete feature you want to build | **Feature request** issue |
+| A question, a half-formed idea, or a design to think through | **[Discussion](https://github.com/misraj-ai/qalam/discussions)** |
+
+Blank issues are disabled; the templates ask for what a maintainer needs to reproduce the
+problem, which for this project is almost always *the document and the page number*.
+
+### 2. Wait for approval
+
+A maintainer triages each issue and either:
+
+- adds the **`approved`** label — the problem is real and fixable, or the feature fits the
+  project, and a PR is welcome;
+- asks for more information; or
+- explains why it will not be taken, and closes it.
+
+**Only start work once the `approved` label is on.** The PR check enforces it (see step 4), so
+a PR linked to an unapproved issue cannot be merged. For a discussion that reaches agreement,
+a maintainer applies the same label to the discussion.
+
+If you intend to implement it yourself, say so in the issue, so two people do not build the
+same thing.
+
+### 3. Name the branch
+
+```
+<type>/<number>-<short-description>
+```
+
+- **`type`** — one of the prefixes below.
+- **`number`** — the issue or discussion this branch implements.
+- **`short-description`** — lowercase words joined by hyphens.
+
+| Prefix | Use for |
+|---|---|
+| `feat/` | New functionality |
+| `fix/` | A bug fix |
+| `refactor/` | Restructuring with no change in behaviour or output |
+| `perf/` | A speed or memory improvement |
+| `docs/` | Documentation only |
+| `test/` | Tests or fixtures only |
+| `ci/` | Workflows and build configuration |
+| `chore/` | Maintenance: dependencies, tooling, housekeeping |
+
+Examples:
+
+```sh
+git switch -c fix/42-cmap-short-bfrange-array
+git switch -c feat/57-tagged-table-reader
+git switch -c docs/61-python-api-examples
+```
+
+Choose the prefix honestly. A `refactor/` branch that changes a golden file is not a refactor,
+and reviewers will read it differently.
+
+### 4. Open the pull request
+
+The PR template asks for the link; fill it in.
+
+- **Link the issue** with a closing keyword, so it closes when the PR merges:
+  `Closes #42` (also `Fixes` / `Resolves`).
+- **Link a discussion** by its full URL, since discussions do not close by keyword:
+  `Discussion: https://github.com/misraj-ai/qalam/discussions/57`.
+
+The number in the branch name must match the issue or discussion you link.
+
+A check named **`pr-policy`** runs on every pull request and fails unless:
+
+1. the branch name follows the pattern above;
+2. the description links an issue or discussion in this repository;
+3. that issue or discussion is the one named in the branch; and
+4. it carries the `approved` label.
+
+The check reads its rules from the default branch, not from the pull request, so editing the
+workflow in a PR does not change what that PR is checked against. The rules are in
+`.github/scripts/pr-policy.js`; run their tests with `node .github/scripts/pr-policy.test.js`. If a maintainer approves the
+issue after you opened the PR, re-run the check from the PR's **Checks** tab.
+
+### Before requesting review
 
 1. `cargo test` passes.
 2. `cargo clippy --all-targets` and `cargo fmt --check` are clean.
@@ -207,5 +301,6 @@ Before opening a pull request:
 5. If it changes what a real document produces, say so in the description and show the before
    and after.
 
-Small, focused changes are much easier to review than large ones. If a change turns out to
-need work across several layers, say so — that is usually a sign the layering needs a look.
+Small, focused changes are much easier to review than large ones. **One issue, one branch, one
+pull request.** If a change turns out to need work across several layers, say so in the issue
+first — that is usually a sign the layering needs a look.
