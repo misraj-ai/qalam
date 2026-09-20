@@ -47,7 +47,15 @@ use crate::cff::{self, GlyphNames};
 use crate::content::GlyphWidths;
 use crate::encoding::{glyph_name_to_string, Encoding};
 use crate::types::{CodeToUnicode, RawFont};
-
+// at Pdf32000_iso sections 9.7.5-9.10.3 you will notice that CMap has two property.
+// 1 Forward CMap where we drown char on the page this used by Renderer,
+// 2 Backward CMap the one we use to extract text.
+// The backward map is optional, added by the producer as a
+// favour to anyone who later wants the text back. font.rs is almost entirely about the backward map.
+// When Word or InDesign embeds an Arabic font, it doesn't embed all 3000 glyphs — it embeds only the
+// ones used on this page, maybe 80 of them, renumbered 1, 2, 3, … in whatever order it felt like.
+// So in one file 0x0113 means alef; in the next file from the same producer it might mean ب.
+// The number is a slot index into a private, one-off font, not a character.
 /// A parsed `/ToUnicode` CMap: glyph code → the text it stands for.
 ///
 /// # Rust lesson: why two containers
@@ -93,13 +101,37 @@ impl CMap {
     /// recoverability detector (L4) will notice the gaps by counting how many
     /// codes resolve.
     pub fn parse(bytes: &[u8]) -> Self {
+        // bytes ──tokenize──► Vec<Token> ──CMap::parse──► CMap
+        //      (lexer:no meaning)        (scanner: look for three keywords, ignore the rest)
+        //
+        //  The lexer knows nothing about CMaps. It only knows "here is a hex string, here is a bracket,
+        //  here is a bare word." All the meaning lives in parse,
+        //  which walks the token list looking for beginbfchar, beginbfrange, begincodespacerange and skips
+        //  everything else.
         let tokens = tokenize(bytes);
         let mut cmap = CMap {
             // Default to 2: composite fonts are the common case for Arabic, and
             // an explicit codespacerange almost always follows anyway.
             code_bytes: 2,
+            // This line mean every thing else will set to default, singles -> {} and ranges -> [].
             ..Default::default()
         };
+        // postscript
+        //   /CIDInit /ProcSet findresource begin        ← noise
+        //   12 dict begin                               ← noise
+        //   begincmap                                   ← noise
+        //   /CIDSystemInfo << /Registry (Adobe)         ← noise, with a dict and a string
+        //     /Ordering (UCS) /Supplement 0 >> def
+        //   /CMapName /Adobe-Identity-UCS def            ← noise
+        //   /CMapType 2 def                              ← noise
+        //   1 begincodespacerange                        ★
+        //   <0000> <FFFF>                                ★
+        //   endcodespacerange                            ★
+        //   2 beginbfchar                                ★
+        //   <0003> <0020>                                ★
+        //   <0113> <0627>                                ★
+        //   endbfchar
+        //   endcmap
 
         let mut i = 0;
         while i < tokens.len() {
