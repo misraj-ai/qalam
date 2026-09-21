@@ -49,11 +49,11 @@ use qalam_core::Document;
 ///   `/ToUnicode` values are already several base letters, and 18 ruled tables.
 const CORPUS: &[(&str, &str)] = &[
     (
-        "../../tests/fixtures/test_for_arabic_barser.pdf",
+        "../../tests/fixtures/25.pdf",
         "../../tests/expected/test_for_arabic_barser.txt",
     ),
     (
-        "../../tests/fixtures/bar_Persons.pdf",
+        "../../tests/fixtures/26.pdf",
         "../../tests/expected/bar_Persons.txt",
     ),
     ("../../tests/fixtures/1.pdf", "../../tests/expected/1.txt"),
@@ -392,7 +392,7 @@ fn no_table_is_invented_in_the_untagged_corpus() {
 
 #[test]
 fn multi_character_ligatures_keep_their_order() {
-    // `bar_Persons.pdf` maps 14 codes to several base letters at once — `لم`,
+    // `26.pdf` maps 14 codes to several base letters at once — `لم`,
     // `لج`, `بح`. Those values are already logical, so the line-level reversal
     // must not reach inside them. It used to, turning `المعظم` into `املعظم`.
     let Some(doc) = open(TABLES_FIXTURE) else {

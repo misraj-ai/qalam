@@ -126,7 +126,7 @@ impl Pdf {
         }
         Ok(out)
     }
-
+    // see 8.10.2 for more information
     /// Every form XObject a page draws, including forms drawn by forms.
     ///
     /// Returned flat, each with a name qualified by its nesting, so the
@@ -628,7 +628,8 @@ impl Pdf {
         }
         raw
     }
-
+    // TODO we need to handel FontFile2
+    // see section 9.9 and 9.8 for more information
     /// Pull the embedded CFF font program out of the font descriptor.
     ///
     /// Only `/FontFile3` (Type1C / CFF) is read. `/FontFile` is Type 1, whose
@@ -680,7 +681,7 @@ impl Pdf {
             raw.differences = flatten_differences(array);
         }
     }
-
+    // 9.6.2 read type 1 font.
     /// Read `/FirstChar` and `/Widths` from a simple (1-byte) font.
     fn read_simple_widths(&self, dict: &Dictionary, raw: &mut RawFont) {
         raw.first_char = self
@@ -689,7 +690,7 @@ impl Pdf {
             // A negative /FirstChar is nonsense; clamp rather than wrap.
             .map(|n| n.max(0) as u32)
             .unwrap_or(0);
-
+        // look at page 255 from Pdf32000_Iso to learn more.
         if let Some(array) = self.lookup(dict, b"Widths").and_then(|o| o.as_array().ok()) {
             raw.widths = array.iter().filter_map(|o| self.number(o)).collect();
         }
@@ -703,9 +704,10 @@ impl Pdf {
             .unwrap_or(0.0);
     }
 
+     // for more information about this read 9.7.4.1 and 9.7.4.3 section
     /// Read `/DW` and `/W` from a composite font's descendant.
-    ///
     /// A `Type0` font is a shell: the widths live in `/DescendantFonts[0]`,
+    /// DescendantFonts is one element array and that why we grep the first element.
     /// which is the actual CIDFont (PLAN.md §10.1).
     fn read_cid_widths(&self, dict: &Dictionary, raw: &mut RawFont) {
         let Some(descendant) = self
@@ -728,7 +730,7 @@ impl Pdf {
         else {
             return;
         };
-
+        // se section 9.7.4.3
         // The /W array interleaves two shapes:
         //   c [w1 w2 ...]      widths for c, c+1, c+2, ...
         //   cfirst clast w     one width for the whole inclusive range
@@ -769,6 +771,16 @@ impl Pdf {
         }
     }
 
+    // # Rust lesson: lifetimes
+    // `&'a self` and `Option<&'a Object>` share the name `'a`, which tells the
+    // compiler the returned reference borrows from `self` and may not outlive it.
+    // That is what makes returning an interior reference safe without copying.
+    // When you omit lifetimes, the compiler applies three mechanical rules:
+    //
+    // 1. Each elided input lifetime gets its own distinct parameter. fn f(a: &X, b: &Y) becomes fn f<'1, '2>(a: &'1 X, b: &'2 Y).
+    // 2. If there is exactly one input lifetime, it's assigned to every elided output lifetime. fn f(a: &X) -> &Y becomes fn f<'1>(a: &'1 X) -> &'1 Y.
+    // 3. If one of the inputs is &self or &mut self, the lifetime of self is assigned to every elided output lifetime — regardless of how many other inputs
+    // there are.
     /// Get `key` from `dict`, following an indirect reference if there is one.
     fn lookup<'a>(&'a self, dict: &'a Dictionary, key: &[u8]) -> Option<&'a Object> {
         dict.get(key).ok().and_then(|obj| self.resolve(obj).ok())
@@ -806,7 +818,7 @@ impl Pdf {
             .ok_or(Error::PageNotFound(page_number))
     }
 
-    /// Assemble a [`PageInfo`] for one page object.
+    /// Assemble a [`PageInfo`] for one-page object.
     fn page_info(&self, number: u32, id: ObjectId) -> PageInfo {
         // A4 in points, used when a page has no /MediaBox anywhere up its tree.
         // Malformed rather than fatal: better to report a plausible page than to
@@ -842,13 +854,7 @@ impl Pdf {
     /// `/MediaBox`, `/Resources`, `/Rotate` and `/CropBox` are *inheritable*: a
     /// PDF may set `/MediaBox` once on the root `/Pages` node and omit it from
     /// every individual page. Looking only at the page dict is a classic bug.
-    ///
-    /// # Rust lesson: lifetimes
-    ///
-    /// `&'a self` and `Option<&'a Object>` share the name `'a`, which tells the
-    /// compiler the returned reference borrows from `self` and may not outlive it.
-    /// That is what makes returning an interior reference safe without copying.
-    fn inherited<'a>(&'a self, page_id: ObjectId, key: &[u8]) -> Option<&'a Object> {
+    fn inherited(&self, page_id: ObjectId, key: &[u8]) -> Option<&Object> {
         // Guard against a malformed file whose /Parent chain loops back on itself,
         // which would otherwise spin forever. Page trees are shallow in practice.
         const MAX_DEPTH: usize = 64;
@@ -877,6 +883,12 @@ impl Pdf {
         }
         // A rect's entries are usually literal numbers, but the spec permits
         // indirect references, so resolve each one before reading it.
+        // MediaBox is usually written literally:
+        // /MediaBox [0 0 595.276 841.89]
+        // but the spec permits this:
+        // /MediaBox [0 0 12 0 R 13 0 R]
+        // where 12 0 R and 13 0 R are separate objects each holding a number.
+        // Rare, but legal and a parser that assumes literals will read garbage or fail.
         let mut n = [0.0f64; 4];
         for (slot, item) in n.iter_mut().zip(array) {
             let resolved = match item.as_reference() {

@@ -265,7 +265,7 @@ fn encode_samples(raw: &RawImage) -> std::result::Result<ExtractedImage, String>
             // visually close on screen.
             //
             // The alternative is not "a more accurate image" but *no image*:
-            // `bar_Persons.pdf` stores 142 of its 177 pictures this way.
+            // `26.pdf` stores 142 of its 177 pictures this way.
             return encode_cmyk(raw);
         }
         ImageColorSpace::Indexed => {

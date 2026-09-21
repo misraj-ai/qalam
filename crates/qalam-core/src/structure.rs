@@ -65,7 +65,7 @@ impl StructRun {
 /// ISO 32000 §14.8.4 splits structure types in two: *block-level* elements
 /// (BLSE) that stack down the page, and *inline-level* ones (ILSE) that flow
 /// within a line. `/Span` is the common inline type, and producers emit a great
-/// many of them — `bar_Persons.pdf` has **3,638**, one around every number and
+/// many of them — `26.pdf` has **3,638**, one around every number and
 /// every change of styling.
 ///
 /// Treating each as a block is catastrophic, and quietly so: every number
@@ -252,7 +252,7 @@ mod tests {
 
     #[test]
     fn inline_spans_join_the_paragraph_they_sit_in() {
-        // The bug this rule exists for. `bar_Persons.pdf` wraps every number
+        // The bug this rule exists for. `26.pdf` wraps every number
         // and every styling change in a `/Span`; treating each as a block put
         // the digits on their own lines and shattered every sentence that
         // mentioned a figure.

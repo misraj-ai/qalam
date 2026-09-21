@@ -14,7 +14,7 @@
 //! One is advisory, the other load-bearing. That asymmetry is the whole reason
 //! this module exists.
 //!
-//! `bar_Persons.pdf` proves the point. Its `PFDinTextArabic` fonts contain
+//! `26.pdf` proves the point. Its `PFDinTextArabic` fonts contain
 //! exactly these glyph names — Arabic-Indic digits and Arabic separators:
 //!
 //! ```text

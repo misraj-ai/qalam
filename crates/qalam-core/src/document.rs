@@ -309,7 +309,7 @@ pub fn extract_text(path: impl AsRef<std::path::Path>) -> Result<String> {
 mod tests {
     use super::*;
 
-    const FIXTURE: &str = "../../tests/fixtures/test_for_arabic_barser.pdf";
+    const FIXTURE: &str = "../../tests/fixtures/25.pdf";
 
     /// Skip rather than fail when the fixture is absent, so a fresh clone
     /// without the (large, binary) test file still passes `cargo test`.

@@ -495,7 +495,7 @@ const SEPARATORS: [char; 6] = [
 /// cannot touch a letter, a digit, or a code the two sources agree on — and on
 /// a correct PDF they always agree, so nothing is corrected at all.
 ///
-/// The fault it repairs is real and costly: `bar_Persons.pdf` maps a glyph it
+/// The fault it repairs is real and costly: `26.pdf` maps a glyph it
 /// draws as an Arabic comma to `.`, so `3,709` extracts as `3.709` — a value
 /// wrong by a factor of a thousand, and wrong in a way no reader would catch.
 fn arbitrate_separators(
@@ -1007,7 +1007,7 @@ end";
 
     #[test]
     fn the_font_overrules_a_wrong_separator() {
-        // `bar_Persons.pdf`, font T1_0: `/ToUnicode` says code 161 is a full
+        // `26.pdf`, font T1_0: `/ToUnicode` says code 161 is a full
         // stop, but `/Differences` names the glyph `uni066B` — the Arabic
         // decimal separator, which is what the page actually draws. Believing
         // the map turns `3,709` into `3.709`: a value wrong by a factor of a

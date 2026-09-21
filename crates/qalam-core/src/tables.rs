@@ -405,7 +405,7 @@ const MIN_BORDERLESS_ROWS: usize = 5;
 /// ...and at least this many columns.
 ///
 /// **Three is not enough, and this is the hard part of the whole feature.**
-/// Page 8 of `test_for_arabic_barser.pdf` sets two columns of numbered cards;
+/// Page 8 of `25.pdf` sets two columns of numbered cards;
 /// the badges form a third column between them, every row shares a baseline,
 /// and the result is geometrically *indistinguishable* from a table. The cells
 /// even have the right length. What tells them apart is that one is wrapped
@@ -1034,7 +1034,7 @@ mod tests {
 
     #[test]
     fn a_distant_rule_does_not_swallow_the_table() {
-        // Page 6 of `bar_Persons.pdf`. A form XObject draws a short decorative
+        // Page 6 of `26.pdf`. A form XObject draws a short decorative
         // rule near the foot of the page that happens to overlap the table
         // above it horizontally. Grouped with the table's rows it stretched the
         // group from 147pt tall to 463pt, and the column filter — which asks

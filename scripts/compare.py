@@ -25,7 +25,7 @@ import sys
 import time
 import unicodedata
 
-FIXTURE = "tests/fixtures/test_for_arabic_barser.pdf"
+FIXTURE = "tests/fixtures/25.pdf"
 
 # Arabic Presentation Forms-A and -B. A correct extractor emits none of these:
 # they are *shaped glyphs*, not letters, and text containing them will not

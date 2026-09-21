@@ -98,7 +98,7 @@ const MIN_GUTTER_EMS_TALL: f64 = 0.9;
 ///
 /// A column has to be able to hold words. A narrower strip than this is
 /// furniture — a margin rule, a bullet, or the ring of numbered badges running
-/// down the edge of each column on page 14 of `test_for_arabic_barser.pdf`,
+/// down the edge of each column on page 14 of `25.pdf`,
 /// which the projection sees as a perfectly good gutter and which splitting
 /// tears away from the text it numbers.
 const MIN_COLUMN_EMS: f64 = 5.0;
@@ -442,7 +442,7 @@ mod tests {
 
     #[test]
     fn a_narrow_strip_is_not_a_column() {
-        // Page 14 of `test_for_arabic_barser.pdf` runs a ring of numbered
+        // Page 14 of `25.pdf` runs a ring of numbered
         // badges down the inside edge of each column. The projection sees a
         // perfectly good gutter beside them, and splitting there tears every
         // number away from the item it numbers.

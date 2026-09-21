@@ -340,7 +340,7 @@ fn each_structure_element_becomes_its_own_block() {
 fn an_untagged_document_still_uses_geometry() {
     // The fallback must be invisible: no tree, no complaint, same result as
     // before any of this existed.
-    let doc = qalam_core::Document::open("../../tests/fixtures/test_for_arabic_barser.pdf");
+    let doc = qalam_core::Document::open("../../tests/fixtures/25.pdf");
     let Ok(doc) = doc else {
         eprintln!("note: corpus fixture not present — skipping");
         return;

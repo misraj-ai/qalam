@@ -538,7 +538,7 @@ mod tests {
 
     #[test]
     fn a_page_grouping_digits_two_ways_is_flagged() {
-        // Page 6 of `bar_Persons.pdf`: the 2016 columns come back as `3.709`
+        // Page 6 of `26.pdf`: the 2016 columns come back as `3.709`
         // and the 2017 columns as `3,900`, because the font maps the comma
         // glyph it *draws* to U+002E. Both are in one table, grouping digits
         // identically, so at least one is wrong — and guessing which would move

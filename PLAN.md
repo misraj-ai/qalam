@@ -358,10 +358,10 @@ Rationale: `qalam-core` knows nothing about Python, so it stays independently us
 - **M8 — Tables (Tier C).** *(ruled path done)* Ruled-line detection from vector graphics:
   the interpreter now reports painted axis-aligned rules, `tables.rs` clusters them into a
   grid, and cells are filled with the text inside them, columns numbered right-to-left —
-  see §10.11. 18 tables found in `bar_Persons.pdf`, none invented in the other fixture.
+  see §10.11. 18 tables found in `26.pdf`, none invented in the other fixture.
   Rotated column headers read correctly (§10.14), and **borderless tables are inferred from
   alignment** (§10.23) — 28 of them in `12.pdf`, none invented across the rest of the corpus.
-  **Still to do:** the tagged `/Table`/`/TR`/`/TD` path — `bar_Persons.pdf` tags 21 tables and
+  **Still to do:** the tagged `/Table`/`/TR`/`/TD` path — `26.pdf` tags 21 tables and
   1,709 cells, so the information is sitting there — and column spans, which currently cut a
   spanning header mid-word.
 - **M9 — HTML export (Tier D, stretch).** Render the block model to HTML: `dir="rtl"`,
@@ -409,7 +409,7 @@ Rationale: `qalam-core` knows nothing about Python, so it stays independently us
   4 -> CMYK), and record anything else as `Color::Unknown` rather than guessing wrong.
 - **Type1 and TrueType font programs are not read.** `cff.rs` handles `/FontFile3` only.
   `/FontFile` (Type 1) hides its encoding in an eexec-encrypted section and `/FontFile2`
-  (TrueType) names glyphs in a `post` table; `bar_Persons.pdf` embeds seven Type 1 fonts, so
+  (TrueType) names glyphs in a `post` table; `26.pdf` embeds seven Type 1 fonts, so
   this is not hypothetical. Both are additive work behind the same interface.
 - **Digits are reported as `/ToUnicode` claims, not as the font names them.** The same fonts
   that mis-map separators also map Arabic-Indic digit glyphs to Latin characters, so a page
@@ -420,7 +420,7 @@ Rationale: `qalam-core` knows nothing about Python, so it stays independently us
 - **Only quarter turns are recognised.** `TextOrientation` snaps to the nearest 90°, so text
   set on an arbitrary angle — a diagonal watermark, a fan of labels round a pie chart — is
   treated as horizontal and will group badly.
-- **Kashida (tatweel) justification.** `bar_Persons.pdf` stretches words to the margin by
+- **Kashida (tatweel) justification.** `26.pdf` stretches words to the margin by
   inserting U+0640 between letters, so `المعظم` is stored as `المعظــم`. We extract it
   faithfully, which is right — it is in the file — but it means extracted text will not
   match a search for the normally-typed word. Stripping it should be a flag alongside the
@@ -566,7 +566,7 @@ across several cells. `arabic::text_within` re-runs the full pipeline over each 
 — overlays anchored, order resolved, marks placed, NFKC applied — which is what keeps a cell's
 Arabic as correct as a paragraph's.
 
-**Where the line is drawn, and why there.** Page 8 of `test_for_arabic_barser.pdf` sets two
+**Where the line is drawn, and why there.** Page 8 of `25.pdf` sets two
 columns of numbered cards. The badges form a third column between them, every row shares a
 baseline, and the cells are even about the right length. It is **geometrically
 indistinguishable** from a table; what separates them is that one is wrapped prose continuing
@@ -692,7 +692,7 @@ that is as coincidence, and the less the width has to prove alone. Above about f
 requirement drops to 0.9 em; below it the strict width stands, because a short region really
 could align a few wide spaces by chance.
 
-That alone over-corrected. Page 14 of `test_for_arabic_barser.pdf` runs a ring of numbered
+That alone over-corrected. Page 14 of `25.pdf` runs a ring of numbered
 badges down the inside edge of each column, and the projection sees a perfectly good gutter
 beside them — so every number was torn from the item it numbered. Hence a second rule:
 **both sides of a column cut must be wide enough to hold words** (5 em). A narrower strip is
@@ -742,7 +742,7 @@ The rule that came out of it — and three attempts before it, each rejected by 
 - **Combining marks are excluded.** A mark is also zero-advance and also drawn over its base,
   but the existing mark handling (§10.5) already places it by reading its own position.
   Anchoring turned `تصورًا` into `تصوراً` — and painting order cannot separate the two cases,
-  because `test_for_arabic_barser.pdf` paints its marks *before* the letter they sit on while
+  because `25.pdf` paints its marks *before* the letter they sit on while
   `3.pdf` paints its overlays *after*. What the glyph **is** decides it, not where it came.
 - **"Does not move the pen" and "is a combining mark" are different questions.** They had been
   one predicate, which is what made a zero-advance `ز` get treated as a mark and moved to the
@@ -794,7 +794,7 @@ operator. Fitting the observation rather than guessing at causes is what found i
 
 ### 10.16 — Form XObjects hide text, and their resources are scoped
 
-Page 1 of `test_for_arabic_barser.pdf` was missing its title. A form XObject is a page within
+Page 1 of `25.pdf` was missing its title. A form XObject is a page within
 a page: its own content stream, its own `/Resources`, its own fonts under its own names. Text
 inside one is invisible to an interpreter that does not descend into it, and **nothing in the
 outer stream hints that anything was missed** — the extraction simply looks complete.
@@ -831,7 +831,7 @@ error survives proofreading, printing and publication. `/Encoding /Differences` 
 opposite: the renderer walks code → glyph name → outline through it, so an error there is
 visible on the page and gets fixed before anyone ships.
 
-That asymmetry is decisive, and `bar_Persons.pdf` demonstrates it three times over:
+That asymmetry is decisive, and `26.pdf` demonstrates it three times over:
 
 ```
                        /ToUnicode says   /Differences says   the page shows
@@ -869,7 +869,7 @@ line.
 ### 10.14 — Text does not always run left to right
 
 A table's narrow column headers are routinely set on their side to fit. Page 8 of
-`bar_Persons.pdf` does exactly that, and every layer of ours assumed text advances along x:
+`26.pdf` does exactly that, and every layer of ours assumed text advances along x:
 each glyph landed on its own baseline, so `أقل من ١٥` came back as `أ( ق ل م ن ٥١ )`.
 
 The direction is taken from the **text rendering matrix** — specifically where it sends the
@@ -883,7 +883,7 @@ change of orientation also ends a line, however close the glyphs are.
 
 Two bugs in one place, and the first was ours.
 
-**A glyph can decode to several digits.** `bar_Persons.pdf` has one whose `/ToUnicode` value
+**A glyph can decode to several digits.** `26.pdf` has one whose `/ToUnicode` value
 is the three characters `201` — a single glyph for a year's leading digits. The
 multi-character pre-reversal added for Arabic ligatures (§10.10) reversed it to `102`, so
 `(2016 - 2017)` came back as `(1026 - 1027)`. The rule was right for ligatures and wrong in
@@ -901,7 +901,7 @@ that appears to be is certainly a mapping fault.
 
 ### 10.12 — A synthetic fixture proves a reader runs, not that it is right
 
-`bar_Persons.pdf` **is tagged** — `/StructTreeRoot`, `/MarkInfo /Marked true`, and all 36
+`26.pdf` **is tagged** — `/StructTreeRoot`, `/MarkInfo /Marked true`, and all 36
 content pages took the tagged reading-order path built in §10.9. The output was far worse
 than geometry would have produced:
 
@@ -932,7 +932,7 @@ both true, and both beside the point.
 
 ### 10.11 — Tables: geometry finds the grid, but only the text can confirm it
 
-`bar_Persons.pdf` yields 18 ruled tables. Page 5's comes out essentially perfect — seven
+`26.pdf` yields 18 ruled tables. Page 5's comes out essentially perfect — seven
 columns of governorate statistics, `المحافظات` as column 0 because the page is RTL.
 
 Two rules did the work:
@@ -964,7 +964,7 @@ reading order, which makes the result deterministic but not correct.
 
 ### 10.10 — A second class of ligature, and why one corpus could not find it
 
-`bar_Persons.pdf` uses `Type1` simple fonts, and 14 of its glyph codes map through
+`26.pdf` uses `Type1` simple fonts, and 14 of its glyph codes map through
 `/ToUnicode` to **several base letters at once**: `لم`, `لج`, `بح`, `في`, `هم`, `لله`. One
 glyph, several letters, already in reading order.
 
@@ -994,7 +994,7 @@ would be exactly the invention this project refuses.
 > fixture turned out to be tagged, and promptly showed that a synthetic fixture proves a
 > reader *runs*, not that it is *right*.
 
-`test_for_arabic_barser.pdf` is untagged: `/StructTreeRoot` appears **zero** times in it.
+`25.pdf` is untagged: `/StructTreeRoot` appears **zero** times in it.
 Rather than ship a reader that had never seen real input, the test suite builds tagged PDFs
 from scratch — real indirect objects, a real xref table, parsed by the same `lopdf` the
 library uses. Weaker evidence than a document from InDesign, far stronger than asserting
