@@ -27,6 +27,7 @@ use crate::images::{self, PlacedImage};
 use crate::parser::Pdf;
 use crate::structure::ReadingOrder;
 use crate::types::Rotation;
+use crate::content::interpret_with_forms;
 use crate::Result;
 
 /// A fully extracted document.
@@ -132,11 +133,11 @@ impl Document {
         // Read the page summaries once. `Pdf::pages` walks the object graph, so
         // calling it per page would make the whole run quadratic. The structure
         // tree is a single document-wide object, so it is read once too.
-        let summaries = pdf.pages();
+        let pages_info = pdf.pages();
         let structure = pdf.structure();
-        let mut pages = Vec::with_capacity(summaries.len());
+        let mut pages = Vec::with_capacity(pages_info.len());
 
-        for info in &summaries {
+        for info in &pages_info {
             let number = info.number;
 
             // L2 before L1: the font map supplies both the code→text mapping
@@ -148,7 +149,7 @@ impl Document {
             // cannot find is read as a single-byte font — which splits every
             // 2-byte CID in half and turns the text into noise.
             let raw_fonts = pdf.page_raw_fonts(number)?;
-            let summaries: Vec<crate::types::FontInfo> =
+            let fonts_info: Vec<crate::types::FontInfo> =
                 raw_fonts.iter().map(|f| f.info.clone()).collect();
             let fonts = FontMap::from_raw(raw_fonts);
             let content = pdf.page_content(number)?;
@@ -157,21 +158,21 @@ impl Document {
             // draws — a form is a page within a page, and text inside one is
             // invisible to an interpreter that does not enter it.
             let forms = pdf.page_forms(number)?;
-            let glyphs = crate::content::interpret_with_forms(&content, &summaries, &forms, &fonts);
+            let page_glyphs = interpret_with_forms(&content, &fonts_info, &forms, &fonts);
 
             // L1.5: does the document state its own reading order for this
             // page? Nearly always `None`, and then L6's geometry decides.
             let order = ReadingOrder::from_structure(
                 &structure,
                 number,
-                &glyphs.mcid_spans,
-                glyphs.glyphs.len(),
+                &page_glyphs.mcid_spans,
+                page_glyphs.glyphs.len(),
             );
 
             // L7, off the critical path for text: images come from
             // `/Resources`, and their positions from the `Do` operators L1 saw.
             let raw_images = pdf.page_raw_images(number)?;
-            let images = images::extract_placed(&raw_images, &glyphs.xobjects);
+            let images = images::extract_placed(&raw_images, &page_glyphs.xobjects);
 
             // L3 + L6 + tables: the unified model, everything ordered together.
             //
@@ -179,10 +180,10 @@ impl Document {
             // is the structured model, `lines` the flat one. Reconstructing the
             // page twice would cost twice as much and let the two drift apart.
             let (blocks, lines) =
-                blocks::assemble(&glyphs, &fonts, &images, info.media_box, order.as_ref());
+                blocks::assemble(&page_glyphs, &fonts, &images, info.media_box, order.as_ref());
 
             // L4 last: it judges what every layer below it produced.
-            let report = detect::assess(number, &glyphs, &fonts, &lines);
+            let report = detect::assess(number, &page_glyphs, &fonts, &lines);
 
             pages.push(Page {
                 number,
