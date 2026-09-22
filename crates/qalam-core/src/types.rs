@@ -557,6 +557,12 @@ pub struct RawFont {
     /// The only source of glyph identity that the *renderer* checks, and so the
     /// only one a producer cannot get wrong unnoticed. See [`crate::cff`].
     pub font_program: Option<Vec<u8>>,
+    /// The embedded TrueType font program (`/FontFile2`), if there is one.
+    ///
+    /// The same argument as `font_program`, for the other font format. For a
+    /// composite font this comes from the *descendant*'s descriptor, which is
+    /// where a `Type0` keeps everything real. See [`crate::truetype`].
+    pub truetype_program: Option<Vec<u8>>,
 }
 
 impl RawFont {
@@ -574,6 +580,7 @@ impl RawFont {
             base_encoding: None,
             differences: Vec::new(),
             font_program: None,
+            truetype_program: None,
         }
     }
 }
