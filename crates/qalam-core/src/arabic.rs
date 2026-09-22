@@ -274,6 +274,7 @@ fn median_text_size(placed: &[Placed]) -> f64 {
     let mut sizes: Vec<f64> = placed.iter().map(|p| p.glyph.style.size).collect();
     if sizes.is_empty() {
         // A page of images only; any positive size keeps the thresholds sane.
+        // TODO No fixed number should be used, this might cause problem later.
         return 10.0;
     }
     sizes.sort_by(f64::total_cmp);
@@ -324,9 +325,13 @@ fn region_bbox(lines: &[TextLine], extras: &[usize], extra_boxes: &[Rect]) -> Re
 /// breaks the tie, so the two stay together. Combining marks are the
 /// exception, and a zero-advance glyph that overlaps nothing keeps its own
 /// position — see the body.
-///
 /// The real coordinates are left untouched in the [`Glyph`], because bounding
 /// boxes should still describe where the ink actually is.
+/// The fix, in one sentence
+/// If a zero-advance glyph is drawn inside another glyph's box, give it that glyph's position for sorting. Because the sort is
+/// stable, painting order then keeps the two side by side.
+/// The real x/y in the Glyph are not changed. Only anchor_along and anchor_across are, and those are the values used for
+/// sorting. Bounding boxes still use the real coordinates, so they still show where the ink actually is.
 fn anchor_zero_advance(placed: &mut [Placed], fonts: &FontMap) {
     /// How far to look, in painting order, for the glyph an overlay sits on.
     /// A producer draws the two together, so the base is a few glyphs away.
@@ -342,7 +347,7 @@ fn anchor_zero_advance(placed: &mut [Placed], fonts: &FontMap) {
         // A mark is drawn over its base and belongs *after* it in logical
         // order, which the existing mark handling arranges by reading the
         // mark's own position (PLAN.md §10.5). Anchoring it would move it to
-        // the wrong side of that base — in `test_for_arabic_barser.pdf` it
+        // the wrong side of that base — in `25.pdf` it
         // turned `تصورًا` into `تصوراً`.
         let text = placed[i]
             .actual
@@ -399,6 +404,8 @@ fn anchor_zero_advance(placed: &mut [Placed], fonts: &FontMap) {
 fn item_for(placed: &Placed) -> Item {
     let g = &placed.glyph;
     // Rotated text occupies a tall, narrow box rather than a short, wide one.
+    // The height is a rough estimate. The real ink height of each glyph is inside the font program,
+    // and reading it would be far more work than choosing a column boundary needs.
     let (w, h) = if g.orientation.is_vertical() {
         (g.style.size, g.advance)
     } else {
@@ -407,8 +414,8 @@ fn item_for(placed: &Placed) -> Item {
     Item {
         x0: g.x,
         x1: g.x + w,
-        y0: g.y - h * 0.25,
-        y1: g.y + h * 0.75,
+        y0: g.y - h * 0.25,  // 25% below the baseline (descenders)
+        y1: g.y + h * 0.75, // 75% above it (ascenders)
         size: g.style.size,
     }
 }
@@ -456,7 +463,8 @@ fn apply_actual_text(page: &PageGlyphs) -> Vec<Placed> {
         let Some(start) = (span.start < end).then_some(span.start) else {
             continue;
         };
-
+        // If the PDF marked a group of glyphs with /ActualText (the author's own "this reads as…"), the whole text
+        // goes on the first glyph and the rest get Some(""), so the text appears exactly once.
         placed[start].actual = Some(span.text.clone());
         for slot in &mut placed[start + 1..end] {
             slot.actual = Some(String::new());
@@ -508,7 +516,12 @@ fn group_into_lines(glyphs: &[Placed]) -> Vec<Vec<Placed>> {
             .total_cmp(&a.anchor_across)
             .then(a.anchor_along.total_cmp(&b.anchor_along))
     });
-
+    // across, descending. Note b before a: comparing b to a reverses the order.
+    // PDF's y increases upwards, so the largest y is the top of the page.
+    // Descending y means top to bottom.
+    // The sort uses the anchors, not the real coordinates. This is where task 2 matters.
+    // Remember the ز drawn 4pt above its line in 3.pdf: its real y is 504, but its anchor was set to its host's 500.
+    // Sorting by the anchor keeps it with its line.
     let mut lines: Vec<Vec<Placed>> = Vec::new();
     let mut current: Vec<Placed> = Vec::new();
     let mut current_across = sorted[0].anchor_across;
@@ -593,6 +606,28 @@ fn build_line(placed: &[Placed], fonts: &FontMap) -> Option<TextLine> {
             .collect::<String>(),
     );
 
+    // Does the producer paint its own spaces on this line?
+    //
+    // That one question decides how much the gap heuristic below is allowed to
+    // do. A producer that paints space glyphs has already told us where the
+    // words end, so geometry only has to catch what it missed, and a suspicious
+    // gap is more likely to be a sidebearing than a word break. A producer that
+    // paints none has delegated the whole job to us: every word boundary on the
+    // line exists only as empty space, and missing one glues two words together.
+    let explicit_spaces = decoded.iter().any(|(_, piece, _)| {
+        piece.as_ref().is_some_and(|p| {
+            let t = piece_str(p);
+            !t.is_empty() && t.chars().all(char::is_whitespace)
+            // does this line contain at least one painted space, meaning a piece that's all whitespace? (!t.is_empty()
+            // excludes the empty /ActualText placeholders, because all is true for an empty string, as confirmed above.)
+        })
+    });
+    let gap_fraction = if explicit_spaces {
+        WORD_GAP_FRACTION
+    } else {
+        WORD_GAP_FRACTION_INFERRED
+    };
+
     // Build the line as pieces rather than one string, because decoded glyphs
     // and `/ActualText` need opposite treatment by the reorder below.
     let mut pieces: Vec<Piece> = Vec::new();
@@ -652,7 +687,7 @@ fn build_line(placed: &[Placed], fonts: &FontMap) -> Option<TextLine> {
             if let Some(edge) = right_edge {
                 let gap = glyph.along() - edge;
                 let already_spaced = matches!(pieces.last(), Some(Piece::Decoded(t)) if t == " ");
-                if gap > glyph.style.size * WORD_GAP_FRACTION && !already_spaced {
+                if gap > glyph.style.size * gap_fraction && !already_spaced {
                     pieces.push(Piece::Decoded(" ".to_string()));
                     mark_slot = None;
                 }
@@ -795,7 +830,7 @@ enum Piece {
 ///
 /// - **`/ActualText`**, which a human wrote for a human.
 /// - **A ligature glyph whose `/ToUnicode` value is several characters.** One
-///   glyph, several letters, given in reading order. `bar_Persons.pdf` maps 14
+///   glyph, several letters, given in reading order. `26.pdf` maps 14
 ///   such codes: `لم`, `لج`, `بح`, `في`, `هم`, `لله`. Reversing inside them
 ///   turns `المعظم` into `املعظم` — the lam and meem swapped.
 ///
@@ -834,7 +869,7 @@ fn assemble_visual(pieces: &[Piece]) -> String {
 ///
 /// # Digits are left-to-right, even in Arabic
 ///
-/// This is where an over-broad rule did real damage. `bar_Persons.pdf` has a
+/// This is where an over-broad rule did real damage. `26.pdf` has a
 /// glyph whose `/ToUnicode` value is the **three characters `201`** — a single
 /// glyph for a year's leading digits. Reversing it produced `102`, so
 /// `(2016 - 2017)` came back as `(1026 - 1027)`: not visibly broken, just
@@ -895,9 +930,9 @@ fn convert_digit(c: char, to: Digits) -> char {
 ///
 /// # Why a number in two scripts is not merely ugly
 ///
-/// `bar_Persons.pdf` has fonts whose `/ToUnicode` maps most digit glyphs to one
+/// `26.pdf` has fonts whose `/ToUnicode` maps most digit glyphs to one
 /// script and a few to the other: `2017` arrives as `20١7` — Latin two, zero
-/// and seven around an Arabic-Indic one. The rendered page shows `٢٠١٧`
+/// and seven around an Arabic-Indic one. The rendered page shows `2017`
 /// throughout, so this is the file's map being inconsistent, not the document.
 ///
 /// The damage is out of all proportion to the cause. Latin digits are bidi
@@ -926,6 +961,7 @@ fn unify_digit_runs(text: &str) -> String {
         };
 
         // Take the whole run of digits.
+        // TODO fix the decimal point and the , seperator for example 1,635 each on is a digit.
         let start = i;
         while i < chars.len() && digit_system(chars[i]).is_some() {
             i += 1;
@@ -1125,11 +1161,30 @@ fn is_combining_mark(c: char) -> bool {
     )
 }
 
-/// How wide a gap, as a fraction of the type size, means a word break.
+/// How wide a gap, as a fraction of the type size, means a word break on a line
+/// whose producer *does* paint space glyphs.
 ///
 /// Tuned low: a missing space is harder to notice and harder to fix than an
 /// extra one, and inter-letter spacing within an Arabic word is very small.
+/// It cannot go much lower, though, because a real non-break can reach 0.20 em
+/// here: `26.pdf` leaves that much air between a full stop and the
+/// letter beside it, and reading that as a word break puts a space before the
+/// full stop.
 const WORD_GAP_FRACTION: f64 = 0.25;
+
+/// The same threshold for a line that contains no space glyph at all.
+///
+/// Every word boundary on such a line is empty space and nothing else, so the
+/// cost of being conservative is not a stray space but a whole line run
+/// together. Justified text is what forces the value down: the gap is the
+/// justification stretch, so it differs line by line, and in `31_lebenon.pdf` it
+/// ranges from 0.18 em to 0.37 em at the same type size. A threshold of 0.25 em
+/// cuts straight through that spread and spaces roughly half the lines — which
+/// is why the failure looks random rather than systematic.
+///
+/// 0.15 em sits below the whole spread while staying clear of the widest gap
+/// *inside* a word in that file, which is 0.10 em.
+const WORD_GAP_FRACTION_INFERRED: f64 = 0.15;
 
 /// Collapse runs of whitespace and trim the ends.
 ///
@@ -1593,11 +1648,89 @@ mod tests {
         );
     }
 
+    /// A font that decodes byte codes through `/WinAnsiEncoding`, so a test can
+    /// paint a real space glyph (code 32) rather than only unresolvable ones.
+    fn winansi_font() -> FontMap {
+        let mut raw = crate::types::RawFont::new(crate::types::FontInfo {
+            resource_name: "F".to_string(),
+            subtype: "TrueType".to_string(),
+            base_font: None,
+            encoding: Some("WinAnsiEncoding".to_string()),
+            code_to_unicode: crate::types::CodeToUnicode::EncodingOnly,
+        });
+        raw.base_encoding = Some("WinAnsiEncoding".to_string());
+        FontMap::from_raw(vec![raw])
+    }
+
+    /// Three glyphs on one baseline, the third pushed `gap` beyond the second.
+    fn line_with_gap(codes: [u32; 3], gap: f64) -> Vec<Glyph> {
+        let size = 13.0;
+        let advance = 5.0;
+        let mut out = Vec::new();
+        let mut x = 100.0;
+        for (i, code) in codes.iter().enumerate() {
+            let mut g = glyph(x, 0.0, size);
+            g.code = *code;
+            g.advance = advance;
+            x += advance + if i == 1 { gap } else { 0.0 };
+            out.push(g);
+        }
+        out
+    }
+
+    #[test]
+    fn a_justified_line_without_space_glyphs_still_gets_its_words_split() {
+        // `31_lebenon.pdf` is justified and paints no space glyph at all: the only
+        // record of a word boundary is the stretch between two glyphs, and that
+        // stretch is whatever the line's justification needed — 0.18 em on a
+        // tight line, 0.37 em on a loose one. Judging all of them against one
+        // threshold of 0.25 em spaced the loose lines and glued the tight ones,
+        // which is why the file looked like spacing failed at random.
+        let gap = 13.0 * 0.18;
+        let page = PageGlyphs {
+            glyphs: line_with_gap([0, 0, 0], gap),
+            ..Default::default()
+        };
+
+        // An empty font map decodes nothing, so this line has no space glyph
+        // and any space in the result is one the gap heuristic invented.
+        let lines = reconstruct(&page, &FontMap::default());
+        assert_eq!(lines.len(), 1);
+        assert!(
+            lines[0].text.contains(' '),
+            "a word boundary was missed: {:?}",
+            lines[0].text
+        );
+    }
+
+    #[test]
+    fn the_same_gap_is_left_alone_when_the_producer_paints_spaces() {
+        // The counter-case, and the reason the threshold is not simply lowered
+        // for everyone. `26.pdf` paints its own spaces, and it also
+        // leaves 0.20 em of air between a full stop and the letter beside it.
+        // Read as a word break, that gap puts a space *before* the full stop.
+        // A line whose producer marks its own word boundaries does not need us
+        // to guess at them, so the conservative threshold stays.
+        let gap = 13.0 * 0.18;
+        let page = PageGlyphs {
+            // `A`, a real space, then `B`: the producer is marking boundaries.
+            glyphs: line_with_gap([b'A' as u32, b' ' as u32, b'B' as u32], gap),
+            ..Default::default()
+        };
+
+        let lines = reconstruct(&page, &winansi_font());
+        assert_eq!(lines.len(), 1);
+        assert_eq!(
+            lines[0].text, "A B",
+            "the gap heuristic invented a second space"
+        );
+    }
+
     // ---- numbers ---------------------------------------------------------
 
     #[test]
     fn a_multi_digit_glyph_is_never_reversed() {
-        // `bar_Persons.pdf` has a glyph whose `/ToUnicode` value is the three
+        // `26.pdf` has a glyph whose `/ToUnicode` value is the three
         // characters `201` — one glyph for a year's leading digits. Treating
         // it like an Arabic ligature and reversing it produced `102`, so
         // `(2016 - 2017)` came back as `(1026 - 1027)`. Not visibly broken,
