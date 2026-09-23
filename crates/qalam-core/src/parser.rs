@@ -654,20 +654,26 @@ impl Pdf {
     /// itself: the descriptor, and with it `/FontFile2`, lives one level down
     /// in `/DescendantFonts[0]`.
     ///
-    /// # Why the two guards
+    /// # Why the guard on `/Encoding`
     ///
-    /// The program is read only to answer "which character is glyph *n*", and
-    /// that question needs the code painted in the content stream to *be* a
-    /// glyph number. Two things have to hold for that:
+    /// The program is read only to answer "which character is glyph *n*", so
+    /// the chain from the painted code to a glyph id has to be one we can
+    /// actually follow:
     ///
-    /// - `/Encoding /Identity-H`, so the code is the CID unchanged rather than
-    ///   a lookup into some other CMap;
-    /// - `/CIDToGIDMap /Identity` or absent, so the CID is the glyph id.
+    /// ```text
+    /// code ──(/Encoding CMap)──► CID ──(/CIDToGIDMap)──► glyph id
+    /// ```
     ///
-    /// Either one being different makes the chain code → CID → glyph a real
-    /// mapping we have not read, and an answer from the font program would be
-    /// confidently wrong. Refusing is the honest outcome: the field is left
-    /// unset, and the layers above keep the sources they already had.
+    /// The second hop is handled: `/CIDToGIDMap` is either the name `/Identity`
+    /// or a stream, and the stream is read here for [`crate::font`] to apply.
+    ///
+    /// The first hop is not. `Identity-H` means there is nothing to do — the
+    /// code *is* the CID — but any other CMap is a translation this crate has
+    /// not implemented, and following the chain without it would look up the
+    /// wrong glyph and get back a perfectly plausible wrong character. So the
+    /// program is left unread and the layers above keep the sources they
+    /// already had. Every fixture in the corpus is `Identity-H`; the guard is
+    /// there for the file that is not.
     fn read_cid_truetype_program(&self, dict: &Dictionary, raw: &mut RawFont) {
         let identity_encoding = self
             .lookup(dict, b"Encoding")
@@ -687,14 +693,17 @@ impl Pdf {
             return;
         };
 
-        // Absent means Identity by the spec's default; a stream means a real
-        // table, which we have not read and so must not assume away.
-        let identity_gids = match self.lookup(descendant, b"CIDToGIDMap") {
-            None => true,
-            Some(obj) => obj.as_name().is_ok_and(|name| name == b"Identity"),
-        };
-        if !identity_gids {
-            return;
+        // `/CIDToGIDMap` is a name or a stream (PDF 32000-1 §9.7.4.2). Absent
+        // means `/Identity`, the spec's default. A name that is neither is
+        // malformed, and inventing a reading for it is how a parser starts
+        // producing confident nonsense — so nothing is read at all.
+        match self.lookup(descendant, b"CIDToGIDMap") {
+            None => {}
+            Some(obj) if obj.as_name().is_ok_and(|name| name == b"Identity") => {}
+            Some(obj) => match obj.as_stream().ok() {
+                Some(stream) => raw.cid_to_gid = stream.decompressed_content().ok(),
+                None => return,
+            },
         }
 
         let Some(descriptor) = self

@@ -563,6 +563,13 @@ pub struct RawFont {
     /// composite font this comes from the *descendant*'s descriptor, which is
     /// where a `Type0` keeps everything real. See [`crate::truetype`].
     pub truetype_program: Option<Vec<u8>>,
+    /// `/CIDToGIDMap`, when it is a stream rather than the name `/Identity`.
+    ///
+    /// Raw bytes, as read: a flat array of big-endian `u16` glyph ids indexed
+    /// by CID. `None` means the identity mapping, where a CID *is* a glyph id —
+    /// the overwhelmingly common case, and the one a `None` here should not be
+    /// confused with "unknown".
+    pub cid_to_gid: Option<Vec<u8>>,
 }
 
 impl RawFont {
@@ -581,6 +588,7 @@ impl RawFont {
             differences: Vec::new(),
             font_program: None,
             truetype_program: None,
+            cid_to_gid: None,
         }
     }
 }
