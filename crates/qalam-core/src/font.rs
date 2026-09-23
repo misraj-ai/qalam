@@ -459,6 +459,26 @@ impl Font {
                 .glyph_program_char(code)
                 .filter(|c| !truetype::is_mirrored(*c))
             {
+                // Convicted is not the same as wrong about everything. When a
+                // font draws `ي` and Persian `ی` with one glyph, its `cmap`
+                // lists both and the program cannot say which was typed — but
+                // the map can, so here the map keeps the code. The same goes
+                // for a ligature glyph the map spells out: `23.pdf` maps its
+                // `﷼` to `ريال`, while the program's U+FDFC decomposes to
+                // `ریال`, with the Persian yeh.
+                //
+                // Digits are deliberately *not* handed back: a convicted map
+                // is often wrong about some digit codes and right about
+                // others, and taking each from a different source would
+                // print `(18)` beside `(٢١)`. The program's digits are the
+                // ones on the page, consistently.
+                let from_map = self.to_unicode.get(code);
+                if from_map
+                    .as_deref()
+                    .is_some_and(|text| map_resolves_ambiguity(text, ch))
+                {
+                    return from_map;
+                }
                 return Some(ch.to_string());
             }
         }
@@ -713,6 +733,9 @@ fn to_unicode_is_untrustworthy(
 
     let mut compared = 0usize;
     let mut disagreed = 0usize;
+    // The second, sharper count: disagreements no accurate map can produce.
+    // See [`is_letter_confusion`].
+    let mut confused = 0usize;
 
     for (code, from_program) in testimony {
         let Some(from_map) = to_unicode.get(code) else {
@@ -734,24 +757,203 @@ fn to_unicode_is_untrustworthy(
         };
 
         compared += 1;
-        // Compared after normalisation, so that a map naming the base letter
-        // where the font names the shaped form counts as agreement. The two
-        // are the same character said two ways, and L3 reconciles them.
-        if !same_after_nfkc(mapped, from_program) {
+        // Compared by meaning, so that a map naming the base letter where the
+        // font names the shaped form — or `2` where the font draws `٢` — counts
+        // as agreement. See [`same_meaning`].
+        if !same_meaning(mapped, from_program) {
             disagreed += 1;
+            if is_letter_confusion(mapped, from_program) {
+                confused += 1;
+            }
         }
     }
 
-    compared >= VERDICT_MIN_SAMPLE && (disagreed as f64) > (compared as f64) * VERDICT_DISAGREEMENT
+    // Two routes to a conviction, both behind the same minimum sample:
+    //
+    // - the *share* of disagreements, for a map shifted wholesale
+    //   (`30_doc3.pdf`, `32_doc5.pdf`);
+    // - the *count* of letter confusions, for a map that is mostly right but
+    //   wrong on a handful of glyphs — which, when those glyphs are `و`, `س`
+    //   and `ل`, still ruins every other word (`28.pdf`).
+    compared >= VERDICT_MIN_SAMPLE
+        && ((disagreed as f64) > (compared as f64) * VERDICT_DISAGREEMENT
+            || confused >= VERDICT_MIN_CONFUSIONS)
+}
+
+/// How many letter confusions condemn a `/ToUnicode` map, whatever its share.
+///
+/// A correct map makes **none**: it has no reason to call a seen `ل` or a waw
+/// a space. So this could in principle be 1; it is 3 only so that one odd
+/// glyph in an otherwise honest font does not flip the whole font over.
+///
+/// Measured on the corpus: every map that renders correctly scores 0, while
+/// `28.pdf` scores 9 (seen→`ل`, sad→`و`, teh→`ك`, and khah, ghain, zain, lam,
+/// waw → space) and `23.pdf` scores 3 (meem, reh, beh → space — which is why
+/// its `ترتيبات` came out as `ت تي ات`).
+const VERDICT_MIN_CONFUSIONS: usize = 3;
+
+/// Is this a disagreement that no accurate map can produce?
+///
+/// The font program draws an Arabic *letter*, and the map calls it either
+/// whitespace or a *different* letter. Both are impossible for an honest
+/// producer: the glyph's outline is that letter, and the map was written to
+/// say what the outline means.
+///
+/// Diacritics are deliberately **not** counted. Plenty of correct maps send a
+/// harakah glyph to a space (`23.pdf`, `27.pdf` both do, on every page) —
+/// lossy, but a producer's habit rather than a broken map.
+fn is_letter_confusion(mapped: char, from_program: char) -> bool {
+    // `let ... else`: bind the letter, or leave the function early. The
+    // program must be testifying about a letter for this to count at all.
+    let Some(drawn) = arabic_letter(from_program) else {
+        return false;
+    };
+    if mapped.is_whitespace() {
+        return true;
+    }
+    // A map that names something other than an Arabic letter — a digit, a
+    // Latin character — is a disagreement, but a milder one, and the share
+    // rule above already weighs it.
+    arabic_letter(mapped).is_some_and(|named| named != drawn)
+}
+
+/// The basic Arabic letter a character stands for, looking through the shaped
+/// presentation forms.
+///
+/// `None` for anything else: marks, tatweel, digits, punctuation, and the
+/// extended letters of Persian and Urdu (whose overlap with the basic ones is
+/// [`same_meaning`]'s business, not a confusion).
+fn arabic_letter(c: char) -> Option<char> {
+    use unicode_normalization::UnicodeNormalization;
+    // NFKC folds `ﺳ` (seen, initial form) onto `س`. It works on a stream of
+    // characters, so we feed it a one-element iterator.
+    let mut folded = std::iter::once(c).nfkc();
+    // Exactly one character out: a ligature such as `ﻻ` folds to two, and is
+    // not "a letter".
+    let (Some(base), None) = (folded.next(), folded.next()) else {
+        return None;
+    };
+    // hamza..ghain, then feh..yeh — skipping U+063B..U+0640, which are
+    // unassigned slots and tatweel.
+    matches!(base, '\u{0621}'..='\u{063A}' | '\u{0641}'..='\u{064A}').then_some(base)
+}
+
+/// Do the map and the font program say the same thing about one glyph?
+///
+/// Stricter than "is it the same character" and looser than it too, because a
+/// glyph is ink and the map is intent, and some ink is shared between
+/// intents:
+///
+/// - **Shape.** NFKC folds a presentation form onto its base letter: `ﺳ` and
+///   `س` are the same letter said two ways, and L3 reconciles them.
+/// - **Digits.** Word draws a typed `2` with the `٢` glyph when the document
+///   asks for Hindi digits. The font can only report `٢`; the map reports
+///   what was typed. Both are right.
+/// - **Separators.** The same, for `,`/`٬` and `.`/`٫` inside those numbers.
+/// - **Letters Arabic shares with Persian.** A font often draws `ي` and `ی`,
+///   or `ه` and `ھ`, with one glyph. Its `cmap` then lists both, and nothing
+///   in the program says which one was typed.
+///
+/// None of these is evidence against the map, so none counts towards a
+/// verdict.
+fn same_meaning(a: char, b: char) -> bool {
+    if same_letter_after_nfkc(a, b) || shares_a_glyph(a, b) {
+        return true;
+    }
+    // `Option<u32> == Option<u32>`: two `None`s would compare equal, so the
+    // `is_some()` guard keeps two non-digits from "agreeing" here.
+    if digit_value(a).is_some() && digit_value(a) == digit_value(b) {
+        return true;
+    }
+    matches!(
+        (a, b),
+        (',', '\u{066C}') | ('\u{066C}', ',') | ('.', '\u{066B}') | ('\u{066B}', '.')
+    )
+}
+
+/// Does the map's text say what the program's glyph says, only more exactly?
+///
+/// Two ways it can:
+///
+/// - a single letter from the same glyph-sharing group (see
+///   [`shares_a_glyph`]);
+/// - a string that spells out a ligature glyph, letter for letter, allowing
+///   the same groups — `ريال` for `﷼`, `لا` for `ﻻ`.
+///
+/// Returns `false` when the two are simply one letter in two shapes: the
+/// program's shaped form is then the better answer for L3.
+fn map_resolves_ambiguity(from_map: &str, from_program: char) -> bool {
+    use unicode_normalization::UnicodeNormalization;
+
+    let mut chars = from_map.chars();
+    if let (Some(mapped), None) = (chars.next(), chars.next()) {
+        return shares_a_glyph(mapped, from_program);
+    }
+
+    // Both sides fully decomposed, then compared pairwise. `zip` alone would
+    // stop at the shorter side, so the lengths are checked first.
+    let spelled: Vec<char> = from_map.nfkc().collect();
+    let drawn: Vec<char> = std::iter::once(from_program).nfkc().collect();
+    drawn.len() > 1
+        && spelled.len() == drawn.len()
+        && spelled
+            .iter()
+            .zip(&drawn)
+            .all(|(a, b)| a == b || shares_a_glyph(*a, *b))
+}
+
+/// Are these two *different* letters that fonts commonly draw with one glyph?
+///
+/// The one disagreement where a convicted map still outranks the program:
+/// the program is not wrong, it is ambiguous, and the map resolves it. Same
+/// letter after NFKC is excluded — that is not ambiguity, just a shaped form
+/// against a base one, and the shaped form is worth keeping for L3.
+fn shares_a_glyph(a: char, b: char) -> bool {
+    !same_letter_after_nfkc(a, b)
+        && variant_group(a).is_some()
+        && variant_group(a) == variant_group(b)
 }
 
 /// Do two characters normalise to the same thing?
 ///
-/// NFKC folds a presentation form onto its base letter, which is precisely the
-/// difference we want to forgive here.
-fn same_after_nfkc(a: char, b: char) -> bool {
+/// NFKC folds a presentation form onto its base letter.
+fn same_letter_after_nfkc(a: char, b: char) -> bool {
     use unicode_normalization::UnicodeNormalization;
     a == b || a.nfkc().eq(b.nfkc())
+}
+
+/// The numeric value of a decimal digit in any of the three scripts Arabic
+/// documents mix: ASCII, Arabic-Indic (`٠١٢`), and Extended Arabic-Indic
+/// (`۰۱۲`, used in Persian and Urdu).
+fn digit_value(c: char) -> Option<u32> {
+    match c {
+        '0'..='9' => Some(c as u32 - '0' as u32),
+        '\u{0660}'..='\u{0669}' => Some(c as u32 - 0x0660),
+        '\u{06F0}'..='\u{06F9}' => Some(c as u32 - 0x06F0),
+        _ => None,
+    }
+}
+
+/// Which group of glyph-sharing letters a character belongs to, named by the
+/// group's basic Arabic member. Looks through presentation forms, so `ﻴ` is
+/// in the yeh group too.
+fn variant_group(c: char) -> Option<char> {
+    use unicode_normalization::UnicodeNormalization;
+    let mut folded = std::iter::once(c).nfkc();
+    let (Some(base), None) = (folded.next(), folded.next()) else {
+        return None;
+    };
+    let group = match base {
+        // yeh, Farsi yeh, alef maksura — the final forms of the last two are
+        // the same dotless shape, and the first two share their medial forms.
+        '\u{064A}' | '\u{06CC}' | '\u{0649}' => '\u{064A}',
+        // heh, heh doachashmee, heh goal, ae.
+        '\u{0647}' | '\u{06BE}' | '\u{06C1}' | '\u{06D5}' => '\u{0647}',
+        // kaf and keheh.
+        '\u{0643}' | '\u{06A9}' => '\u{0643}',
+        _ => return None,
+    };
+    Some(group)
 }
 
 /// Every font on one page, keyed by the resource name the stream uses.
@@ -1313,14 +1515,35 @@ end";
         cmap: &[(u16, u16, u16)],
         cid_to_gid: Option<&[u16]>,
     ) -> Font {
+        // Each `char` becomes a one-character `String`, so the general helper
+        // below serves both shapes of test.
+        let entries: Vec<(u16, String)> = to_unicode
+            .iter()
+            .map(|(code, ch)| (*code, ch.to_string()))
+            .collect();
+        composite_with_text(&entries, cmap, cid_to_gid)
+    }
+
+    /// The general form: a map whose destinations are strings, for the
+    /// ligature glyphs a producer spells out letter by letter.
+    fn composite_with_text(
+        to_unicode: &[(u16, String)],
+        cmap: &[(u16, u16, u16)],
+        cid_to_gid: Option<&[u16]>,
+    ) -> Font {
         use crate::truetype::fixtures::{font_with_cmap, format4};
 
         // A minimal CMap stream. Only `beginbfchar` is needed: the shape the
         // verdict reads is one code, one destination.
         let mut stream = String::from("1 begincodespacerange\n<0000> <FFFF>\nendcodespacerange\n");
         stream.push_str(&format!("{} beginbfchar\n", to_unicode.len()));
-        for (code, ch) in to_unicode {
-            stream.push_str(&format!("<{:04X}> <{:04X}>\n", code, *ch as u32));
+        for (code, text) in to_unicode {
+            // A destination is UTF-16BE hex; `encode_utf16` yields its units.
+            let hex: String = text
+                .encode_utf16()
+                .map(|unit| format!("{unit:04X}"))
+                .collect();
+            stream.push_str(&format!("<{code:04X}> <{hex}>\n"));
         }
         stream.push_str("endbfchar\n");
 
@@ -1343,7 +1566,7 @@ end";
     /// Distinct on purpose. Neighbouring presentation forms are usually four
     /// shapes of the same letter, and those normalise to the same character —
     /// so a map shifted by one across them would be no disagreement at all,
-    /// which is exactly what `same_after_nfkc` is there to forgive.
+    /// which is exactly what `same_meaning` is there to forgive.
     fn ten_glyphs() -> Vec<(u16, u16, u16)> {
         (0..10u16)
             .map(|i| (0x0627 + i, 0x0627 + i, 10 + i))
@@ -1495,5 +1718,121 @@ end";
             !font.to_unicode_untrusted(),
             "an accurate map was convicted by comparing the wrong pairs"
         );
+    }
+
+    // ---- letter confusions ---------------------------------------------------
+
+    /// Ten distinct letters the map gets right, plus whatever a test adds.
+    fn ten_agreeing() -> Vec<(u16, char)> {
+        ten_glyphs()
+            .iter()
+            .map(|(form, _, glyph)| (*glyph, char::from_u32(u32::from(*form)).expect("valid")))
+            .collect()
+    }
+
+    #[test]
+    fn a_map_wrong_about_a_few_letters_is_overruled() {
+        // `28.pdf` in miniature. Most of the map is right, so the share of
+        // disagreements stays under a third — but three codes turn a letter
+        // into a space or into a *different* letter, which no honest map does.
+        let mut cmap = ten_glyphs();
+        cmap.extend([
+            (0x0633, 0x0633, 30),
+            (0x0635, 0x0635, 31),
+            (0x0648, 0x0648, 32),
+        ]);
+
+        let mut map = ten_agreeing();
+        map.extend([(30, '\u{0644}'), (31, '\u{0648}'), (32, ' ')]);
+
+        let font = composite_with(&map, &cmap);
+        assert!(font.to_unicode_untrusted());
+        assert_eq!(
+            font.decode(30),
+            Some("\u{0633}".to_string()),
+            "seen, not lam"
+        );
+        assert_eq!(
+            font.decode(31),
+            Some("\u{0635}".to_string()),
+            "sad, not waw"
+        );
+        assert_eq!(
+            font.decode(32),
+            Some("\u{0648}".to_string()),
+            "waw, not a space"
+        );
+    }
+
+    #[test]
+    fn diacritics_mapped_to_space_are_not_a_confusion() {
+        // Many correct producers send harakat glyphs to a space. Lossy, but a
+        // habit rather than a broken map, so it must not convict.
+        let mut cmap = ten_glyphs();
+        cmap.extend([(0x064B, 0x064D, 30)]);
+
+        let mut map = ten_agreeing();
+        map.extend([(30, ' '), (31, ' '), (32, ' ')]);
+
+        let font = composite_with(&map, &cmap);
+        assert!(!font.to_unicode_untrusted());
+    }
+
+    #[test]
+    fn a_convicted_map_keeps_a_yeh_the_font_shares_with_persian() {
+        // One glyph drawn for both `ي` and `ی`: the program's `cmap` cannot
+        // say which was typed, the map can. Conviction must not turn Arabic
+        // text Persian.
+        let mut cmap = ten_glyphs();
+        cmap.extend([
+            (0x0633, 0x0633, 30),
+            (0x0635, 0x0635, 31),
+            (0x0648, 0x0648, 32),
+        ]);
+        cmap.push((0x06CC, 0x06CC, 40));
+
+        let mut map = ten_agreeing();
+        map.extend([(30, '\u{0644}'), (31, '\u{0648}'), (32, ' ')]);
+        map.push((40, '\u{064A}'));
+
+        let font = composite_with(&map, &cmap);
+        assert!(font.to_unicode_untrusted());
+        assert_eq!(font.decode(40), Some("\u{064A}".to_string()));
+    }
+
+    #[test]
+    fn a_convicted_map_keeps_a_ligature_it_spells_out() {
+        // `23.pdf` maps its rial-sign glyph to `ريال`. The program only knows
+        // U+FDFC, whose decomposition uses the Persian yeh — so the map's
+        // spelling is the better answer. A spelling that does *not* match
+        // (`28.pdf` calls lam-alef `يج`) is still overruled.
+        let mut cmap = ten_glyphs();
+        cmap.extend([
+            (0x0633, 0x0633, 30),
+            (0x0635, 0x0635, 31),
+            (0x0648, 0x0648, 32),
+        ]);
+        cmap.push((0xFDFC, 0xFDFC, 40));
+        cmap.push((0xFEFB, 0xFEFB, 41));
+
+        let mut map: Vec<(u16, String)> = ten_agreeing()
+            .into_iter()
+            .map(|(code, ch)| (code, ch.to_string()))
+            .collect();
+        map.extend([
+            (30, "\u{0644}".into()),
+            (31, "\u{0648}".into()),
+            (32, " ".into()),
+        ]);
+        map.push((40, "\u{0631}\u{064A}\u{0627}\u{0644}".into()));
+        map.push((41, "\u{064A}\u{062C}".into()));
+
+        let font = composite_with_text(&map, &cmap, None);
+        assert!(font.to_unicode_untrusted());
+        assert_eq!(
+            font.decode(40),
+            Some("\u{0631}\u{064A}\u{0627}\u{0644}".to_string())
+        );
+        assert_eq!(font.decode(41), Some("\u{FEFB}".to_string()));
     }
 }
