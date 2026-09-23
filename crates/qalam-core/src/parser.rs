@@ -621,6 +621,7 @@ impl Pdf {
 
         if raw.info.is_two_byte() {
             self.read_cid_widths(dict, &mut raw);
+            self.read_cid_truetype_program(dict, &mut raw);
         } else {
             self.read_simple_widths(dict, &mut raw);
             self.read_encoding(dict, &mut raw);
@@ -628,14 +629,12 @@ impl Pdf {
         }
         raw
     }
-    // TODO we need to handel FontFile2
-    // see section 9.9 and 9.8 for more information
+
     /// Pull the embedded CFF font program out of the font descriptor.
     ///
-    /// Only `/FontFile3` (Type1C / CFF) is read. `/FontFile` is Type 1, whose
-    /// encoding sits inside an eexec-encrypted section, and `/FontFile2` is
-    /// TrueType, whose `post` table names glyphs but by a different route —
-    /// both are worth adding later, and neither is guessed at now.
+    /// Only `/FontFile3` (Type1C / CFF) is read here. `/FontFile` is Type 1,
+    /// whose encoding sits inside an eexec-encrypted section, and is still not
+    /// guessed at. `/FontFile2` is TrueType and has its own reader below.
     fn read_font_program(&self, dict: &Dictionary) -> Option<Vec<u8>> {
         let descriptor = self
             .lookup(dict, b"FontDescriptor")
@@ -647,6 +646,77 @@ impl Pdf {
 
         // Font programs are almost always Flate-compressed.
         stream.decompressed_content().ok()
+    }
+
+    /// Read `/FontFile2` from a composite font's descendant.
+    ///
+    /// PDF 32000-1 §9.7.4. A `Type0` font dictionary carries almost nothing
+    /// itself: the descriptor, and with it `/FontFile2`, lives one level down
+    /// in `/DescendantFonts[0]`.
+    ///
+    /// # Why the guard on `/Encoding`
+    ///
+    /// The program is read only to answer "which character is glyph *n*", so
+    /// the chain from the painted code to a glyph id has to be one we can
+    /// actually follow:
+    ///
+    /// ```text
+    /// code ──(/Encoding CMap)──► CID ──(/CIDToGIDMap)──► glyph id
+    /// ```
+    ///
+    /// The second hop is handled: `/CIDToGIDMap` is either the name `/Identity`
+    /// or a stream, and the stream is read here for [`crate::font`] to apply.
+    ///
+    /// The first hop is not. `Identity-H` means there is nothing to do — the
+    /// code *is* the CID — but any other CMap is a translation this crate has
+    /// not implemented, and following the chain without it would look up the
+    /// wrong glyph and get back a perfectly plausible wrong character. So the
+    /// program is left unread and the layers above keep the sources they
+    /// already had. Every fixture in the corpus is `Identity-H`; the guard is
+    /// there for the file that is not.
+    fn read_cid_truetype_program(&self, dict: &Dictionary, raw: &mut RawFont) {
+        let identity_encoding = self
+            .lookup(dict, b"Encoding")
+            .and_then(|o| o.as_name().ok())
+            .is_some_and(|name| name == b"Identity-H" || name == b"Identity-V");
+        if !identity_encoding {
+            return;
+        }
+
+        let Some(descendant) = self
+            .lookup(dict, b"DescendantFonts")
+            .and_then(|o| o.as_array().ok())
+            .and_then(|a| a.first())
+            .and_then(|o| self.resolve(o).ok())
+            .and_then(|o| o.as_dict().ok())
+        else {
+            return;
+        };
+
+        // `/CIDToGIDMap` is a name or a stream (PDF 32000-1 §9.7.4.2). Absent
+        // means `/Identity`, the spec's default. A name that is neither is
+        // malformed, and inventing a reading for it is how a parser starts
+        // producing confident nonsense — so nothing is read at all.
+        match self.lookup(descendant, b"CIDToGIDMap") {
+            None => {}
+            Some(obj) if obj.as_name().is_ok_and(|name| name == b"Identity") => {}
+            Some(obj) => match obj.as_stream().ok() {
+                Some(stream) => raw.cid_to_gid = stream.decompressed_content().ok(),
+                None => return,
+            },
+        }
+
+        let Some(descriptor) = self
+            .lookup(descendant, b"FontDescriptor")
+            .and_then(|o| o.as_dict().ok())
+        else {
+            return;
+        };
+
+        raw.truetype_program = self
+            .lookup(descriptor, b"FontFile2")
+            .and_then(|o| o.as_stream().ok())
+            .and_then(|stream| stream.decompressed_content().ok());
     }
 
     /// Read `/Encoding` in either of its two forms.
@@ -704,7 +774,7 @@ impl Pdf {
             .unwrap_or(0.0);
     }
 
-     // for more information about this read 9.7.4.1 and 9.7.4.3 section
+    // for more information about this read 9.7.4.1 and 9.7.4.3 section
     /// Read `/DW` and `/W` from a composite font's descendant.
     /// A `Type0` font is a shell: the widths live in `/DescendantFonts[0]`,
     /// DescendantFonts is one element array and that why we grep the first element.

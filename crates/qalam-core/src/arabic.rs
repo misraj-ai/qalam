@@ -414,7 +414,7 @@ fn item_for(placed: &Placed) -> Item {
     Item {
         x0: g.x,
         x1: g.x + w,
-        y0: g.y - h * 0.25,  // 25% below the baseline (descenders)
+        y0: g.y - h * 0.25, // 25% below the baseline (descenders)
         y1: g.y + h * 0.75, // 75% above it (ascenders)
         size: g.style.size,
     }
@@ -788,7 +788,7 @@ fn build_line(placed: &[Placed], fonts: &FontMap) -> Option<TextLine> {
     // sit on. Here the mark is not alone: it belongs to the letter beside it,
     // and that space would split a word in half. Observed on page 5 of the
     // fixture, where `تتضمّن` came out as `تتض َّمن`.
-    let text = tidy_whitespace(&strip_mark_bases(&normalised));
+    let text = tidy_whitespace(&strip_mark_bases(&strip_tatweel(&normalised)));
     if std::env::var_os("QALAM_DBG").is_some() && text.contains("\u{0625}\u{0625}") {
         eprintln!(
             "PIECES: {:?}",
@@ -1063,6 +1063,72 @@ fn merge_hamza(host: &str, base: char, composed: char) -> Option<String> {
             .map(|c| if c == base { composed } else { c })
             .collect(),
     )
+}
+
+/// Remove the tatweel where it is justification, and keep it where it is not.
+///
+/// U+0640 is not a letter. It carries no sound and changes no meaning: a line
+/// is justified in Arabic by widening words rather than spaces, and the tatweel
+/// is the bar that does the widening. NFKC leaves it exactly where it found it,
+/// so `تأدية` stays `تأديــة` — the same word with typesetting spelled into it.
+///
+/// Two very different routes lead here. A well behaved file names the character
+/// outright, as `16.pdf` and `bar_Persons.pdf` do. A badly behaved one has no
+/// name for its stretched glyphs at all, and [`crate::truetype`] recognises
+/// them by their outlines — without which `30_doc3.pdf` reports them as a
+/// letter and `تاریخ` arrives as `تاااااریخ`.
+///
+/// # Why position decides it
+///
+/// Not every tatweel is typesetting. `١٤٤٦هـ` marks a Hijri year, and there the
+/// bar is part of how the abbreviation is written — `12.pdf` has both that and
+/// `رقم 2)هـ(`. Dropping it there loses something the author wrote.
+///
+/// The two cases are told apart by where the bar sits. Justification stretches
+/// the *join* between two letters, so it is always surrounded by them. The
+/// abbreviation's tatweel trails at the end of its word with nothing after it.
+/// So a run of tatweels goes only when a letter stands on both sides of it.
+fn strip_tatweel(text: &str) -> String {
+    let chars: Vec<char> = text.chars().collect();
+    let mut out = String::with_capacity(text.len());
+    let mut i = 0;
+
+    while i < chars.len() {
+        if chars[i] != crate::truetype::TATWEEL {
+            out.push(chars[i]);
+            i += 1;
+            continue;
+        }
+
+        // The whole run at once: a stretched join is several bars wide, and the
+        // ones in the middle have no letter beside them to be judged by.
+        let start = i;
+        while i < chars.len() && chars[i] == crate::truetype::TATWEEL {
+            i += 1;
+        }
+
+        let joined = start
+            .checked_sub(1)
+            .and_then(|before| chars.get(before))
+            .is_some_and(|c| is_arabic_letter(*c))
+            && chars.get(i).is_some_and(|c| is_arabic_letter(*c));
+
+        if !joined {
+            for _ in start..i {
+                out.push(crate::truetype::TATWEEL);
+            }
+        }
+    }
+
+    out
+}
+
+/// Is this a letter of the Arabic script, as opposed to a mark or a digit?
+///
+/// Deliberately narrow. A tatweel between two *marks* or two digits is not a
+/// stretched join, and only a letter can be joined to in the first place.
+fn is_arabic_letter(c: char) -> bool {
+    c.is_alphabetic() && matches!(c as u32, 0x0600..=0x06FF | 0x0750..=0x077F | 0xFB50..=0xFEFF)
 }
 
 /// Remove the placeholder space that NFKC puts before an isolated mark.
@@ -1809,6 +1875,25 @@ mod tests {
         let logical = bidi::visual_to_logical(&visual, Direction::Ltr);
         let text: String = logical.nfkc().collect();
         assert_eq!(text, "é");
+    }
+
+    #[test]
+    fn tatweel_goes_when_it_is_a_stretched_join_and_stays_when_it_is_notation() {
+        // Justification: bars between two letters, however many.
+        assert_eq!(
+            strip_tatweel("\u{062A}\u{0640}\u{0640}\u{0640}\u{0627}"),
+            "\u{062A}\u{0627}"
+        );
+        // The Hijri year marker, where the bar trails the word. `12.pdf` has
+        // both `1446\u{0647}\u{0640}` and `\u{0631}\u{0642}\u{0645} 2)\u{0647}\u{0640}(`.
+        assert_eq!(
+            strip_tatweel("1446\u{0647}\u{0640}"),
+            "1446\u{0647}\u{0640}"
+        );
+        // A bar with a space after it is not joining anything either.
+        assert_eq!(strip_tatweel("\u{0643}\u{0640} ("), "\u{0643}\u{0640} (");
+        // Nothing to do is the common case and must not allocate surprises.
+        assert_eq!(strip_tatweel("\u{062A}\u{0627}"), "\u{062A}\u{0627}");
     }
 
     #[test]

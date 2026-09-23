@@ -47,6 +47,12 @@ use qalam_core::Document;
 ///   CIDs, presentation forms folded by NFKC, multi-column card layouts.
 /// - `bar_Persons` — `Type1` simple fonts, 1-byte codes, ligatures whose
 ///   `/ToUnicode` values are already several base letters, and 18 ruled tables.
+/// - `30_doc3` and `32_doc5` — the two files that need the *font program* to be
+///   read back. Both carry a `/ToUnicode` that is wrong for most of its codes,
+///   and both stretch their justified lines with kashida glyphs no `cmap`
+///   reaches. Without [`qalam_core::truetype`] they extract as fluent-looking
+///   Arabic that says something else entirely, which is the worst failure this
+///   project has: not obviously broken, just quietly wrong.
 const CORPUS: &[(&str, &str)] = &[
     (
         "../../tests/fixtures/25.pdf",
@@ -60,6 +66,16 @@ const CORPUS: &[(&str, &str)] = &[
     ("../../tests/fixtures/3.pdf", "../../tests/expected/3.txt"),
     ("../../tests/fixtures/8.pdf", "../../tests/expected/8.txt"),
     ("../../tests/fixtures/12.pdf", "../../tests/expected/12.txt"),
+    // Appended, not inserted: the `CORPUS[n]` constants below name entries by
+    // index, so adding one anywhere but the end would silently repoint them.
+    (
+        "../../tests/fixtures/30_doc3.pdf",
+        "../../tests/expected/30_doc3.txt",
+    ),
+    (
+        "../../tests/fixtures/32_doc5.pdf",
+        "../../tests/expected/32_doc5.txt",
+    ),
 ];
 
 /// The first fixture, which most of the named regressions below refer to.
