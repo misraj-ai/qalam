@@ -23,12 +23,15 @@
 //! | Presentation forms surviving normalisation | NFKC did not do its job |
 //! | Share of glyphs painted invisibly (`Tr 3`) | Someone else's OCR layer |
 //! | Replacement characters in the output | Corruption that reached the text |
+//! | Images covering the page, with little text | Text that lives in a picture |
 //!
 //! A page is only called `Ok` when every one of them is clean.
 
 use crate::arabic::TextLine;
 use crate::content::PageGlyphs;
 use crate::font::FontMap;
+use crate::images::PlacedImage;
+use crate::types::Rect;
 
 /// The verdict for one page.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -77,11 +80,18 @@ pub struct Signals {
     pub replacement_chars: usize,
     /// Characters of text produced.
     pub text_len: usize,
+    /// Characters of text produced, not counting whitespace.
+    pub visible_text_len: usize,
     /// `true` when the page groups digits with both `,` and `.`.
     ///
     /// See [`judge`]: at least one of the two is wrong, and which is not
     /// knowable from the text alone.
     pub mixed_digit_separators: bool,
+    /// Share of the page area covered by images we saw drawn, 0.0 to 1.0.
+    ///
+    /// Images whose position is unknown (drawn inside a form we do not enter)
+    /// cannot be counted, so this is a lower bound.
+    pub image_coverage: f64,
 }
 
 impl Signals {
@@ -141,14 +151,38 @@ const OCR_LAYER_INVISIBLE_RATE: f64 = 0.9;
 /// Fewer characters than this on a page with glyphs suggests a stray label
 /// rather than content.
 const MINIMUM_MEANINGFUL_TEXT: usize = 2;
+/// Images covering at least this share of the page make it a picture page.
+const IMAGE_PAGE_COVERAGE: f64 = 0.5;
+/// A picture page with no more non-space characters than this has nothing on
+/// it but a page number or a printer's mark: its content is in the picture.
+///
+/// Deliberately tiny. A cover photo with a real title — `8.pdf`'s `شرف
+/// التعليم`, ten letters — is a sound text layer, and `NeedsOcr` would throw
+/// that title away.
+const IMAGE_PAGE_NEGLIGIBLE_TEXT: usize = 4;
+/// A picture page with fewer characters than this *may* carry more text inside
+/// the picture than outside it, so it is flagged, but its text is kept. Below
+/// a short paragraph (around 300 characters), above a title or caption.
+const IMAGE_PAGE_SPARSE_TEXT: usize = 50;
 
 /// Assess one page.
 ///
 /// Takes the output of every layer below: L1's glyphs, L2's fonts, L3's lines.
 /// The detector measures rather than re-derives — it is the last stage, and
 /// everything it needs has already been computed.
-pub fn assess(page: u32, glyphs: &PageGlyphs, fonts: &FontMap, lines: &[TextLine]) -> PageReport {
-    let signals = measure(glyphs, fonts, lines);
+///
+/// `images` and `page_box` feed the one signal the glyphs cannot: a page whose
+/// text is *drawn* — a scanned page, a designed cover — has few glyphs or none,
+/// and only the pictures say where its content went.
+pub fn assess(
+    page: u32,
+    glyphs: &PageGlyphs,
+    fonts: &FontMap,
+    lines: &[TextLine],
+    images: &[PlacedImage],
+    page_box: Rect,
+) -> PageReport {
+    let signals = measure(glyphs, fonts, lines, images, page_box);
     let (verdict, reasons) = judge(&signals);
 
     PageReport {
@@ -161,7 +195,13 @@ pub fn assess(page: u32, glyphs: &PageGlyphs, fonts: &FontMap, lines: &[TextLine
 }
 
 /// Collect the measurements.
-fn measure(glyphs: &PageGlyphs, fonts: &FontMap, lines: &[TextLine]) -> Signals {
+fn measure(
+    glyphs: &PageGlyphs,
+    fonts: &FontMap,
+    lines: &[TextLine],
+    images: &[PlacedImage],
+    page_box: Rect,
+) -> Signals {
     let text: String = lines.iter().map(|l| l.text.as_str()).collect();
 
     Signals {
@@ -187,8 +227,38 @@ fn measure(glyphs: &PageGlyphs, fonts: &FontMap, lines: &[TextLine]) -> Signals 
             .filter(|c| *c == char::REPLACEMENT_CHARACTER)
             .count(),
         text_len: text.chars().count(),
+        visible_text_len: text.chars().filter(|c| !c.is_whitespace()).count(),
         mixed_digit_separators: has_mixed_separators(&text),
+        image_coverage: image_coverage(images, page_box),
     }
+}
+
+/// How much of the page its images cover, 0.0 to 1.0.
+///
+/// Each image is clipped to the page first: a full-bleed picture overhangs the
+/// trim, and the overhang is not page. The clipped areas are then summed and
+/// capped at 1.0 — overlapping images are counted twice, which a picture page
+/// does not need to be told apart from a page with one big picture.
+fn image_coverage(images: &[PlacedImage], page_box: Rect) -> f64 {
+    let page_area = page_box.width() * page_box.height();
+    if page_area <= 0.0 {
+        return 0.0;
+    }
+
+    let covered: f64 = images
+        .iter()
+        // `filter_map`: an image with no known position contributes nothing.
+        .filter_map(|image| image.bbox)
+        .map(|b| {
+            // The overlap of two rectangles, per axis; `max(0.0)` turns "no
+            // overlap" (a negative length) into zero.
+            let w = (b.x1.min(page_box.x1) - b.x0.max(page_box.x0)).max(0.0);
+            let h = (b.y1.min(page_box.y1) - b.y0.max(page_box.y0)).max(0.0);
+            w * h
+        })
+        .sum();
+
+    (covered / page_area).min(1.0)
 }
 
 /// Does this page group digits with a comma in one number and a full stop in
@@ -327,6 +397,41 @@ fn judge(s: &Signals) -> (Recoverability, Vec<String>) {
         );
     }
 
+    if s.image_coverage >= IMAGE_PAGE_COVERAGE {
+        // A page that is mostly picture. Its few glyphs are real text and
+        // resolve perfectly, so every check above passes — but the glyphs
+        // cannot say whether the picture holds more text than they do.
+        //
+        // Two tiers, because the cost of being wrong differs. `NeedsOcr`
+        // withholds the page's text, which is right for a printer's mark
+        // (`default.pdf` page 1: `1 PB` over a cover whose title is drawn)
+        // and wrong for a title set over a photo. So only negligible text
+        // condemns the page; merely sparse text is flagged and kept.
+        if s.visible_text_len <= IMAGE_PAGE_NEGLIGIBLE_TEXT {
+            fail(
+                Recoverability::NeedsOcr,
+                format!(
+                    "images cover {:.0}% of the page and it has almost no text \
+                     ({} characters) — the content is inside the image",
+                    s.image_coverage * 100.0,
+                    s.visible_text_len
+                ),
+                &mut verdict,
+            );
+        } else if s.text_len < IMAGE_PAGE_SPARSE_TEXT {
+            fail(
+                Recoverability::Degraded,
+                format!(
+                    "images cover {:.0}% of the page and only {} characters of text \
+                     were found — the image may hold text that is not extracted",
+                    s.image_coverage * 100.0,
+                    s.text_len
+                ),
+                &mut verdict,
+            );
+        }
+    }
+
     if s.text_len < MINIMUM_MEANINGFUL_TEXT {
         fail(
             Recoverability::NeedsOcr,
@@ -405,8 +510,50 @@ mod tests {
             residual_presentation_forms: 0,
             replacement_chars: 0,
             text_len: 480,
+            visible_text_len: 400,
             mixed_digit_separators: false,
+            image_coverage: 0.0,
         }
+    }
+
+    #[test]
+    fn a_picture_page_with_a_stray_label_needs_ocr() {
+        // `default.pdf` page 1: a cover drawn as one image, plus a printer's
+        // mark that resolves perfectly. Every glyph-based check passes.
+        let s = Signals {
+            glyph_count: 4,
+            text_len: 4,
+            visible_text_len: 3,
+            image_coverage: 0.84,
+            ..healthy()
+        };
+        assert_eq!(judge(&s).0, Recoverability::NeedsOcr);
+    }
+
+    #[test]
+    fn a_title_over_a_photo_is_kept_but_flagged() {
+        // `8.pdf` page 9: a real title, `شرف التعليم`, set over a full-page
+        // photo. The text is sound, so it must not be withheld — but the
+        // photo might carry more, so the page is not called clean either.
+        let s = Signals {
+            glyph_count: 10,
+            text_len: 11,
+            visible_text_len: 10,
+            image_coverage: 1.0,
+            ..healthy()
+        };
+        assert_eq!(judge(&s).0, Recoverability::Degraded);
+    }
+
+    #[test]
+    fn a_picture_page_with_real_text_is_ok() {
+        // `default.pdf` page 2 has a page-sized background image under a full
+        // page of text. The picture is decoration; the text is the content.
+        let s = Signals {
+            image_coverage: 1.0,
+            ..healthy()
+        };
+        assert_eq!(judge(&s).0, Recoverability::Ok);
     }
 
     #[test]
@@ -589,7 +736,9 @@ mod tests {
             residual_presentation_forms: 50,
             replacement_chars: 50,
             text_len: 10,
+            visible_text_len: 10,
             mixed_digit_separators: true,
+            image_coverage: 1.0,
         };
         let score = confidence(&s, Recoverability::Degraded);
         assert!((0.0..=1.0).contains(&score), "score was {score}");

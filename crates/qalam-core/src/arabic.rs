@@ -129,7 +129,7 @@ pub fn reconstruct_regions(
     extra_boxes: &[Rect],
     order: Option<&ReadingOrder>,
 ) -> Vec<Region> {
-    let mut placed = apply_actual_text(page);
+    let mut placed = apply_actual_text(page, fonts);
     if placed.is_empty() && extra_boxes.is_empty() {
         return Vec::new();
     }
@@ -204,7 +204,7 @@ pub fn reconstruct_regions(
 /// — overlays anchored, order resolved, marks placed, NFKC applied — which is
 /// what keeps a cell's Arabic as correct as a paragraph's.
 pub fn text_within(page: &PageGlyphs, fonts: &FontMap, bbox: Rect) -> String {
-    let mut placed = apply_actual_text(page);
+    let mut placed = apply_actual_text(page, fonts);
     anchor_zero_advance(&mut placed, fonts);
 
     placed.retain(|p| {
@@ -355,6 +355,15 @@ fn anchor_zero_advance(placed: &mut [Placed], fonts: &FontMap) {
             .or_else(|| fonts.decode(&glyph.style.font, glyph.code))
             .unwrap_or_default();
         if is_mark_glyph(&text) {
+            // But a mark does need its host's *line*. Tashkeel is drawn above
+            // or below the letter, and in `default.pdf` a kasra sits 7pt under
+            // a 17pt line — past the line tolerance, so every such mark was
+            // grouped into a line of its own (`ٍِِِ`) and lost from its word.
+            // Only the across coordinate is borrowed; `anchor_along` stays
+            // the mark's own, for the reason above.
+            if let Some(across) = mark_host_across(placed, i) {
+                placed[i].anchor_across = across;
+            }
             continue;
         }
 
@@ -396,7 +405,41 @@ fn anchor_zero_advance(placed: &mut [Placed], fonts: &FontMap) {
     }
 }
 
-/// The box a glyph occupies, for the layout pass./// The box a glyph occupies, for the layout pass./// The box a glyph occupies, for the layout pass.
+/// The baseline of the letter a combining mark is drawn over, if any.
+///
+/// The host is a pen-advancing glyph whose horizontal extent contains the
+/// mark, no more than one type size above or below it — tashkeel never strays
+/// further than that from its letter. Of several candidates (a mark between
+/// two lines can sit inside a glyph of each), the nearest baseline wins.
+///
+/// The whole page is searched rather than a window in painting order:
+/// `default.pdf` paints its marks as separate runs, after the line they
+/// belong to, so the host can be any distance away in the stream.
+fn mark_host_across(placed: &[Placed], i: usize) -> Option<f64> {
+    let mark = &placed[i];
+    let (along, across, size) = (mark.anchor_along, mark.anchor_across, mark.glyph.style.size);
+
+    placed
+        .iter()
+        .filter(|other| {
+            advances_pen(&other.glyph)
+                // Same direction of travel, or "along" means different things.
+                && other.glyph.orientation == mark.glyph.orientation
+                && (other.anchor_across - across).abs() <= size
+                && other.anchor_along <= along
+                && along <= other.anchor_along + other.glyph.advance
+        })
+        // `min_by` with `total_cmp`, because `f64` has no total order of its
+        // own (NaN), so plain `min` is not available.
+        .min_by(|a, b| {
+            (a.anchor_across - across)
+                .abs()
+                .total_cmp(&(b.anchor_across - across).abs())
+        })
+        .map(|host| host.anchor_across)
+}
+
+/// The box a glyph occupies, for the layout pass.
 ///
 /// Heights are approximated from the type size, the same way [`line_bbox`] does
 /// it — a glyph's true ink extent needs per-glyph bounding boxes from the font
@@ -444,7 +487,7 @@ fn page_direction(placed: &[Placed], fonts: &FontMap) -> Direction {
 ///
 /// The whole span's text goes on its first glyph and the rest are blanked, so
 /// the text appears exactly once, positioned where the span began.
-fn apply_actual_text(page: &PageGlyphs) -> Vec<Placed> {
+fn apply_actual_text(page: &PageGlyphs, fonts: &FontMap) -> Vec<Placed> {
     let mut placed: Vec<Placed> = page
         .glyphs
         .iter()
@@ -465,12 +508,89 @@ fn apply_actual_text(page: &PageGlyphs) -> Vec<Placed> {
         };
         // If the PDF marked a group of glyphs with /ActualText (the author's own "this reads as…"), the whole text
         // goes on the first glyph and the rest get Some(""), so the text appears exactly once.
-        placed[start].actual = Some(span.text.clone());
+        placed[start].actual = Some(logical_actual_text(
+            &span.text,
+            &page.glyphs[start..end],
+            fonts,
+        ));
         for slot in &mut placed[start + 1..end] {
             slot.actual = Some(String::new());
         }
     }
     placed
+}
+
+/// Put an `/ActualText` value into logical order, if its producer did not.
+///
+/// # The spec says logical; not every producer agrees
+///
+/// `/ActualText` is meant to be the text a human would type, and the rest of
+/// this module trusts it as such: it outranks the glyphs. `default.pdf`
+/// (PDFium) breaks that for spans that cover a ligature with its tashkeel. The
+/// ligature `يح` with a fatha is stored as `َحي` — mark first, letters
+/// reversed — and trusted as it stands, `يحثه ويحرضه حتى يخرجه` came out as
+/// `َحيثُّه وُحيرضه حتىُخيرِجه`.
+///
+/// # Asking the glyphs, rather than guessing from the span
+///
+/// A rule on the span alone does not work. "Starts with a mark" catches the
+/// reversed spans, but the same file also has `ِّه` — whose marks belong to
+/// the `ي` *before* it — and that one is already in logical order.
+///
+/// The glyphs under the span settle it. Each pen-advancing glyph's own
+/// `/ToUnicode` text is logical (the map is a per-glyph statement), so the
+/// span's letters are compared with their letters:
+///
+/// - the same, forwards → the span is logical, and is kept;
+/// - the same only **backwards** → the span is in visual order, and the
+///   whole of it is reversed, which also moves its leading marks behind
+///   their letters;
+/// - no letters to compare (a span over a mark glyph alone, as `ِّه` is) →
+///   there is no evidence against the span, and it is kept.
+///
+/// The remaining imperfection is honest: where several marks sit on one
+/// ligature, the span does not say which letter wears which mark, so they
+/// all land after the ligature. The letters themselves are always right.
+///
+/// Punctuation spans are left alone, deliberately. `12.pdf` writes spans that
+/// put a footnote's `1.` into logical order *against* its glyphs, so a span
+/// disagreeing with its glyphs about punctuation is not evidence of anything.
+fn logical_actual_text(text: &str, covered: &[Glyph], fonts: &FontMap) -> String {
+    // Base letters only: marks are exactly what is out of place, so they are
+    // left out of the comparison.
+    let letters_of = |s: &str| -> Vec<char> {
+        s.chars()
+            .filter(|c| !is_combining_mark(*c) && !c.is_whitespace())
+            .collect()
+    };
+
+    let spanned = letters_of(text);
+    // `Option<String>` collects into `Option<String>`: `None` as soon as any
+    // glyph fails to decode, and then there is nothing to compare against.
+    let decoded: Option<String> = covered
+        .iter()
+        .filter(|g| advances_pen(g))
+        .map(|g| fonts.decode(&g.style.font, g.code))
+        .collect();
+
+    let drawn = letters_of(decoded.as_deref().unwrap_or_default());
+
+    // One letter reads the same both ways, so it proves nothing; neither does
+    // a span whose glyphs carry no letters at all.
+    // And only Arabic: visual order is a right-to-left artefact, so a
+    // reversed Latin span would be some other fault, not this one.
+    let reversed_only = spanned.len() > 1
+        && spanned.iter().any(|c| bidi::is_rtl_char(*c))
+        && spanned != drawn
+        && spanned.iter().rev().eq(drawn.iter());
+
+    if reversed_only {
+        // `rev()` walks characters, not bytes, so multi-byte Arabic letters
+        // survive intact.
+        text.chars().rev().collect()
+    } else {
+        text.to_string()
+    }
 }
 
 /// Join a page's lines into a single string, top to bottom.
@@ -1920,7 +2040,7 @@ mod tests {
             ..Default::default()
         };
 
-        let placed = apply_actual_text(&page);
+        let placed = apply_actual_text(&page, &FontMap::default());
         assert_eq!(placed[0].actual.as_deref(), Some("ffi"));
         // Covered but already accounted for: `Some("")`, not `None`, so the
         // text is emitted once rather than once per glyph.
@@ -1950,7 +2070,7 @@ mod tests {
             ..Default::default()
         };
 
-        let placed = apply_actual_text(&page);
+        let placed = apply_actual_text(&page, &FontMap::default());
         assert_eq!(placed.len(), 1);
         assert_eq!(placed[0].actual.as_deref(), Some("x"));
     }
@@ -1995,5 +2115,93 @@ mod tests {
         assert_eq!(lines[0].text, "fi");
         // The glyphs never went through font decoding, so nothing is unresolved.
         assert_eq!(lines[0].unresolved, 0);
+    }
+
+    // ---- `/ActualText` in visual order, and marks off the baseline ---------
+
+    /// A composite font whose `/ToUnicode` maps each code to the given text,
+    /// under the resource name the `glyph` helper paints with.
+    fn cmap_font(entries: &[(u32, &str)]) -> FontMap {
+        let mut stream = String::from("1 begincodespacerange\n<0000> <FFFF>\nendcodespacerange\n");
+        stream.push_str(&format!("{} beginbfchar\n", entries.len()));
+        for (code, text) in entries {
+            // Destinations are UTF-16BE hex, one 4-digit group per unit.
+            let hex: String = text
+                .encode_utf16()
+                .map(|unit| format!("{unit:04X}"))
+                .collect();
+            stream.push_str(&format!("<{code:04X}> <{hex}>\n"));
+        }
+        stream.push_str("endbfchar\n");
+
+        let mut raw = crate::types::RawFont::new(crate::types::FontInfo {
+            resource_name: "F".to_string(),
+            subtype: "Type0".to_string(),
+            base_font: None,
+            encoding: Some("Identity-H".to_string()),
+            code_to_unicode: crate::types::CodeToUnicode::ToUnicode,
+        });
+        raw.to_unicode = Some(stream.into_bytes());
+        FontMap::from_raw(vec![raw])
+    }
+
+    /// A glyph with a code and an advance, for building spans by hand.
+    fn coded(code: u32, x: f64, y: f64, advance: f64) -> Glyph {
+        let mut g = glyph(x, y, 17.0);
+        g.code = code;
+        g.advance = advance;
+        g
+    }
+
+    #[test]
+    fn a_visual_order_actual_text_is_put_back_in_logical_order() {
+        // `default.pdf`: the ligature `يح` with a fatha on it, covered by a
+        // span that says `َحي` — mark first, letters reversed. The ligature's
+        // own map says `يح`, which is how the span is caught out.
+        let fonts = cmap_font(&[(1, "\u{064A}\u{062D}"), (2, "\u{064E}")]);
+        let covered = [coded(2, 104.0, 0.0, 0.0), coded(1, 100.0, 0.0, 9.0)];
+
+        let text = logical_actual_text("\u{064E}\u{062D}\u{064A}", &covered, &fonts);
+        assert_eq!(text, "\u{064A}\u{062D}\u{064E}");
+    }
+
+    #[test]
+    fn a_logical_actual_text_is_left_alone() {
+        // The same span, written correctly, agrees with the ligature forwards
+        // and must not be touched.
+        let fonts = cmap_font(&[(1, "\u{064A}\u{062D}"), (2, "\u{064E}")]);
+        let covered = [coded(2, 104.0, 0.0, 0.0), coded(1, 100.0, 0.0, 9.0)];
+
+        let text = logical_actual_text("\u{064A}\u{062D}\u{064E}", &covered, &fonts);
+        assert_eq!(text, "\u{064A}\u{062D}\u{064E}");
+    }
+
+    #[test]
+    fn a_span_over_a_mark_glyph_alone_is_kept() {
+        // `بأيِّهما` in `default.pdf`: the span `ِّه` covers only the mark
+        // glyph, so no letter under it can testify — and it is in fact right,
+        // its marks belonging to the `ي` before it. "Starts with a mark" alone
+        // would have reversed it into `هِّ`.
+        let fonts = cmap_font(&[(3, "\u{0650}\u{0651}")]);
+        let covered = [coded(3, 100.0, 0.0, 0.0)];
+
+        let span = "\u{0650}\u{0651}\u{0647}";
+        assert_eq!(logical_actual_text(span, &covered, &fonts), span);
+    }
+
+    #[test]
+    fn a_mark_far_below_its_letter_stays_on_its_line() {
+        // A kasra drawn 8pt under a 17pt line: past the line tolerance
+        // (0.3 × 17 = 5.1pt), so on its own coordinates it was a line of its
+        // own. It belongs to the letter it sits under.
+        let fonts = cmap_font(&[(4, "\u{0628}"), (5, "\u{0650}")]);
+        let page = PageGlyphs {
+            glyphs: vec![coded(4, 100.0, 500.0, 8.0), coded(5, 102.0, 492.0, 0.0)],
+            ..Default::default()
+        };
+
+        let lines = reconstruct(&page, &fonts);
+        assert_eq!(lines.len(), 1, "the mark was split off: {lines:?}");
+        assert_eq!(lines[0].text, "\u{0628}\u{0650}");
     }
 }
