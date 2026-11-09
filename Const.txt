@@ -1,0 +1,49 @@
+# Const found so Far that we don't know if it's correct or need tuning
+
+---------------layout.rs------------------
+
+const MIN_GUTTER_EMS: f64 = 1.5;
+
+const MIN_GUTTER_EMS_TALL: f64 = 0.9;
+
+
+const MIN_COLUMN_EMS: f64 = 5.0;
+
+const TALL_REGION_EMS: f64 = 8.0;
+
+
+const MIN_ROW_GAP_EMS: f64 = 1.0;
+
+
+const MIN_MULTILINE_HEIGHT_EMS: f64 = 1.8;
+
+const MAX_DEPTH: usize = 24;
+
+const MIN_ITEMS_TO_SPLIT: usize = 4;
+
+
+------------- content.rs ----------------------
+const MAX_RULE_THICKNESS: f64 = 3.0;
+
+const MIN_RULE_LENGTH: f64 = 4.0;
+
+const AXIS_TOLERANCE: f64 = 0.5;
+
+----------------- arabic.rs -------------
+const NEGLIGIBLE: f64 = 0.05;
+
+const WORD_GAP_FRACTION: f64 = 0.25;
+
+const WORD_GAP_FRACTION_INFERRED: f64 = 0.15;
+
+
+----------------- detect.rs -------------------
+
+const NEEDS_OCR_RESOLUTION: f64 = 0.5;
+
+const DEGRADED_RESOLUTION: f64 = 1.0;
+
+const OCR_LAYER_INVISIBLE_RATE: f64 = 0.9;
+
+const MINIMUM_MEANINGFUL_TEXT: usize = 2;
+

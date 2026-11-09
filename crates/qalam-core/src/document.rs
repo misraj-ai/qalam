@@ -183,7 +183,14 @@ impl Document {
                 blocks::assemble(&page_glyphs, &fonts, &images, info.media_box, order.as_ref());
 
             // L4 last: it judges what every layer below it produced.
-            let report = detect::assess(number, &page_glyphs, &fonts, &lines);
+            let report = detect::assess(
+                number,
+                &page_glyphs,
+                &fonts,
+                &lines,
+                &images,
+                info.media_box,
+            );
 
             pages.push(Page {
                 number,
